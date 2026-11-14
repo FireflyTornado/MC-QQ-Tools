@@ -341,7 +341,9 @@ sudo:
 
 保存清单后，在 Minecraft 服务端控制台执行 `mcqqauth sudo reload`。插件校验整份清单后立即替换规则，并报告加载条数。留空清单会加载零条规则。文件无法读取或格式无效时，插件清空生效规则并暂停群内 `/sudo`。修正文件后再次执行同一条指令即可恢复。此操作只读取清单，无需重启游戏服、Bot 或 FastAPI。
 
-前缀按大小写和空格边界匹配。写入 `whitelist` 即开放整个原版白名单命令，包括 `whitelist off`。只写 `whitelist add` 则允许 `/sudo whitelist add Steve`，并拒绝 `whitelist remove Steve` 和 `whitelist addall Steve`。匹配后，参数交由 Minecraft 校验。无命名空间的指令使用 `minecraft:`。插件指令需要在清单和群消息里都写完整命名空间，例如 `example:inspect`。
+前缀按大小写和空格边界匹配。写入 `whitelist` 即开放服务端当前注册为 `whitelist` 的命令及其所有子命令。只写 `whitelist add` 则允许 `/sudo whitelist add Steve`，并拒绝 `whitelist remove Steve` 和 `whitelist addall Steve`。匹配后，插件把命令原样交给服务端，短名按 Mohist 当前的命令注册表解析，参数由服务端校验。`commands.yml` 配置的服务端命令别名会被拒绝。
+
+如果从自动补 `minecraft:` 的旧版本升级，请检查清单里的短名规则。需要固定执行原版白名单命令时，将旧规则 `whitelist add` 改为 `minecraft:whitelist add`，群里对应发送 `/sudo minecraft:whitelist add Steve`。插件和模组命令同样可以使用服务端实际注册的短名或完整名称，群消息中的写法须与清单匹配。
 
 启用并重启 Bot、FastAPI 和 Minecraft 服务端后，可以在清单中加入 `list`，在控制台执行 `mcqqauth sudo reload`，再用指定 QQ 在目标群发 `/sudo list`，检查在线人数和名字的回显。也可以用 `/sudo list invalid-argument` 检查语法错误的回显。Minecraft 原版白名单独立于本项目的 QQ 绑定准入。
 
@@ -387,7 +389,7 @@ cd minecraft-plugin
 mvn -B -ntp clean verify
 ```
 
-部署产物为 `minecraft-plugin/target/MCQQAuth-0.5.0.jar`。Spigot API 1.20.1 以 `provided` 作用域参与编译，由兼容的服务端提供。JAR 内置并隔离 Jetty、Gson 及所需的日志依赖。Maven 测试通过本机回环地址运行模拟 HTTPS/WSS 服务并生成临时证书，也会模拟 Bukkit 登录、入服、公告界面和踢出调度。
+部署产物为 `minecraft-plugin/target/MCQQAuth-0.5.1.jar`。Spigot API 1.20.1 以 `provided` 作用域参与编译，由兼容的服务端提供。JAR 内置并隔离 Jetty、Gson 及所需的日志依赖。Maven 测试通过本机回环地址运行模拟 HTTPS/WSS 服务并生成临时证书，也会模拟 Bukkit 登录、入服、公告界面和踢出调度。
 
 游戏名现支持 1–16 位，授权匹配忽略大小写。从要求游戏名为 3–16 位的版本升级时，先替换游戏服上的插件 JAR 并重启，再更新 Bot，避免旧插件收到短名后拒绝整份授权名单。若已有超过 16 位的绑定，升级前先处理这些记录。数据库校验会拒绝含有超长记录的库，插件也会拒绝含有超长名字的整份授权名单。无需迁移表结构。
 
@@ -468,7 +470,7 @@ Bukkit 只能在玩家成功进入游戏后打开背包界面。名单未就绪�
 ### Mohist 面板服维护窗口
 
 1. 使用 Java 17 和 Mohist 1.20.1 的独立测试服，配置隔离的 HTTPS/WSS 模拟授权端点、测试 Token 和测试游戏名。构建 JAR，备份待升级服的旧插件与配置。
-2. 停服后将 `plugins/` 中的旧版替换为 `MCQQAuth-0.5.0.jar`，只保留一个 MCQQAuth JAR。保留已有 API 地址、Token 和文件访问权限。首次安装可从 JAR 提取默认配置，填写两条授权端点和 Token。
+2. 停服后将 `plugins/` 中的旧版替换为 `MCQQAuth-0.5.1.jar`，只保留一个 MCQQAuth JAR。保留已有 API 地址、Token 和文件访问权限。首次安装可从 JAR 提取默认配置，填写两条授权端点和 Token。
 3. **阶段 A · 观察**。显式配置 `mode: OBSERVE` 与 `observe.notice.enabled: true`，填写 QQ 群号并启动游戏服。用 `/mcqqauth` 确认模式和同步状态。用已授权、未授权、同步暂不可用三种测试状态入服，核对公告、日志及同步恢复后的表现。检查原版客户端的中文文案、Esc、确认按钮、背包操作和其他插件的登录菜单。
 4. **阶段 B · 强制**。保留已授权和未授权的测试玩家在线，执行 `/mcqqauth mode enforce`。验证新登录、在线豁免、退出重连和撤权。用隔离的测试名单演练显式清理，核对踢出人数和日志。在 WSS 断开时核对清理被拒、新登录被拒及重连后的恢复。确认切换本身未产生新连接，再重启测试服核对模式保存结果。
-5. 生产环境先按观察阶段核对同步和公告，再用指令切换。修改公告等其他配置后，在维护窗口完整停止并重新启动 Mohist。完整回滚时停服，移出 `MCQQAuth-0.5.0.jar`，恢复同一次备份的旧 JAR 与配置，再启动并核对 `/mcqqauth`。
+5. 生产环境先按观察阶段核对同步和公告，再用指令切换。修改公告等其他配置后，在维护窗口完整停止并重新启动 Mohist。完整回滚时停服，移出 `MCQQAuth-0.5.1.jar`，恢复同一次备份的旧 JAR 与配置，再启动并核对 `/mcqqauth`。

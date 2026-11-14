@@ -82,8 +82,7 @@ final class SudoCommands {
             return new Result("rejected");
         }
 
-        String qualified = label(command).contains(":") ? command : "minecraft:" + command;
-        String target = label(qualified);
+        String target = label(command);
         // Configured Bukkit aliases can expand to multiple commands.
         if (server.getCommandAliases().keySet().stream().anyMatch(target::equalsIgnoreCase)) {
             return new Result("rejected");
@@ -98,7 +97,7 @@ final class SudoCommands {
         try {
             boolean dispatched;
             try {
-                dispatched = server.dispatchCommand(feedback.sender(), qualified);
+                dispatched = server.dispatchCommand(feedback.sender(), command);
             } catch (CommandException e) {
                 var output = feedback.output().get();
                 if (output.text().isBlank() && !output.truncated()) {

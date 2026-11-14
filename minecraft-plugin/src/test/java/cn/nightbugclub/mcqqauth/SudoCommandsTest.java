@@ -62,11 +62,11 @@ class SudoCommandsTest {
         assertEquals(Set.of("whitelist add", "example:inspect world"), prefixes);
         var commands = new SudoCommands(server, prefixes,
                 () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
-        when(server.dispatchCommand(console, "minecraft:whitelist add Steve Alex")).thenReturn(true);
+        when(server.dispatchCommand(console, "whitelist add Steve Alex")).thenReturn(true);
         when(server.dispatchCommand(console, "example:inspect world \"夜间 测试\"")).thenReturn(true);
         assertEquals("ok", commands.execute("whitelist add Steve Alex").status());
         assertEquals("ok", commands.execute("example:inspect world \"夜间 测试\"").status());
-        verify(server).dispatchCommand(console, "minecraft:whitelist add Steve Alex");
+        verify(server).dispatchCommand(console, "whitelist add Steve Alex");
         verify(server).dispatchCommand(console, "example:inspect world \"夜间 测试\"");
     }
 
@@ -77,52 +77,59 @@ class SudoCommandsTest {
         when(server.dispatchCommand(eq(console), anyString())).thenReturn(true);
         for (String input : Set.of("whitelist", "whitelist on", "whitelist remove Steve", "whitelist add Alex")) {
             assertEquals("ok", commands.execute(input).status());
-            verify(server).dispatchCommand(console, "minecraft:" + input);
+            verify(server).dispatchCommand(console, input);
         }
-        when(server.getCommandAliases()).thenReturn(Map.of("minecraft:whitelist", new String[]{"first", "second"}));
-        clearInvocations(server);
-        assertEquals("rejected", commands.execute("whitelist on").status());
-        verify(server, never()).dispatchCommand(any(), anyString());
     }
 
     @Test
-    void unqualifiedAliasDoesNotRedirectSudoEvenWhenItShadowsAVanillaCommand() {
+    void shortNameUsesServerBindingAndQualifiedNameSelectsTheOtherCommand() {
         var commandMap = new SimpleCommandMap(server);
-        var first = mock(Command.class);
-        var second = mock(Command.class);
-        commandMap.register("first", "example", first);
-        commandMap.register("second", "example", second);
-        when(server.getCommandAliases()).thenReturn(
-                Map.of("greet", new String[]{"example:first", "example:second"}));
-        commandMap.registerServerAliases();
-        assertInstanceOf(FormattedCommandAlias.class, commandMap.getCommand("greet"));
-        assertNull(commandMap.getCommand("minecraft:greet"));
+        var plugin = greetingCommand("plugin command");
+        var vanilla = greetingCommand("vanilla command");
+        commandMap.register("greet", "example", plugin);
+        commandMap.register("greet", "minecraft", vanilla);
+        assertSame(plugin, commandMap.getCommand("greet"));
+        assertSame(vanilla, commandMap.getCommand("minecraft:greet"));
         when(server.dispatchCommand(eq(console), anyString()))
                 .thenAnswer(call -> commandMap.dispatch(console, call.getArgument(1, String.class)));
 
-        var commands = new SudoCommands(server, Set.of("greet"),
+        var commands = new SudoCommands(server, Set.of("greet", "minecraft:greet"),
                 () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
-        assertEquals(new SudoCommands.Result("error", "服务端未找到该命令。"), commands.execute("greet"));
-
-        var vanilla = new Command("greet") {
-            @Override
-            public boolean execute(CommandSender sender, String label, String[] args) {
-                sender.sendMessage("vanilla command");
-                return true;
-            }
-        };
-        commandMap.register("greet", "minecraft", vanilla);
-        assertInstanceOf(FormattedCommandAlias.class, commandMap.getCommand("greet"));
-        assertSame(vanilla, commandMap.getCommand("minecraft:greet"));
         try (var bukkit = mockStatic(Bukkit.class)) {
             bukkit.when(Bukkit::getPluginManager).thenReturn(mock(PluginManager.class));
             assertEquals("ok", commands.execute("greet").status());
+            verify(console).sendMessage("plugin command");
+            verify(console, never()).sendMessage("vanilla command");
+            assertEquals("ok", commands.execute("minecraft:greet").status());
+            verify(console).sendMessage("vanilla command");
         }
+    }
 
-        verify(server, times(2)).dispatchCommand(console, "minecraft:greet");
-        verify(console).sendMessage("vanilla command");
-        verify(first, never()).execute(any(), anyString(), any());
-        verify(second, never()).execute(any(), anyString(), any());
+    private static Command greetingCommand(String message) {
+        return new Command("greet") {
+            @Override
+            public boolean execute(CommandSender sender, String label, String[] args) {
+                sender.sendMessage(message);
+                return true;
+            }
+        };
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"greet", "example:greet"})
+    void rejectsConfiguredAliasesBeforeDispatch(String alias) {
+        var commandMap = new SimpleCommandMap(server);
+        commandMap.register("first", "example", mock(Command.class));
+        commandMap.register("second", "example", mock(Command.class));
+        when(server.getCommandAliases()).thenReturn(
+                Map.of(alias, new String[]{"example:first", "example:second"}));
+        commandMap.registerServerAliases();
+        assertInstanceOf(FormattedCommandAlias.class, commandMap.getCommand(alias));
+
+        var commands = new SudoCommands(server, Set.of(alias),
+                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+        assertEquals("rejected", commands.execute(alias + " argument").status());
+        verify(server, never()).dispatchCommand(any(), anyString());
     }
 
     @Test
@@ -136,7 +143,7 @@ class SudoCommandsTest {
             }).when(sender).sendMessage(anyString());
             return new MohistCommandFeedback.Capture(sender, output::snapshot);
         });
-        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("minecraft:list")))
+        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("list")))
                 .thenAnswer(call -> {
                     call.getArgument(0, RemoteConsoleCommandSender.class).sendMessage("Players:\nAlex, Steve\n");
                     return true;

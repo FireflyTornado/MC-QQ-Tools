@@ -108,8 +108,8 @@ class MCQQAuthPluginTest {
             SudoCommands live = commands.remove();
             ConsoleCommandSender console = admin(ConsoleCommandSender.class);
             when(server.getConsoleSender()).thenReturn(console);
-            when(server.dispatchCommand(remote, "minecraft:say hi")).thenReturn(true);
-            when(server.dispatchCommand(remote, "minecraft:whitelist on")).thenReturn(true);
+            when(server.dispatchCommand(remote, "say hi")).thenReturn(true);
+            when(server.dispatchCommand(remote, "whitelist on")).thenReturn(true);
             when(server.dispatchCommand(remote, "mcqqauth:mcqqauth sudo reload")).thenAnswer(call -> {
                 execute(console, "sudo", "reload");
                 return true;
@@ -162,7 +162,7 @@ class MCQQAuthPluginTest {
         verify(plugins).registerEvents(isA(AuthorizationListener.class), eq(plugin));
         CommandSender admin = admin(CommandSender.class);
         execute(admin);
-        verify(admin).sendMessage("MCQQAuth v0.5.0");
+        verify(admin).sendMessage("MCQQAuth v0.5.1");
         verify(admin).sendMessage("当前模式：OBSERVE");
         verify(admin).sendMessage("授权服务：未就绪");
         verify(admin).sendMessage("当前行为：允许正常登录，仅观察");

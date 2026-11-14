@@ -1,5 +1,7 @@
 package cn.nightbugclub.mcqqauth;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.PluginCommandYamlParser;
 import org.bukkit.plugin.PluginDescriptionFile;
@@ -55,6 +57,7 @@ import static org.mockito.Mockito.*;
 @Timeout(20)
 public class AuthorizationServiceTest {
     private static final String TOKEN = "test-only.api-token";
+    private static final String SUDO_TOKEN = "test-only.sudo-token";
     private static final String PASSWORD = "test-keystore";
     private static final long VERSION = 1_794_141_600_123L;
     @TempDir
@@ -240,15 +243,14 @@ public class AuthorizationServiceTest {
         take(api.requests).reply(200, snapshot(VERSION - 1, "\"steve\""));
         assertTrue(take(logs).contains("版本落后"));
         assertFalse(service.view().ready());
-        take(api.sessions);
         take(api.requests).reply(200, snapshot(VERSION + 1, ""));
         assertEquals(Set.of(), take(updates).snapshot().activeNames());
     }
 
     @Test
-    void failedSnapshotKeepsLoginClosedAndRetriesWithBackoff() throws Exception {
+    void failedSnapshotKeepsLoginClosedAndRetriesWithoutReconnecting() throws Exception {
         start(TOKEN, 700);
-        take(api.sessions);
+        Session session = take(api.sessions);
         take(api.requests).reply(401, TOKEN);
         String rejected = take(logs);
         assertTrue(rejected.contains("HTTP 401"));
@@ -256,42 +258,77 @@ public class AuthorizationServiceTest {
         assertFalse(rejected.contains(TOKEN));
         assertFalse(service.view().ready());
 
-        take(api.sessions);
         take(api.requests);
         String timedOut = take(logs);
         assertTrue(timedOut.contains("Timeout"));
         assertTrue(timedOut.contains("200 毫秒"));
         assertFalse(service.view().ready());
 
-        take(api.sessions);
         take(api.requests).reply(200, snapshot(VERSION, ""));
         assertTrue(take(updates).ready());
+        assertPong(session);
+        assertTrue(api.sessions.isEmpty());
+        assertTrue(api.closes.isEmpty());
+    }
+
+    @Test
+    void sudoUsesSameSocketDuringSnapshotFailureAndMalformedCommands() throws Exception {
+        SudoCommands commands = mock(SudoCommands.class);
+        when(commands.execute("list")).thenReturn(new SudoCommands.Result("ok", "players", false));
+        try (SudoChannel sudo = new SudoChannel(commands, Runnable::run, Logger.getAnonymousLogger())) {
+            start(TOKEN, 3_000, trustedLocalCertificate(), "localhost", new SudoChannel.Settings(SUDO_TOKEN), sudo);
+            Session session = take(api.sessions);
+            take(api.requests).reply(503, "{}");
+            assertTrue(take(logs).contains("HTTP 503"));
+            assertFalse(service.view().ready());
+
+            String id = "a".repeat(32);
+            send(session, "{\"type\":\"sudo_command\",\"id\":\"" + id + "\"}");
+            assertEquals("error", take(api.results).get("status").getAsString());
+            verifyNoInteractions(commands);
+            String nextId = "b".repeat(32);
+            send(session, """
+                    {"type":"sudo_command","id":"%s","command":"list","deadline_ms":%d}
+                    """.formatted(nextId, System.currentTimeMillis() + 25_000));
+            JsonObject result = take(api.results);
+            assertEquals("sudo_result", result.get("type").getAsString());
+            assertEquals(nextId, result.get("id").getAsString());
+            assertEquals("players", result.get("output").getAsString());
+            verify(commands).execute("list");
+
+            take(api.requests).reply(200, snapshot(VERSION, "\"steve\""));
+            assertTrue(take(updates).ready());
+            notice(session, VERSION + 1);
+            take(api.requests).reply(200, snapshot(VERSION + 1, ""));
+            assertEquals(VERSION + 1, take(updates).snapshot().version());
+            assertTrue(api.sessions.isEmpty());
+            assertTrue(api.closes.isEmpty());
+        }
     }
 
     @Test
     void malformedPayloadsAndSameVersionConflictNeverReplaceConfirmedSnapshot() throws Exception {
         start(TOKEN, 3_000);
-        take(api.sessions);
+        Session session = take(api.sessions);
         take(api.requests).reply(200, "{\"version\":1,\"active_names\":[null]}");
         assertTrue(take(logs).contains("快照格式无效"));
         assertNull(service.view().snapshot());
 
-        Session session = take(api.sessions);
         take(api.requests).reply(200, snapshot(VERSION, "\"steve\""));
         AuthProtocol.Snapshot confirmed = take(updates).snapshot();
-        // The client may reject the message and close the socket before Jetty completes the send.
-        // The rejection log confirms receipt even when the send callback races with disconnect.
-        session.sendText("{\"type\":\"auth_updated\",\"version\":\"2\"}", Callback.NOOP);
+        send(session, "{\"type\":\"auth_updated\",\"version\":\"2\"}");
         assertTrue(take(logs).contains("通知格式无效"));
         assertFalse(service.view().ready());
         assertSame(confirmed, service.view().snapshot());
-        take(api.sessions);
         take(api.requests).reply(200, snapshot(VERSION, ""));
         assertTrue(take(logs).contains("同一版本"));
         assertFalse(service.view().ready());
         assertSame(confirmed, service.view().snapshot());
         assertTrue(service.view().snapshot().allows("Steve"));
         assertTrue(updates.isEmpty());
+        assertPong(session);
+        assertTrue(api.sessions.isEmpty());
+        assertTrue(api.closes.isEmpty());
     }
 
     @Test
@@ -381,6 +418,11 @@ public class AuthorizationServiceTest {
     }
 
     private void start(String token, int requestTimeout, SslContextFactory.Client tls, String snapshotHost) {
+        start(token, requestTimeout, tls, snapshotHost, null, null);
+    }
+
+    private void start(String token, int requestTimeout, SslContextFactory.Client tls, String snapshotHost,
+                       SudoChannel.Settings sudoSettings, SudoChannel sudo) {
         Logger logger = Logger.getAnonymousLogger();
         logger.setUseParentHandlers(false);
         logger.addHandler(new java.util.logging.Handler() {
@@ -392,7 +434,8 @@ public class AuthorizationServiceTest {
         service = new AuthorizationService(new PluginSettings(
                 URI.create("https://" + snapshotHost + ":" + port + "/internal/mc/snapshot"),
                 URI.create("wss://localhost:" + port + "/internal/mc/ws"),
-                token, 2_000, requestTimeout, 100, 400), tls, logger, () -> updates.add(service.view()));
+                token, 2_000, requestTimeout, 100, 400), tls, logger, () -> updates.add(service.view()),
+                sudoSettings, sudo);
         service.start();
     }
 
@@ -461,6 +504,7 @@ public class AuthorizationServiceTest {
         private final BlockingQueue<Exchange> requests = new LinkedBlockingQueue<>();
         private final BlockingQueue<Integer> closes = new LinkedBlockingQueue<>();
         private final BlockingQueue<ByteBuffer> pongs = new LinkedBlockingQueue<>();
+        private final BlockingQueue<JsonObject> results = new LinkedBlockingQueue<>();
         private final Server server = new Server();
         private final ServerConnector connector;
 
@@ -482,7 +526,9 @@ public class AuthorizationServiceTest {
                     callback.succeeded();
                     return null;
                 }
-                return new TestSocket(sessions, closes, pongs);
+                boolean sudoReady = ("Bearer " + SUDO_TOKEN).equals(
+                        request.getHeaders().get("X-MC-Sudo-Authorization"));
+                return new TestSocket(sessions, closes, pongs, results, sudoReady);
             });
             server.setHandler(new Handler.Abstract() {
                 @Override
@@ -520,12 +566,17 @@ public class AuthorizationServiceTest {
     }
 
     public record TestSocket(BlockingQueue<Session> sessions, BlockingQueue<Integer> closes,
-                             BlockingQueue<ByteBuffer> pongs)
+                             BlockingQueue<ByteBuffer> pongs, BlockingQueue<JsonObject> results, boolean sudoReady)
             implements Session.Listener.AutoDemanding {
         @Override
         public void onWebSocketOpen(Session session) {
-            session.sendText("{\"type\":\"connected\",\"message\":\"test\"}",
+            session.sendText("{\"type\":\"connected\",\"message\":\"test\",\"sudo_ready\":" + sudoReady + "}",
                     Callback.from(() -> sessions.add(session), failure -> session.disconnect()));
+        }
+
+        @Override
+        public void onWebSocketText(String message) {
+            results.add(JsonParser.parseString(message).getAsJsonObject());
         }
 
         @Override

@@ -1,14 +1,11 @@
 package cn.nightbugclub.mcqqauth;
 
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.WebSocket;
 import java.time.Duration;
 import java.util.ArrayDeque;
-import java.util.concurrent.CompletableFuture;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -73,27 +70,17 @@ class SudoChannelTest {
     private static final class ChannelFixture implements AutoCloseable {
         final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
         final SudoCommands commands = mock(SudoCommands.class);
-        final WebSocket.Builder builder = mock(WebSocket.Builder.class, RETURNS_SELF);
         final SudoChannel channel;
 
         ChannelFixture() {
-            var http = mock(HttpClient.class);
-            when(http.newWebSocketBuilder()).thenReturn(builder);
             when(commands.execute(anyString())).thenReturn(new SudoCommands.Result("ok"));
-            var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token");
-            channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), http);
+            channel = new SudoChannel(commands, tasks::add, mock(Logger.class));
         }
 
         Peer connect() {
-            var opened = new ArrayDeque<Peer>();
-            doAnswer(call -> {
-                var peer = new Peer(call.getArgument(1));
-                peer.listener.onOpen(peer.socket);
-                opened.add(peer);
-                return CompletableFuture.completedFuture(peer.socket);
-            }).when(builder).buildAsync(any(URI.class), any(WebSocket.Listener.class));
-            channel.maintain();
-            return opened.remove();
+            var peer = new Peer(channel);
+            channel.attach(peer);
+            return peer;
         }
 
         @Override
@@ -102,25 +89,32 @@ class SudoChannelTest {
         }
     }
 
-    private static final class Peer {
-        final WebSocket.Listener listener;
-        final WebSocket socket = mock(WebSocket.class);
+    private static final class Peer implements SudoChannel.Connection {
+        final SudoChannel channel;
         final ArrayDeque<String> replies = new ArrayDeque<>();
+        boolean open = true;
 
-        Peer(WebSocket.Listener listener) {
-            this.listener = listener;
-            when(socket.sendText(anyString(), eq(true))).thenAnswer(call -> {
-                replies.add(call.getArgument(0));
-                return CompletableFuture.completedFuture(socket);
-            });
+        Peer(SudoChannel channel) {
+            this.channel = channel;
+        }
+
+        @Override
+        public boolean isOpen() {
+            return open;
+        }
+
+        @Override
+        public void sendSudoResult(String message) {
+            replies.add(message);
         }
 
         void send(int id) {
             long deadline = System.currentTimeMillis() + Duration.ofSeconds(25).toMillis();
-            String message = """
-                    {"id":"%032x","command":"test%d","deadline_ms":%d}
-                    """.formatted(id, id, deadline);
-            listener.onText(socket, message, true);
+            var message = new JsonObject();
+            message.addProperty("id", "%032x".formatted(id));
+            message.addProperty("command", "test%d".formatted(id));
+            message.addProperty("deadline_ms", deadline);
+            channel.receive(this, message);
         }
 
         String status() {
@@ -128,7 +122,8 @@ class SudoChannelTest {
         }
 
         void disconnect() {
-            listener.onClose(socket, 1000, "");
+            open = false;
+            channel.detach(this);
         }
     }
 

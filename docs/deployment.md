@@ -326,16 +326,17 @@ MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_PLUGIN_TOKEN=REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知和 OneBot 的凭据区分。Bot 通过固定的回环地址 `127.0.0.1:18765` 提交指令。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知和 OneBot 的凭据区分。Bot 通过固定的回环地址 `127.0.0.1:18765` 提交指令。游戏主机通过现有的 `/internal/mc/ws` 接收授权通知和指令。反代需转发 Upgrade、Authorization 和 `X-MC-Sudo-Authorization` 头，尽可能限制到游戏主机的来源地址，并避免记录两个鉴权头。将 `/internal/mc/sudo/submit` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
 更新插件 JAR，在 Minecraft 插件的 `config.yml` 中加入以下设置。仅填写插件专用的 `MC_SUDO_PLUGIN_TOKEN` 值。
 
 ```yaml
 sudo:
   enabled: true
-  websocket-url: "wss://auth.example.org/internal/mc/sudo/ws"
   token: "REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN"
 ```
+
+从独立 WSS 的版本升级时，在同一个维护窗口更新 FastAPI 和游戏服插件。继续使用原有的 `api.websocket-url` 与独立的 `sudo.token`。旧的 `sudo.websocket-url` 配置可删除，升级完成后可移除反代中的 `/internal/mc/sudo/ws` 路由。
 
 插件首次启动时会在 `config.yml` 同目录创建 `sudo-allowlist.txt`。文件默认没有允许规则。用 UTF-8 编辑，每行一个命令前缀，省略开头的 `/`。空行和以 `#` 开头的行会被跳过。若曾配置 `sudo.allowed-commands`，请手动把仍需开放的条目移入新清单。
 
@@ -406,7 +407,7 @@ Spigot API 使用 `1.20.1-R0.1-SNAPSHOT`，本次解析到 `1.20.1-R0.1-20230921
 | `api.websocket-url` | 默认 `wss://auth.bf656.nightbugclub.cn/internal/mc/ws`，路径无末尾斜杠。 |
 | `api.token` | 填写后端的 `MC_API_TOKEN`，两条连接均通过 Bearer 请求头鉴权。实际值只保存在面板服的运行配置中。 |
 | `api.connect-timeout-ms`、`api.request-timeout-ms` | 默认 5000、8000 毫秒，分别限制连接与请求总耗时。 |
-| `sync.reconnect-min-ms`、`sync.reconnect-max-ms` | 默认 1000、30000 毫秒，故障后指数退避，成功同步后恢复初始等待。 |
+| `sync.reconnect-min-ms`、`sync.reconnect-max-ms` | 默认 1000、30000 毫秒，分别用于 WSS 重连和 HTTPS 快照重试的指数退避范围。WSS 确认连接、HTTPS 成功同步后，各自恢复初始等待。 |
 | `messages.unauthorized`、`messages.not-ready`、`messages.revoked` | 未授权拒绝、服务未就绪拒绝和撤销踢出提示。 |
 
 连接使用 Java 信任库验证证书链和主机名。WSS 每隔约 15 秒发送 Ping，10 秒内缺少对应 Pong 会进入重连。Ping/Pong 只检查连接活性。插件会在启动和重连后获取完整快照，并按更高版本提醒刷新。客户端最多接收 2 MiB 的快照。若恢复数据库备份导致版本回退，运行中的插件将保持未就绪，需在维护窗口先核实恢复后的名单和版本，再重新启动游戏服。

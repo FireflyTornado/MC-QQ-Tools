@@ -96,14 +96,13 @@ class MCQQAuthPluginTest {
                     when(capture.open()).thenReturn(new MohistCommandFeedback.Capture(
                             remote, new BoundedCommandOutput()::snapshot)));
              var channels = mockConstruction(SudoChannel.class,
-                (channel, context) -> commands.add((SudoCommands) context.arguments().get(1)))) {
+                (channel, context) -> commands.add((SudoCommands) context.arguments().get(0)))) {
             Path allowlist = dataFolder.resolve(SudoCommands.ALLOWLIST_FILE);
             Files.writeString(allowlist, "say\nmcqqauth:mcqqauth\n");
             start("mode: OBSERVE\n" + TEST_API + """
                     sudo:
                       enabled: true
                       token: test-sudo-token
-                      websocket-url: wss://localhost:1/internal/mc/sudo/ws
                     """);
             SudoCommands live = commands.remove();
             ConsoleCommandSender console = admin(ConsoleCommandSender.class);

@@ -7,7 +7,6 @@ from app_config import ConfigError, require_token
 
 SUDO_TIMEOUT = 30
 SUDO_SUBMIT_PATH = "/internal/mc/sudo/submit"
-SUDO_WS_PATH = "/internal/mc/sudo/ws"
 MAX_COMMAND_LENGTH = 256
 MAX_RESULT_BYTES = 64 * 1024
 MAX_RESULT_MESSAGE_BYTES = 512 * 1024

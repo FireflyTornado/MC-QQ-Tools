@@ -30,7 +30,7 @@ sync:
 
 sudo:
   enabled: false
-  websocket-url: ""
+  # 共用 api.websocket-url，仍使用独立的 MC_SUDO_PLUGIN_TOKEN。
   token: ""
   # 指令允许清单由同目录的 sudo-allowlist.txt 管理。
 

@@ -76,6 +76,7 @@ public final class MCQQAuthPlugin extends JavaPlugin {
             getLogger().severe("授权配置无效，" + behavior + " " + e.getMessage());
             return;
         }
+        SudoChannel.Settings sudo = configureSudo(config, settings.token);
         authorization = new AuthorizationService(settings, new SslContextFactory.Client(), getLogger(),
                 () -> controller.scheduleSync(this::scheduleOnMainThread, policy -> {
                     if (policy.mode == Mode.OBSERVE) {
@@ -83,12 +84,11 @@ public final class MCQQAuthPlugin extends JavaPlugin {
                     } else {
                         gate.checkOnlinePlayers(policy);
                     }
-                }));
+                }), sudo, sudoChannel);
         authorization.start();
-        startSudo(config, settings.token);
     }
 
-    private void startSudo(YamlConfiguration config, String authToken) {
+    private SudoChannel.Settings configureSudo(YamlConfiguration config, String authToken) {
         try {
             createSudoAllowlist();
         } catch (IOException | SecurityException e) {
@@ -104,12 +104,13 @@ public final class MCQQAuthPlugin extends JavaPlugin {
                 } catch (IOException | SecurityException | IllegalArgumentException e) {
                     getLogger().warning(sudoReloadFailure(e));
                 }
-                sudoChannel = new SudoChannel(sudo, sudoCommands,
+                sudoChannel = new SudoChannel(sudoCommands,
                         task -> server.getScheduler().runTask(this, task), getLogger());
-                sudoChannel.start();
             }
+            return sudo;
         } catch (IllegalArgumentException e) {
             getLogger().warning("/sudo 已关闭：" + e.getMessage());
+            return null;
         }
     }
 

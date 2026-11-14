@@ -221,15 +221,14 @@ class SudoCommandsTest {
     }
 
     @Test
-    void enabledConfigurationRequiresSecureChannel() {
+    void enabledConfigurationRequiresIndependentCredentials() {
         var config = new YamlConfiguration();
         config.set("sudo.enabled", false);
         assertNull(SudoChannel.Settings.read(config, "auth-token"));
         config.set("sudo.enabled", true);
-        config.set("sudo.token", "distinct-token");
-        config.set("sudo.websocket-url", "ws://example.net/internal/mc/sudo/ws");
+        config.set("sudo.token", "auth-token");
         assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
-        config.set("sudo.websocket-url", "wss://example.net/internal/mc/sudo/ws");
-        assertNotNull(SudoChannel.Settings.read(config, "auth-token"));
+        config.set("sudo.token", "distinct-token");
+        assertEquals("distinct-token", SudoChannel.Settings.read(config, "auth-token").token());
     }
 }

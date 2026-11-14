@@ -61,7 +61,7 @@ curl --fail -X POST http://127.0.0.1:18765/internal/mc/notify \
 
 ## WS /internal/mc/ws
 
-WebSocket 握手使用 API Token。Minecraft 插件从受控 WSS 代理接入，用于接收刷新提醒。以下为本机 HTTP Upgrade 请求示例。
+WebSocket 握手使用 API Token。每个 Minecraft 插件实例通过受控 WSS 代理建立一条连接，可同时接收授权刷新提醒与 `/sudo` 指令。以下为启用了 `/sudo` 的本机 HTTP Upgrade 请求示例。
 
 ```http
 GET /internal/mc/ws HTTP/1.1
@@ -71,6 +71,7 @@ Connection: Upgrade
 Sec-WebSocket-Version: 13
 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
 Authorization: Bearer demo-api-token
+X-MC-Sudo-Authorization: Bearer demo-sudo-plugin-token
 ```
 
 通过鉴权后，服务端接受连接并发送：
@@ -78,7 +79,8 @@ Authorization: Bearer demo-api-token
 ```json
 {
   "type": "connected",
-  "message": "Minecraft authentication connected"
+  "message": "Minecraft authentication connected",
+  "sudo_ready": true
 }
 ```
 
@@ -91,8 +93,10 @@ Authorization: Bearer demo-api-token
 }
 ```
 
-`type` 标识消息类别，`message` 是连接提示，`version` 是当前授权版本。更新消息只用于触发快照刷新，不包含名单。连接和重连后均应主动拉取完整快照。消息没有持久化、确认或重放机制，不能作为可靠消息队列使用。
+`type` 标识消息类别，`message` 是连接提示，`version` 是当前授权版本。授权通知触发 HTTPS 快照刷新。插件在连接和重连后主动拉取完整快照，快照失败时将授权状态标记为未就绪，并在原连接上独立退避重试。
 
-广播发送失败时，服务端撤销该连接登记，尝试发送 `1011` 并结束 WebSocket 处理。其余客户端独立接收通知。
+未提供可选的 `X-MC-Sudo-Authorization` 时，连接确认消息省略 `sudo_ready`。提供该头时，只有独立的插件 Token 验证成功且后端启用了 `/sudo`，才会返回 `sudo_ready: true`。后端向最早连入的可用 `/sudo` 插件连接发送 `sudo_command`，字段为 `id`、`command`、`deadline_ms`。插件在同一连接上发送 `sudo_result`，字段为 `id`、`status`、`output`，可附 `truncated`。后端按连接与请求 ID 匹配回执。匹配到请求但字段无效时仅结束该请求。指令和回执都不会自动重发。
 
-凭据无效时，应用在接受连接前拒绝握手并且不会登记连接。应用发送的 ASGI 关闭代码为 `1008`，客户端观察到的握手响应取决于 ASGI 服务与反向代理。代理还需正确转发 Upgrade 和 Authorization 头。
+后端为授权通知和命令各保留一个待发送位置，优先处理已排队的授权通知。授权广播实际写入失败时，服务端撤销该连接登记，尝试发送 `1011` 并结束 WebSocket 处理。其余客户端独立接收通知。
+
+API Token 无效时，应用在接受连接前拒绝握手。应用发送的 ASGI 关闭代码为 `1008`，客户端观察到的握手响应取决于 ASGI 服务与反向代理。代理需转发 Upgrade 和 Authorization 头，启用 `/sudo` 时也需转发可选的 `X-MC-Sudo-Authorization`。

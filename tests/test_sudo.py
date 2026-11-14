@@ -1,18 +1,19 @@
 import asyncio
+import importlib
 import json
+import os
 import sys
 import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
-
-from fastapi import FastAPI
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
-from sudo_api import sudo_router
+import app_config
 from app_config import ConfigError
-from sudo_config import MAX_RESULT_BYTES, SUDO_SUBMIT_PATH, SUDO_WS_PATH, SudoSettings, is_single_command, read_sudo_output_settings
+from sudo_config import MAX_RESULT_BYTES, SUDO_SUBMIT_PATH, is_single_command, read_sudo_output_settings
 
 
 class SudoOutputSettingsTests(unittest.TestCase):
@@ -37,11 +38,20 @@ class SudoOutputSettingsTests(unittest.TestCase):
 
 class SudoApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.app = FastAPI()
-        self.app.include_router(sudo_router(
-            SudoSettings(frozenset({"101"}), "bot-token", "plugin-token"), "202",
-            lambda headers, token: headers == ["Bearer " + token.decode("ascii")],
-        ))
+        config = {
+            "MC_API_TOKEN": "api-token",
+            "MC_NOTIFY_TOKEN": "notify-token",
+            "TARGET_GROUP_ID": "202",
+            "MC_SUDO_QQ_IDS": '["101"]',
+            "MC_SUDO_BOT_TOKEN": "bot-token",
+            "MC_SUDO_PLUGIN_TOKEN": "plugin-token",
+        }
+        with patch.object(app_config, "ENV_FILE", Path(__file__).with_suffix(".missing")), patch.dict(
+            os.environ, config, clear=True,
+        ):
+            self.api = importlib.import_module("mc_api")
+        self.addCleanup(sys.modules.pop, "mc_api", None)
+        self.app = self.api.app
 
     async def submit(self, *, token="bot-token", timeout=2, request_id="a" * 32, **overrides):
         payload = {
@@ -82,16 +92,24 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
 
         async def send(message):
             outgoing.put_nowait(message)
-            if block_send is not None and message["type"] == "websocket.send":
+            if (block_send is not None and message["type"] == "websocket.send"
+                    and json.loads(message["text"])["type"] == "sudo_command"):
                 await block_send.wait()
 
         task = asyncio.create_task(self.app({
-            "type": "websocket", "scheme": "ws", "path": SUDO_WS_PATH,
-            "headers": [(b"authorization", f"Bearer {token}".encode())], "query_string": b"",
+            "type": "websocket", "scheme": "ws", "path": "/internal/mc/ws",
+            "headers": [
+                (b"authorization", b"Bearer api-token"),
+                (b"x-mc-sudo-authorization", f"Bearer {token}".encode()),
+            ],
+            "query_string": b"",
         }, receive, send))
         try:
             handshake = await asyncio.wait_for(outgoing.get(), 2)
-            yield handshake["type"], incoming, outgoing
+            self.assertEqual(handshake["type"], "websocket.accept")
+            greeting = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.assertEqual(greeting["type"], "connected")
+            yield greeting["sudo_ready"], incoming, outgoing
         finally:
             incoming.put_nowait({"type": "websocket.disconnect", "code": 1000})
             await asyncio.wait_for(task, 2)
@@ -99,7 +117,7 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def result(incoming, request_id, text="在线玩家 0/20", **fields):
         incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
-            "id": request_id, "status": "ok", "output": text, **fields,
+            "type": "sudo_result", "id": request_id, "status": "ok", "output": text, **fields,
         })})
 
     async def test_forwards_full_byte_budget_and_truncation_flag(self):
@@ -117,14 +135,14 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.submit(command="list\nsay hello"))[0], 400)
         self.assertFalse(is_single_command("say first\u2028second"))
         self.assertEqual(await self.submit(), (200, {"status": "unavailable"}))
-        async with self.connect("bot-token") as (handshake, _, _):
-            self.assertEqual(handshake, "websocket.close")
+        async with self.connect("bot-token") as (sudo_ready, _, outgoing):
+            self.assertFalse(sudo_ready)
+            self.assertEqual(await self.submit(), (200, {"status": "unavailable"}))
+            self.assertEqual(await self.broadcast(outgoing), 1)
 
     async def test_waits_for_matching_result_and_refuses_concurrent_work(self):
-        async with self.connect() as (handshake, incoming, outgoing):
-            self.assertEqual(handshake, "websocket.accept")
-            async with self.connect() as (second_handshake, _, _):
-                self.assertEqual(second_handshake, "websocket.close")
+        async with self.connect() as (sudo_ready, incoming, outgoing):
+            self.assertTrue(sudo_ready)
             first = asyncio.create_task(self.submit())
             request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
             self.assertEqual(request["command"], "list")
@@ -136,6 +154,50 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(first.done())
             self.result(incoming, request["id"])
             self.assertEqual(await first, (200, {"status": "ok", "output": "在线玩家 0/20"}))
+
+    async def broadcast(self, outgoing):
+        with patch.object(self.api, "read_auth_version", return_value=1):
+            _, delivered = await self.api.broadcast_latest()
+        self.assertEqual(json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"]), {
+            "type": "auth_updated", "version": 1,
+        })
+        return delivered
+
+    async def test_invalid_result_fails_only_that_request_and_connection_keeps_broadcasting(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"], status="invalid")
+            self.assertEqual(await first, (200, {"status": "error"}))
+            self.assertEqual(await self.broadcast(outgoing), 1)
+            second = asyncio.create_task(self.submit(request_id="b" * 32))
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"])
+            self.assertEqual((await second)[1]["status"], "ok")
+
+    async def test_stalled_command_write_does_not_close_authorization_socket(self):
+        with patch.object(self.api, "WS_SEND_TIMEOUT", 0.1):
+            async with self.connect(block_send=asyncio.Event()) as (_, _, outgoing):
+                first = asyncio.create_task(self.submit(timeout=0.5))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.assertEqual(request["type"], "sudo_command")
+                self.assertEqual(await self.broadcast(outgoing), 1)
+                self.assertEqual(await first, (200, {"status": "timeout"}))
+                self.assertEqual(len(self.api.connections), 1)
+
+    async def test_second_connection_preserves_first_target_and_cannot_submit_its_result(self):
+        async with self.connect() as (_, incoming, outgoing), self.connect() as (ready, second, standby):
+            self.assertTrue(ready)
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.assertTrue(standby.empty())
+            self.result(second, request["id"], "wrong connection")
+            processed = asyncio.Event()
+            second.put_nowait(processed)
+            await asyncio.wait_for(processed.wait(), 2)
+            self.assertFalse(first.done())
+            self.result(incoming, request["id"], "first connection")
+            self.assertEqual((await first)[1]["output"], "first connection")
 
     async def test_timeout_releases_slot_and_late_result_is_ignored(self):
         async with self.connect() as (_, incoming, outgoing):

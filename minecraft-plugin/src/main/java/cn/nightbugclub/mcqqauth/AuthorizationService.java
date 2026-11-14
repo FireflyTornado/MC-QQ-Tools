@@ -1,5 +1,10 @@
 package cn.nightbugclub.mcqqauth;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.Strictness;
 import org.eclipse.jetty.client.CompletableResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
@@ -34,6 +39,7 @@ public final class AuthorizationService implements AutoCloseable {
     private static final int MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
     private static final int PING_INTERVAL_MS = 15_000;
     private static final int PONG_TIMEOUT_MS = 10_000;
+    private static final Gson JSON = new GsonBuilder().setStrictness(Strictness.STRICT).create();
 
     enum PlayerStatus { AUTHORIZED, UNAUTHORIZED, UNKNOWN }
 
@@ -54,6 +60,8 @@ public final class AuthorizationService implements AutoCloseable {
     private final SslContextFactory.Client tls;
     private final Logger logger;
     private final Runnable onSynchronized;
+    private final SudoChannel.Settings sudoSettings;
+    private final SudoChannel sudo;
     private final ScheduledThreadPoolExecutor worker;
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile Published published = new Published(View.OFFLINE, null);
@@ -67,10 +75,17 @@ public final class AuthorizationService implements AutoCloseable {
 
     AuthorizationService(PluginSettings settings, SslContextFactory.Client tls, Logger logger,
                          Runnable onSynchronized) {
+        this(settings, tls, logger, onSynchronized, null, null);
+    }
+
+    AuthorizationService(PluginSettings settings, SslContextFactory.Client tls, Logger logger,
+                         Runnable onSynchronized, SudoChannel.Settings sudoSettings, SudoChannel sudo) {
         this.settings = settings;
         this.tls = tls;
         this.logger = logger;
         this.onSynchronized = onSynchronized;
+        this.sudoSettings = sudoSettings;
+        this.sudo = sudo;
         reconnectDelay = settings.reconnectMinMs;
         worker = new ScheduledThreadPoolExecutor(1, task -> {
             Thread thread = new Thread(task, "MCQQAuth-sync");
@@ -136,6 +151,9 @@ public final class AuthorizationService implements AutoCloseable {
         connection = attempt;
         ClientUpgradeRequest upgrade = new ClientUpgradeRequest();
         upgrade.setHeader(HttpHeader.AUTHORIZATION.asString(), "Bearer " + settings.token);
+        if (sudoSettings != null) {
+            upgrade.setHeader("X-MC-Sudo-Authorization", "Bearer " + sudoSettings.token());
+        }
         upgrade.setTimeout(settings.requestTimeoutMs, MILLISECONDS);
         try {
             attempt.upgrade = websocket.connect(attempt, settings.websocketUrl, upgrade);
@@ -150,8 +168,8 @@ public final class AuthorizationService implements AutoCloseable {
         });
     }
 
-    private void receive(Connection source, AuthProtocol.Notice notice) {
-        if (connection != source) {
+    private void receive(Connection source, AuthProtocol.Notice notice, boolean sudoReady) {
+        if (connection != source || source.disconnected) {
             return;
         }
         switch (notice.type()) {
@@ -159,7 +177,15 @@ public final class AuthorizationService implements AutoCloseable {
                 if (!source.confirmed) {
                     source.confirmed = true;
                     source.timer.cancel(false);
+                    reconnectDelay = settings.reconnectMinMs;
                     schedulePing(source);
+                    if (sudo != null) {
+                        if (sudoReady) {
+                            sudo.attach(source);
+                        } else {
+                            logger.warning("/sudo 未获后端授权，授权同步继续运行");
+                        }
+                    }
                     refresh(source);
                 }
             }
@@ -175,7 +201,8 @@ public final class AuthorizationService implements AutoCloseable {
     }
 
     private void refresh(Connection source) {
-        if (!source.confirmed || source.disconnected || source.snapshotRequest != null || closed.get()) {
+        if (!source.confirmed || source.disconnected || source.snapshotRequest != null
+                || source.snapshotRetry != null || closed.get()) {
             return;
         }
         long requestedVersion = wantedVersion;
@@ -197,18 +224,18 @@ public final class AuthorizationService implements AutoCloseable {
         }
         source.snapshotRequest = null;
         if (failure != null) {
-            fail(source, "HTTPS 快照请求失败（" + failureType(failure) + "）");
+            retrySnapshot(source, "HTTPS 快照请求失败（" + failureType(failure) + "）");
             return;
         }
         if (response.getStatus() < 200 || response.getStatus() >= 300) {
-            fail(source, "HTTPS 快照返回 HTTP " + response.getStatus());
+            retrySnapshot(source, "HTTPS 快照返回 HTTP " + response.getStatus());
             return;
         }
         AuthProtocol.Snapshot candidate;
         try {
             candidate = AuthProtocol.snapshot(response.getContent());
         } catch (IOException e) {
-            fail(source, "HTTPS 快照格式无效");
+            retrySnapshot(source, "HTTPS 快照格式无效");
             return;
         }
         long minimumVersion = Math.max(wantedVersion, source.latestNoticeVersion);
@@ -219,20 +246,33 @@ public final class AuthorizationService implements AutoCloseable {
                 markUnready();
                 refresh(source);
             } else {
-                fail(source, "HTTPS 快照版本落后，等待重新同步");
+                retrySnapshot(source, "HTTPS 快照版本落后");
             }
             return;
         }
         AuthProtocol.Snapshot previous = published.view().snapshot();
         if (previous != null && candidate.version() == previous.version()
                 && !candidate.activeNames().equals(previous.activeNames())) {
-            fail(source, "HTTPS 快照同一版本返回不同名单");
+            retrySnapshot(source, "HTTPS 快照同一版本返回不同名单");
             return;
         }
         wantedVersion = candidate.version();
         published = new Published(new View(candidate, true), source);
-        reconnectDelay = settings.reconnectMinMs;
+        source.snapshotDelay = settings.reconnectMinMs;
         onSynchronized.run();
+    }
+
+    private void retrySnapshot(Connection source, String reason) {
+        markUnready();
+        if (source.snapshotRetry != null) {
+            return;
+        }
+        logger.warning(reason + "，" + source.snapshotDelay + " 毫秒后重试快照");
+        source.snapshotRetry = worker.schedule(() -> {
+            source.snapshotRetry = null;
+            refresh(source);
+        }, source.snapshotDelay, MILLISECONDS);
+        source.snapshotDelay = Math.min(source.snapshotDelay * 2, settings.reconnectMaxMs);
     }
 
     private void schedulePing(Connection source) {
@@ -255,6 +295,10 @@ public final class AuthorizationService implements AutoCloseable {
         wantedVersion = Math.max(wantedVersion, source.latestNoticeVersion);
         markUnready();
         connection = null;
+        source.disconnected = true;
+        if (sudo != null) {
+            sudo.detach(source);
+        }
         source.cancelRequests();
         if (source.session != null) {
             source.session.disconnect();
@@ -330,7 +374,7 @@ public final class AuthorizationService implements AutoCloseable {
     }
 
     // Jetty resolves listener methods via public method handles.
-    public final class Connection implements Session.Listener {
+    public final class Connection implements Session.Listener, SudoChannel.Connection {
         // These observations invalidate a published view even while its worker is processing HTTPS.
         private volatile boolean disconnected;
         private volatile long latestNoticeVersion = -1;
@@ -338,6 +382,9 @@ public final class AuthorizationService implements AutoCloseable {
         private Session session;
         private ScheduledFuture<?> timer;
         private Request snapshotRequest;
+        private ScheduledFuture<?> snapshotRetry;
+        private int snapshotDelay = settings.reconnectMinMs;
+        private final AtomicBoolean sendingResult = new AtomicBoolean();
         private boolean confirmed;
         private long ping;
         private boolean awaitingPong;
@@ -360,21 +407,52 @@ public final class AuthorizationService implements AutoCloseable {
 
         @Override
         public void onWebSocketText(String message) {
+            JsonObject body;
+            try {
+                body = JSON.fromJson(message, JsonObject.class);
+            } catch (JsonParseException e) {
+                dispatch(this::demand);
+                return;
+            }
+            var type = body == null ? null : body.get("type");
+            String name = type != null && type.isJsonPrimitive() && type.getAsJsonPrimitive().isString()
+                    ? type.getAsString() : "";
+            if (name.equals("sudo_command")) {
+                dispatch(() -> {
+                    if (sudo != null && isOpen()) {
+                        sudo.receive(this, body);
+                    }
+                    demand();
+                });
+                return;
+            }
+            if (!name.equals("auth_updated") && !name.equals("connected")) {
+                dispatch(this::demand);
+                return;
+            }
             try {
                 AuthProtocol.Notice notice = AuthProtocol.notice(message);
                 if (notice.type() == AuthProtocol.MessageType.AUTH_UPDATED) {
                     latestNoticeVersion = Math.max(latestNoticeVersion, notice.version());
                 }
-                dispatch(() -> receive(this, notice));
+                var ready = body.get("sudo_ready");
+                boolean sudoReady = ready != null && ready.isJsonPrimitive()
+                        && ready.getAsJsonPrimitive().isBoolean() && ready.getAsBoolean();
+                dispatch(() -> receive(this, notice, sudoReady));
             } catch (IOException e) {
-                reportFailure("WSS 通知格式无效");
+                dispatch(() -> {
+                    if (connection == this && confirmed && !disconnected) {
+                        retrySnapshot(this, "WSS 授权通知格式无效");
+                    }
+                    demand();
+                });
             }
         }
 
         @Override
         public void onWebSocketBinary(ByteBuffer payload, Callback callback) {
             callback.succeed();
-            reportFailure("WSS 收到意外的二进制消息");
+            dispatch(this::demand);
         }
 
         @Override
@@ -406,9 +484,39 @@ public final class AuthorizationService implements AutoCloseable {
         }
 
         private void demand() {
-            if (connection == this) {
+            if (connection == this && !disconnected) {
                 session.demand();
             }
+        }
+
+        @Override
+        public boolean isOpen() {
+            return !disconnected && !closed.get();
+        }
+
+        @Override
+        public void sendSudoResult(String message) {
+            if (!isOpen() || !sendingResult.compareAndSet(false, true)) {
+                return;
+            }
+            if (!dispatch(() -> {
+                if (connection != this || !isOpen()) {
+                    sendingResult.set(false);
+                    return;
+                }
+                try {
+                    session.sendText(message, Callback.from(() -> sendingResult.set(false), failure -> resultFailed()));
+                } catch (RuntimeException e) {
+                    resultFailed();
+                }
+            })) {
+                sendingResult.set(false);
+            }
+        }
+
+        private void resultFailed() {
+            sendingResult.set(false);
+            logger.warning("/sudo 回执发送失败");
         }
 
         private void cancelRequests() {
@@ -417,6 +525,9 @@ public final class AuthorizationService implements AutoCloseable {
             }
             if (upgrade != null) {
                 upgrade.cancel(true);
+            }
+            if (snapshotRetry != null) {
+                snapshotRetry.cancel(false);
             }
             if (snapshotRequest != null) {
                 snapshotRequest.abort(new IOException("授权连接已结束"));

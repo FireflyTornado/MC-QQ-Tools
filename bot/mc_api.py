@@ -1,9 +1,9 @@
 import asyncio
+import json
 import logging
 import secrets
 import sqlite3
 from contextlib import closing, suppress
-from dataclasses import dataclass, field
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
 
@@ -16,8 +16,8 @@ from app_config import (
     target_group_id,
 )
 from database import DB_PATH
-from sudo_api import sudo_router
-from sudo_config import read_sudo_settings
+from sudo_api import SudoService
+from sudo_config import MAX_RESULT_MESSAGE_BYTES, read_sudo_settings
 
 config = load_config()
 API_TOKEN = config_token(config, "MC_API_TOKEN").encode("ascii")
@@ -77,7 +77,8 @@ def require_token(authorization: list[str] | None = Header(default=None)) -> Non
     require_bearer(authorization, API_TOKEN)
 
 
-app.include_router(sudo_router(sudo_settings, TARGET_GROUP_ID, verify_bearer))
+sudo = SudoService(sudo_settings, TARGET_GROUP_ID, verify_bearer)
+app.include_router(sudo.router)
 
 
 @app.get("/internal/health")
@@ -143,14 +144,78 @@ def get_snapshot(response: Response):
         )
 
 
-@dataclass
-class BroadcastConnection:
-    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    failed: asyncio.Event = field(default_factory=asyncio.Event)
+class MinecraftConnection:
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+        self.outbox: dict[str, tuple[dict, asyncio.Future[bool]]] = {}
+        self.message_ready = asyncio.Event()
+        self.closed = False
+
+    async def send(self, message: dict) -> bool:
+        if self.closed:
+            return False
+        kind = message["type"]
+        # Reserve one slot per message type so queued commands cannot crowd out a notice.
+        queued = self.outbox.get(kind)
+        if queued is not None and not queued[1].cancelled():
+            return False
+        sent = asyncio.get_running_loop().create_future()
+        self.outbox[kind] = (message, sent)
+        self.message_ready.set()
+        return await sent
+
+    async def write(self, greeting: dict) -> None:
+        try:
+            async with asyncio.timeout(WS_SEND_TIMEOUT):
+                await self.websocket.send_json(greeting)
+            while True:
+                await self.message_ready.wait()
+                kind = "auth_updated" if "auth_updated" in self.outbox else "sudo_command"
+                message, sent = self.outbox.pop(kind)
+                if not self.outbox:
+                    self.message_ready.clear()
+                if sent.cancelled():
+                    continue
+                delivered = False
+                try:
+                    async with asyncio.timeout(WS_SEND_TIMEOUT):
+                        await self.websocket.send_json(message)
+                    delivered = True
+                except WebSocketDisconnect:
+                    raise
+                except Exception:
+                    if kind == "auth_updated":
+                        raise
+                finally:
+                    if not sent.done():
+                        sent.set_result(delivered)
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        self.closed = True
+        for _, sent in self.outbox.values():
+            if not sent.done():
+                sent.set_result(False)
+        self.outbox.clear()
+        self.message_ready.clear()
+
+    async def read(self) -> None:
+        while (message := await self.websocket.receive())["type"] != "websocket.disconnect":
+            raw = message.get("text")
+            if raw is None or len(raw) > MAX_RESULT_MESSAGE_BYTES:
+                continue
+            try:
+                if len(raw.encode("utf-8")) > MAX_RESULT_MESSAGE_BYTES:
+                    continue
+                body = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(body, dict) and body.get("type") == "sudo_result":
+                sudo.receive(self.send, body)
 
 
-# 每个连接的路由负责关闭，广播只标记失败。
-connections: dict[WebSocket, BroadcastConnection] = {}
+connections: dict[WebSocket, MinecraftConnection] = {}
 
 # 避免多个通知同时广播
 broadcast_lock = asyncio.Lock()
@@ -176,20 +241,6 @@ def read_auth_version() -> int:
         return row[0]
 
 
-async def send_update(websocket: WebSocket, connection: BroadcastConnection, message: dict) -> bool:
-    try:
-        async with asyncio.timeout(WS_SEND_TIMEOUT), connection.send_lock:
-            if websocket not in connections:
-                return False
-            await websocket.send_json(message)
-        return True
-    except Exception as exc:
-        connections.pop(websocket, None)
-        connection.failed.set()
-        logger.warning("授权 WebSocket 广播失败，正在关闭连接（%s）", type(exc).__name__)
-        return False
-
-
 async def broadcast_latest():
     """串行发布递增版本，每个版本并发向各连接发送。"""
     global last_broadcast_version
@@ -201,10 +252,7 @@ async def broadcast_latest():
             raise RuntimeError("数据库授权版本回退")
 
         message = {"type": "auth_updated", "version": version}
-        delivered = await asyncio.gather(*(
-            send_update(websocket, connection, message)
-            for websocket, connection in tuple(connections.items())
-        ))
+        delivered = await asyncio.gather(*(connection.send(message) for connection in tuple(connections.values())))
         last_broadcast_version = version
         return version, sum(delivered)
 
@@ -248,42 +296,32 @@ async def mc_websocket(websocket: WebSocket):
 
     await websocket.accept()
 
-    connection = BroadcastConnection()
+    connection = MinecraftConnection(websocket)
+    credentials = websocket.headers.getlist("x-mc-sudo-authorization")
+    greeting = {"type": "connected", "message": "Minecraft authentication connected"}
+    if credentials:
+        greeting["sudo_ready"] = sudo.attach(connection.send, credentials)
+    connections[websocket] = connection
+    reader = asyncio.create_task(connection.read())
+    writer = asyncio.create_task(connection.write(greeting))
 
     try:
-        # Register before the greeting so the initial snapshot and broadcasts overlap.
-        async with connection.send_lock:
-            connections[websocket] = connection
-            try:
-                async with asyncio.timeout(WS_SEND_TIMEOUT):
-                    await websocket.send_json({
-                        "type": "connected",
-                        "message": "Minecraft authentication connected",
-                    })
-            except Exception:
-                connections.pop(websocket, None)
-                await close_failed_websocket(websocket)
-                return
-
-        disconnected = asyncio.create_task(wait_for_disconnect(websocket))
-        failed = asyncio.create_task(connection.failed.wait())
+        done, _ = await asyncio.wait((reader, writer), return_when=asyncio.FIRST_COMPLETED)
+        if writer not in done:
+            reader.result()
+            return
         try:
-            done, _ = await asyncio.wait((disconnected, failed), return_when=asyncio.FIRST_COMPLETED)
-            if disconnected in done:
-                disconnected.result()
-            else:
-                await close_failed_websocket(websocket)
-        finally:
-            disconnected.cancel()
-            failed.cancel()
-            await asyncio.gather(disconnected, failed, return_exceptions=True)
+            writer.result()
+        except Exception as exc:
+            logger.warning("Minecraft WebSocket 发送失败，正在关闭连接（%s）", type(exc).__name__)
     finally:
         connections.pop(websocket, None)
-
-
-async def wait_for_disconnect(websocket: WebSocket) -> None:
-    while (await websocket.receive())["type"] != "websocket.disconnect":
-        pass
+        sudo.detach(connection.send)
+        connection.stop()
+        reader.cancel()
+        writer.cancel()
+        await asyncio.gather(reader, writer, return_exceptions=True)
+    await close_failed_websocket(websocket)
 
 
 async def close_failed_websocket(websocket: WebSocket) -> None:

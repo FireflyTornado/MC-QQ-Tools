@@ -661,7 +661,7 @@ events:
             self.assertEqual(Message(await self.command_reply("/sudo list bad", message_id=43)).extract_plain_text(),
                              error)
             self.assertEqual(Message(await self.command_reply("/sudo list", message_id=44)).extract_plain_text(),
-                             "命令已返回，服务端无输出。")
+                             "命令已返回，未捕获到输出")
             self.assertEqual(Message(await self.command_reply("/sudo list", message_id=47)).extract_plain_text(),
                              "指令通道已断开，执行结果未知。")
 

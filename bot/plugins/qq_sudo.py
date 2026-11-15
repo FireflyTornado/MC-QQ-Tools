@@ -39,7 +39,7 @@ MAX_RECENT = 1024
 replay_cache_blocked_until = 0.0
 UPLOAD_TIMEOUT = 20
 REPLIES = {
-    "ok": "命令已返回，服务端无输出。",
+    "ok": "命令已返回，未捕获到输出",
     "rejected": "该指令或参数未获服务端许可。",
     "error": "服务端执行失败或无法确认结果。",
     "busy": "有指令正在处理，请稍后重试。",

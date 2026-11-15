@@ -31,7 +31,7 @@ final class SudoChannel implements AutoCloseable {
     private static final long FEEDBACK_CHECK_MS = 50;
     private static final Gson JSON = new Gson();
 
-    record Settings(URI url, String token, boolean asyncFeedback) {
+    record Settings(URI url, String token) {
         static Settings read(ConfigurationSection config, String authToken) {
             Object enabled = config.get("sudo.enabled");
             if (Boolean.FALSE.equals(enabled)) {
@@ -56,11 +56,7 @@ final class SudoChannel implements AutoCloseable {
                     || url.getRawFragment() != null || url.getRawPath().isEmpty()) {
                 throw new IllegalArgumentException("sudo.websocket-url 必须为 WSS 地址");
             }
-            Object configured = config.get("sudo.async-feedback", false);
-            if (!(configured instanceof Boolean asyncFeedback)) {
-                throw new IllegalArgumentException("sudo.async-feedback 必须为布尔值");
-            }
-            return new Settings(url, token, asyncFeedback);
+            return new Settings(url, token);
         }
     }
 
@@ -250,7 +246,7 @@ final class SudoChannel implements AutoCloseable {
         SudoCommands.Result result = new SudoCommands.Result("expired");
         try {
             if (canRun) {
-                result = commands.execute(request.command, settings.asyncFeedback());
+                result = commands.execute(request.command);
             }
         } catch (RuntimeException e) {
             result = new SudoCommands.Result("error");

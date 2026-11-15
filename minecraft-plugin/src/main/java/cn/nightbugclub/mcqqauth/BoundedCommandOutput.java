@@ -7,8 +7,8 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 final class BoundedCommandOutput {
     static final int MAX_BYTES = 64 * 1024;
-    static final long MAX_WAIT_MS = 2_000;
-    private static final long QUIET_NANOS = MILLISECONDS.toNanos(300);
+    static final long MAX_WAIT_MS = 3_000;
+    private static final long QUIET_NANOS = MILLISECONDS.toNanos(500);
     static final String TRUNCATION_NOTICE = "\n[输出超过 64 KiB，已截断。]\n";
     private static final int NOTICE_BYTES = TRUNCATION_NOTICE.getBytes(UTF_8).length;
 
@@ -45,7 +45,7 @@ final class BoundedCommandOutput {
             if (bytes + size <= MAX_BYTES) {
                 text.appendCodePoint(codePoint);
                 bytes += size;
-                visible = visible || deadline != null && !Character.isISOControl(codePoint)
+                visible = visible || !Character.isISOControl(codePoint)
                         && !Character.isWhitespace(codePoint) && !Character.isSpaceChar(codePoint);
             } else {
                 while (bytes + NOTICE_BYTES > MAX_BYTES) {
@@ -86,7 +86,11 @@ final class BoundedCommandOutput {
     }
 
     synchronized void collectFor(long millis) {
-        deadline = clock.getAsLong() + MILLISECONDS.toNanos(millis);
+        long now = clock.getAsLong();
+        deadline = now + MILLISECONDS.toNanos(millis);
+        if (lastVisibleOutput != null) {
+            lastVisibleOutput = now;
+        }
     }
 
     synchronized Snapshot finishIfReady() {

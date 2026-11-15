@@ -85,10 +85,6 @@ final class SudoCommands {
     }
 
     Result execute(String command) {
-        return execute(command, false);
-    }
-
-    Result execute(String command, boolean collectAsync) {
         if (!validCommand(command) || allowed.stream().noneMatch(
                 prefix -> command.equals(prefix) || command.startsWith(prefix + " "))) {
             return new Result("rejected");
@@ -119,15 +115,15 @@ final class SudoCommands {
                 }
                 return new Result("error", snapshot);
             }
-            if (dispatched && collectAsync) {
+            if (dispatched) {
                 deferred = true;
                 return new Result("ok", "", false, output);
             }
             var snapshot = output.finish();
-            if (!dispatched && snapshot.text().isBlank() && !snapshot.truncated()) {
+            if (snapshot.text().isBlank() && !snapshot.truncated()) {
                 return new Result("error", "服务端未找到该命令。");
             }
-            return new Result(dispatched ? "ok" : "error", snapshot);
+            return new Result("error", snapshot);
         } finally {
             if (!deferred) {
                 output.close();

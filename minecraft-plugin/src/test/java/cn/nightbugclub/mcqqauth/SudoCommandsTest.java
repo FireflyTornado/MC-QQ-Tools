@@ -43,7 +43,6 @@ class SudoCommandsTest {
             "whitelist add Steve\u2028stop"})
     void rejectsCommandsOutsideTheTokenPrefix(String input) {
         assertEquals("rejected", new SudoCommands(server, Set.of("whitelist add")).execute(input).status());
-        assertEquals("rejected", new SudoCommands(server, Set.of("whitelist add")).execute(input, true).status());
         verifyNoInteractions(server);
     }
 
@@ -158,7 +157,10 @@ class SudoCommandsTest {
                     throw new CommandException("test failure");
                 })
                 .thenReturn(false);
-        assertEquals(new SudoCommands.Result("ok", "Players:\nAlex, Steve\n"), commands.execute("list"));
+        var result = commands.execute("list");
+        assertEquals("ok", result.status());
+        assertEquals(new BoundedCommandOutput.Snapshot("Players:\nAlex, Steve\n", false),
+                result.pendingOutput().finish());
         assertEquals(new SudoCommands.Result("error", "Incorrect argument\n"), commands.execute("list"));
         assertEquals(new SudoCommands.Result("error", "服务端未找到该命令。"), commands.execute("list"));
         assertFalse(commands.isDispatching());
@@ -186,7 +188,9 @@ class SudoCommandsTest {
         assertEquals(new SudoCommands.Result("error", "Console output 1\nDirect feedback\nConsole output 2\n"),
                 commands.execute("list"));
         logger.error("Output after dispatch");
-        assertEquals(new SudoCommands.Result("ok"), commands.execute("list"));
+        var result = commands.execute("list");
+        assertEquals("ok", result.status());
+        assertEquals(new BoundedCommandOutput.Snapshot("", false), result.pendingOutput().finish());
     }
 
     @Test
@@ -211,7 +215,7 @@ class SudoCommandsTest {
             return null;
         }).when(console).sendMessage(anyString());
 
-        var result = commands.execute("list", true);
+        var result = commands.execute("list");
         assertEquals("ok", result.status());
         assertSame(output, result.pendingOutput());
         assertFalse(commands.isDispatching());
@@ -285,12 +289,6 @@ class SudoCommandsTest {
         config.set("sudo.websocket-url", "ws://example.net/internal/mc/sudo/ws");
         assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
         config.set("sudo.websocket-url", "wss://example.net/internal/mc/sudo/ws");
-        assertFalse(SudoChannel.Settings.read(config, "auth-token").asyncFeedback());
-        config.set("sudo.async-feedback", true);
-        assertTrue(SudoChannel.Settings.read(config, "auth-token").asyncFeedback());
-        config.set("sudo.async-feedback", false);
-        assertFalse(SudoChannel.Settings.read(config, "auth-token").asyncFeedback());
-        config.set("sudo.async-feedback", "true");
-        assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
+        assertNotNull(SudoChannel.Settings.read(config, "auth-token"));
     }
 }

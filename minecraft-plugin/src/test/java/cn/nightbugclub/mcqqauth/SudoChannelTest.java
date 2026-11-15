@@ -2,6 +2,8 @@ package cn.nightbugclub.mcqqauth;
 
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -91,7 +93,7 @@ class SudoChannelTest {
             assertEquals("busy", reconnected.status());
             fixture.tasks.remove().run();
             assertEquals("ok", reconnected.status());
-            verify(fixture.commands).execute("test2", false);
+            verify(fixture.commands).execute("test2");
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
@@ -102,7 +104,7 @@ class SudoChannelTest {
         try (var fixture = new ChannelFixture()) {
             var original = fixture.connect();
             var reconnected = new ArrayDeque<Peer>();
-            when(fixture.commands.execute("test1", false)).thenAnswer(call -> {
+            when(fixture.commands.execute("test1")).thenAnswer(call -> {
                 original.disconnect();
                 var next = fixture.openNext(1000);
                 next.send(2);
@@ -118,21 +120,21 @@ class SudoChannelTest {
             next.send(3);
             fixture.tasks.remove().run();
             assertEquals("ok", next.status());
-            verify(fixture.commands).execute("test1", false);
-            verify(fixture.commands).execute("test3", false);
+            verify(fixture.commands).execute("test1");
+            verify(fixture.commands).execute("test3");
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
     }
 
     @Test
-    void asyncFeedbackEnabledWaitsForLateFeedbackAndReturnsOneCombinedResult() {
-        try (var fixture = new ChannelFixture(true)) {
+    void collectsLateFeedbackAndReturnsOneCombinedResultAfterQuiet() {
+        try (var fixture = new ChannelFixture()) {
             var clock = new AtomicLong();
             var output = new BoundedCommandOutput(clock::get);
             output.append("Initial feedback\n");
             clock.set(MILLISECONDS.toNanos(500));
-            when(fixture.commands.execute("test1", true))
+            when(fixture.commands.execute("test1"))
                     .thenReturn(new SudoCommands.Result("ok", "", false, output));
 
             var peer = fixture.connect();
@@ -146,15 +148,15 @@ class SudoChannelTest {
             clock.set(MILLISECONDS.toNanos(900));
             fixture.runNext(50, MILLISECONDS);
             assertTrue(peer.replies.isEmpty());
-            clock.set(MILLISECONDS.toNanos(1_000));
+            clock.set(MILLISECONDS.toNanos(950));
             output.append("First late line\n");
             fixture.runNext(50, MILLISECONDS);
-            clock.set(MILLISECONDS.toNanos(1_299));
+            clock.set(MILLISECONDS.toNanos(1_449));
             output.append("Second late line\n");
             fixture.runNext(50, MILLISECONDS);
             assertTrue(peer.replies.isEmpty());
 
-            clock.set(MILLISECONDS.toNanos(1_599));
+            clock.set(MILLISECONDS.toNanos(1_949));
             assertTrue(output.append("After quiet window"));
             fixture.runNext(50, MILLISECONDS);
             var result = JsonParser.parseString(peer.replies.remove()).getAsJsonObject();
@@ -162,15 +164,71 @@ class SudoChannelTest {
             assertEquals("Initial feedback\nFirst late line\nSecond late line\n", result.get("output").getAsString());
             assertTrue(output.append("After reply"));
             assertTrue(fixture.scheduled.isEmpty());
-            verify(fixture.commands).execute("test1", true);
+            verify(fixture.commands).execute("test1");
+        }
+    }
+
+    @Test
+    void synchronousFeedbackStartsQuietPeriodAtDispatchReturn() {
+        try (var fixture = new ChannelFixture()) {
+            var clock = new AtomicLong();
+            var output = new BoundedCommandOutput(clock::get);
+            output.append("Synchronous result\n");
+            clock.set(MILLISECONDS.toNanos(1_000));
+            when(fixture.commands.execute("test1"))
+                    .thenReturn(new SudoCommands.Result("ok", "", false, output));
+            var peer = fixture.connect();
+            fixture.takeNext(20, SECONDS);
+            peer.send(1);
+            fixture.tasks.remove().run();
+            assertTrue(peer.replies.isEmpty());
+
+            clock.set(MILLISECONDS.toNanos(1_499));
+            fixture.runNext(50, MILLISECONDS);
+            assertTrue(peer.replies.isEmpty());
+            clock.set(MILLISECONDS.toNanos(1_500));
+            fixture.runNext(50, MILLISECONDS);
+            assertEquals("Synchronous result\n", JsonParser.parseString(peer.replies.remove())
+                    .getAsJsonObject().get("output").getAsString());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopsAtThreeSecondsWithOrWithoutLateFeedback(boolean lateFeedback) {
+        try (var fixture = new ChannelFixture()) {
+            var clock = new AtomicLong();
+            var output = new BoundedCommandOutput(clock::get);
+            when(fixture.commands.execute("test1"))
+                    .thenReturn(new SudoCommands.Result("ok", "", false, output));
+            var peer = fixture.connect();
+            fixture.takeNext(20, SECONDS);
+            peer.send(1);
+            fixture.tasks.remove().run();
+
+            clock.set(MILLISECONDS.toNanos(2_800));
+            fixture.runNext(50, MILLISECONDS);
+            assertTrue(peer.replies.isEmpty());
+            if (lateFeedback) {
+                output.append("Late result\n");
+            }
+            clock.set(MILLISECONDS.toNanos(2_999));
+            fixture.runNext(50, MILLISECONDS);
+            assertTrue(peer.replies.isEmpty());
+            clock.set(MILLISECONDS.toNanos(3_000));
+            fixture.runNext(50, MILLISECONDS);
+            var result = JsonParser.parseString(peer.replies.remove()).getAsJsonObject();
+            assertEquals("ok", result.get("status").getAsString());
+            assertEquals(lateFeedback ? "Late result\n" : "", result.get("output").getAsString());
+            assertTrue(fixture.scheduled.isEmpty());
         }
     }
 
     @Test
     void disconnectCancelsFeedbackCollectionAndReleasesSlot() {
-        try (var fixture = new ChannelFixture(true)) {
+        try (var fixture = new ChannelFixture()) {
             var output = new BoundedCommandOutput();
-            when(fixture.commands.execute("test1", true))
+            when(fixture.commands.execute("test1"))
                     .thenReturn(new SudoCommands.Result("ok", "", false, output));
             var original = fixture.connect();
             fixture.takeNext(20, SECONDS);
@@ -189,7 +247,7 @@ class SudoChannelTest {
             assertTrue(reconnected.replies.isEmpty());
             fixture.tasks.remove().run();
             assertEquals("ok", reconnected.status());
-            verify(fixture.commands).execute("test2", true);
+            verify(fixture.commands).execute("test2");
         }
     }
 
@@ -201,10 +259,6 @@ class SudoChannelTest {
         final SudoChannel channel;
 
         ChannelFixture() {
-            this(false);
-        }
-
-        ChannelFixture(boolean asyncFeedback) {
             var http = mock(HttpClient.class);
             var timer = mock(ScheduledExecutorService.class);
             when(timer.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenAnswer(call -> {
@@ -215,9 +269,8 @@ class SudoChannelTest {
                 return future;
             });
             when(http.newWebSocketBuilder()).thenReturn(builder);
-            when(commands.execute(anyString(), anyBoolean())).thenReturn(new SudoCommands.Result("ok"));
-            var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token",
-                    asyncFeedback);
+            when(commands.execute(anyString())).thenReturn(new SudoCommands.Result("ok"));
+            var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token");
             channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), 1000, 30000, http, timer);
         }
 

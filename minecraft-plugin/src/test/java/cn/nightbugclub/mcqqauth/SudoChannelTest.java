@@ -9,10 +9,12 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -124,6 +126,73 @@ class SudoChannelTest {
         }
     }
 
+    @Test
+    void configuredCommandWaitsForLateFeedbackAndReturnsOneCombinedResult() {
+        try (var fixture = new ChannelFixture(Set.of("test1"))) {
+            var clock = new AtomicLong();
+            var output = new BoundedCommandOutput(clock::get);
+            output.append("Initial feedback\n");
+            clock.set(MILLISECONDS.toNanos(500));
+            when(fixture.commands.execute("test1", true))
+                    .thenReturn(new SudoCommands.Result("ok", "", false, output));
+
+            var peer = fixture.connect();
+            fixture.takeNext(20, SECONDS);
+            peer.send(1);
+            fixture.tasks.remove().run();
+            assertTrue(peer.replies.isEmpty());
+            peer.send(2);
+            assertEquals("busy", peer.status());
+
+            clock.set(MILLISECONDS.toNanos(900));
+            fixture.runNext(50, MILLISECONDS);
+            assertTrue(peer.replies.isEmpty());
+            clock.set(MILLISECONDS.toNanos(1_000));
+            output.append("First late line\n");
+            fixture.runNext(50, MILLISECONDS);
+            clock.set(MILLISECONDS.toNanos(1_299));
+            output.append("Second late line\n");
+            fixture.runNext(50, MILLISECONDS);
+            assertTrue(peer.replies.isEmpty());
+
+            clock.set(MILLISECONDS.toNanos(1_599));
+            assertTrue(output.append("After quiet window"));
+            fixture.runNext(50, MILLISECONDS);
+            var result = JsonParser.parseString(peer.replies.remove()).getAsJsonObject();
+            assertEquals("ok", result.get("status").getAsString());
+            assertEquals("Initial feedback\nFirst late line\nSecond late line\n", result.get("output").getAsString());
+            assertTrue(output.append("After reply"));
+            assertTrue(fixture.scheduled.isEmpty());
+            verify(fixture.commands).execute("test1", true);
+        }
+    }
+
+    @Test
+    void disconnectCancelsFeedbackCollectionAndReleasesSlot() {
+        try (var fixture = new ChannelFixture(Set.of("test1"))) {
+            var output = new BoundedCommandOutput();
+            when(fixture.commands.execute("test1", true))
+                    .thenReturn(new SudoCommands.Result("ok", "", false, output));
+            var original = fixture.connect();
+            fixture.takeNext(20, SECONDS);
+            original.send(1);
+            fixture.tasks.remove().run();
+            var check = fixture.takeNext(50, MILLISECONDS);
+            original.disconnect();
+            verify(check.future()).cancel(false);
+
+            var reconnected = fixture.openNext(1000);
+            reconnected.send(2);
+            check.action().run();
+            assertTrue(output.append("From disconnected request"));
+            assertEquals("", output.snapshot().text());
+            assertTrue(original.replies.isEmpty());
+            assertTrue(reconnected.replies.isEmpty());
+            fixture.tasks.remove().run();
+            assertEquals("ok", reconnected.status());
+        }
+    }
+
     private static final class ChannelFixture implements AutoCloseable {
         final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
         final ArrayDeque<ScheduledTask> scheduled = new ArrayDeque<>();
@@ -132,6 +201,10 @@ class SudoChannelTest {
         final SudoChannel channel;
 
         ChannelFixture() {
+            this(Set.of());
+        }
+
+        ChannelFixture(Set<String> asyncFeedbackCommands) {
             var http = mock(HttpClient.class);
             var timer = mock(ScheduledExecutorService.class);
             when(timer.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenAnswer(call -> {
@@ -143,7 +216,8 @@ class SudoChannelTest {
             });
             when(http.newWebSocketBuilder()).thenReturn(builder);
             when(commands.execute(anyString())).thenReturn(new SudoCommands.Result("ok"));
-            var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token");
+            var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token",
+                    asyncFeedbackCommands);
             channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), 1000, 30000, http, timer);
         }
 

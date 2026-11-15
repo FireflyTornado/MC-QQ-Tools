@@ -42,9 +42,11 @@ final class MohistCommandFeedback {
                     new Class<?>[]{methods.visitorType}, (proxy, method, args) ->
                             output.append((String) args[0]) ? Optional.of(Boolean.TRUE) : Optional.empty());
             Consumer<Object> appendComponent = component -> {
-                if (!output.truncated()) {
-                    visit(methods.visit, component, visitor);
-                    output.append("\n");
+                synchronized (output) {
+                    if (output.acceptingOutput()) {
+                        visit(methods.visit, component, visitor);
+                        output.append("\n");
+                    }
                 }
             };
             Consumer<String> appendString = output::append;

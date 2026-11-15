@@ -47,7 +47,7 @@ final class ConsoleLogCapture extends AbstractFilter implements AutoCloseable {
 
     @Override
     public Result filter(LogEvent event) {
-        if (Thread.currentThread() == dispatchThread && !output.truncated()) {
+        if (Thread.currentThread() == dispatchThread && output.acceptingOutput()) {
             output.appendLine(event.getMessage().getFormattedMessage());
         }
         return Result.NEUTRAL;

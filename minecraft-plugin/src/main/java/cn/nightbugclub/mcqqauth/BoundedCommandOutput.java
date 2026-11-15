@@ -1,19 +1,40 @@
 package cn.nightbugclub.mcqqauth;
 
+import java.util.function.LongSupplier;
+
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 final class BoundedCommandOutput {
     static final int MAX_BYTES = 64 * 1024;
+    static final long MAX_WAIT_MS = 2_000;
+    private static final long QUIET_NANOS = MILLISECONDS.toNanos(300);
     static final String TRUNCATION_NOTICE = "\n[输出超过 64 KiB，已截断。]\n";
     private static final int NOTICE_BYTES = TRUNCATION_NOTICE.getBytes(UTF_8).length;
 
     record Snapshot(String text, boolean truncated) {}
 
     private final StringBuilder text = new StringBuilder();
+    private final LongSupplier clock;
     private int bytes;
     private boolean truncated;
+    private boolean closed;
+    private Long deadline;
+    private Long lastVisibleOutput;
+
+    BoundedCommandOutput() {
+        this(System::nanoTime);
+    }
+
+    BoundedCommandOutput(LongSupplier clock) {
+        this.clock = clock;
+    }
 
     synchronized boolean append(String part) {
+        if (!acceptingOutput()) {
+            return true;
+        }
+        boolean visible = false;
         for (int offset = 0; !truncated && offset < part.length();) {
             int codePoint = part.codePointAt(offset);
             offset += Character.charCount(codePoint);
@@ -24,6 +45,8 @@ final class BoundedCommandOutput {
             if (bytes + size <= MAX_BYTES) {
                 text.appendCodePoint(codePoint);
                 bytes += size;
+                visible = visible || deadline != null && !Character.isISOControl(codePoint)
+                        && !Character.isWhitespace(codePoint) && !Character.isSpaceChar(codePoint);
             } else {
                 while (bytes + NOTICE_BYTES > MAX_BYTES) {
                     int last = text.codePointBefore(text.length());
@@ -33,6 +56,9 @@ final class BoundedCommandOutput {
                 text.append(TRUNCATION_NOTICE);
                 truncated = true;
             }
+        }
+        if (visible) {
+            lastVisibleOutput = clock.getAsLong();
         }
         return truncated;
     }
@@ -48,8 +74,32 @@ final class BoundedCommandOutput {
         }
     }
 
-    synchronized boolean truncated() {
-        return truncated;
+    synchronized boolean acceptingOutput() {
+        if (closed || truncated) {
+            return false;
+        }
+        if (deadline == null) {
+            return true;
+        }
+        long now = clock.getAsLong();
+        return now - deadline < 0 && (lastVisibleOutput == null || now - lastVisibleOutput < QUIET_NANOS);
+    }
+
+    synchronized void collectFor(long millis) {
+        deadline = clock.getAsLong() + MILLISECONDS.toNanos(millis);
+    }
+
+    synchronized Snapshot finishIfReady() {
+        return acceptingOutput() ? null : finish();
+    }
+
+    synchronized Snapshot finish() {
+        close();
+        return snapshot();
+    }
+
+    synchronized void close() {
+        closed = true;
     }
 
     private static int utf8Bytes(int codePoint) {

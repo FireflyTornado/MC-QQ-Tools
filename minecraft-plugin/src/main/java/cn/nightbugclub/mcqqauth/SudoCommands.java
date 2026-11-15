@@ -15,7 +15,15 @@ final class SudoCommands {
     static final String ALLOWLIST_FILE = "sudo-allowlist.txt";
     private static final Pattern COMMAND_LABEL = Pattern.compile("[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?");
 
-    record Result(String status, String output, boolean truncated) {
+    record Result(String status, String output, boolean truncated, BoundedCommandOutput pendingOutput) {
+        Result(String status, String output, boolean truncated) {
+            this(status, output, truncated, null);
+        }
+
+        Result(String status, BoundedCommandOutput.Snapshot output) {
+            this(status, output.text(), output.truncated());
+        }
+
         Result(String status, String output) {
             this(status, output, false);
         }
@@ -67,7 +75,7 @@ final class SudoCommands {
                 if (prefix.isEmpty() || prefix.startsWith("#")) {
                     continue;
                 }
-                if (!validCommand(prefix) || !COMMAND_LABEL.matcher(label(prefix)).matches()) {
+                if (!validPrefix(prefix)) {
                     throw new IllegalArgumentException(ALLOWLIST_FILE + " 第 " + lineNumber + " 行的命令前缀无效");
                 }
                 prefixes.add(prefix);
@@ -77,8 +85,11 @@ final class SudoCommands {
     }
 
     Result execute(String command) {
-        if (!validCommand(command) || allowed.stream().noneMatch(
-                prefix -> command.equals(prefix) || command.startsWith(prefix + " "))) {
+        return execute(command, false);
+    }
+
+    Result execute(String command, boolean collectAsync) {
+        if (!validCommand(command) || !matchesPrefix(command, allowed)) {
             return new Result("rejected");
         }
 
@@ -93,26 +104,43 @@ final class SudoCommands {
         } catch (IllegalStateException e) {
             return new Result("error", "服务端命令反馈接口不可用，指令未执行。");
         }
+        BoundedCommandOutput output = feedback.output();
         dispatching = true;
+        boolean deferred = false;
         try {
             boolean dispatched;
             try (var console = ConsoleLogCapture.open(server.getClass().getClassLoader(), feedback.output())) {
                 dispatched = server.dispatchCommand(feedback.sender(), command);
             } catch (CommandException e) {
-                var output = feedback.output().snapshot();
-                if (output.text().isBlank() && !output.truncated()) {
+                var snapshot = output.finish();
+                if (snapshot.text().isBlank() && !snapshot.truncated()) {
                     throw e;
                 }
-                return new Result("error", output.text(), output.truncated());
+                return new Result("error", snapshot);
             }
-            var output = feedback.output().snapshot();
-            if (!dispatched && output.text().isBlank() && !output.truncated()) {
+            if (dispatched && collectAsync) {
+                deferred = true;
+                return new Result("ok", "", false, output);
+            }
+            var snapshot = output.finish();
+            if (!dispatched && snapshot.text().isBlank() && !snapshot.truncated()) {
                 return new Result("error", "服务端未找到该命令。");
             }
-            return new Result(dispatched ? "ok" : "error", output.text(), output.truncated());
+            return new Result(dispatched ? "ok" : "error", snapshot);
         } finally {
+            if (!deferred) {
+                output.close();
+            }
             dispatching = false;
         }
+    }
+
+    static boolean validPrefix(String prefix) {
+        return validCommand(prefix) && COMMAND_LABEL.matcher(label(prefix)).matches();
+    }
+
+    static boolean matchesPrefix(String command, Set<String> prefixes) {
+        return prefixes.stream().anyMatch(prefix -> command.equals(prefix) || command.startsWith(prefix + " "));
     }
 
     private static String label(String command) {

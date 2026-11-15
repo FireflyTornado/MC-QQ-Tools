@@ -11,7 +11,10 @@ import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -28,9 +31,14 @@ final class SudoChannel implements AutoCloseable {
     private static final int PONG_TIMEOUT_SECONDS = 15;
     private static final long TTL_MS = 30_000;
     private static final long CLOCK_SKEW_MS = 1_000;
+    private static final long FEEDBACK_CHECK_MS = 50;
     private static final Gson JSON = new Gson();
 
-    record Settings(URI url, String token) {
+    record Settings(URI url, String token, Set<String> asyncFeedbackCommands) {
+        Settings(URI url, String token) {
+            this(url, token, Set.of());
+        }
+
         static Settings read(ConfigurationSection config, String authToken) {
             Object enabled = config.get("sudo.enabled");
             if (Boolean.FALSE.equals(enabled)) {
@@ -55,7 +63,18 @@ final class SudoChannel implements AutoCloseable {
                     || url.getRawFragment() != null || url.getRawPath().isEmpty()) {
                 throw new IllegalArgumentException("sudo.websocket-url 必须为 WSS 地址");
             }
-            return new Settings(url, token);
+            Object configured = config.get("sudo.async-feedback-commands", List.of());
+            if (!(configured instanceof List<?> entries)) {
+                throw new IllegalArgumentException("sudo.async-feedback-commands 必须为命令前缀列表");
+            }
+            var prefixes = new HashSet<String>();
+            for (Object entry : entries) {
+                if (!(entry instanceof String prefix) || !SudoCommands.validPrefix(prefix)) {
+                    throw new IllegalArgumentException("sudo.async-feedback-commands 含无效的命令前缀");
+                }
+                prefixes.add(prefix);
+            }
+            return new Settings(url, token, Set.copyOf(prefixes));
         }
     }
 
@@ -107,6 +126,8 @@ final class SudoChannel implements AutoCloseable {
     private Connection active;
     private Request running;
     private boolean executing;
+    private BoundedCommandOutput feedbackOutput;
+    private ScheduledFuture<?> feedbackCheck;
     private final RequestHistory history = new RequestHistory();
 
     SudoChannel(Settings settings, SudoCommands commands, Consumer<Runnable> onMain, Logger log,
@@ -193,6 +214,7 @@ final class SudoChannel implements AutoCloseable {
         }
         active = null;
         if (!executing) {
+            cancelFeedback();
             running = null;
         }
         connection.abort();
@@ -242,13 +264,58 @@ final class SudoChannel implements AutoCloseable {
         SudoCommands.Result result = new SudoCommands.Result("expired");
         try {
             if (canRun) {
-                result = commands.execute(request.command);
+                result = SudoCommands.matchesPrefix(request.command, settings.asyncFeedbackCommands())
+                        ? commands.execute(request.command, true) : commands.execute(request.command);
             }
         } catch (RuntimeException e) {
             result = new SudoCommands.Result("error");
             log.warning("/sudo #" + request.id + " 执行异常（" + e.getClass().getSimpleName() + "）");
         } finally {
+            completeDispatch(source, request, result);
+        }
+    }
+
+    private synchronized void completeDispatch(Connection source, Request request, SudoCommands.Result result) {
+        var output = result.pendingOutput();
+        if (output == null) {
             finish(source, request, result);
+            return;
+        }
+        if (active != source || running != request) {
+            output.close();
+            finish(source, request, result);
+            return;
+        }
+
+        executing = false;
+        feedbackOutput = output;
+        long remaining = request.deadlineMs - CLOCK_SKEW_MS - System.currentTimeMillis();
+        output.collectFor(Math.max(0, Math.min(BoundedCommandOutput.MAX_WAIT_MS, remaining)));
+        checkFeedback(source, request);
+    }
+
+    private synchronized void checkFeedback(Connection source, Request request) {
+        if (active != source || running != request || feedbackOutput == null) {
+            return;
+        }
+        feedbackCheck = null;
+        var output = feedbackOutput.finishIfReady();
+        if (output != null) {
+            feedbackOutput = null;
+            finish(source, request, new SudoCommands.Result("ok", output));
+        } else {
+            feedbackCheck = timer.schedule(() -> checkFeedback(source, request), FEEDBACK_CHECK_MS, MILLISECONDS);
+        }
+    }
+
+    private void cancelFeedback() {
+        if (feedbackCheck != null) {
+            feedbackCheck.cancel(false);
+            feedbackCheck = null;
+        }
+        if (feedbackOutput != null) {
+            feedbackOutput.close();
+            feedbackOutput = null;
         }
     }
 
@@ -284,6 +351,7 @@ final class SudoChannel implements AutoCloseable {
         closed = true;
         timer.shutdownNow();
         if (!executing) {
+            cancelFeedback();
             running = null;
         }
         if (active != null) {

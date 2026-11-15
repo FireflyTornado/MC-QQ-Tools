@@ -20,11 +20,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.net.SocketAddress;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -197,6 +200,31 @@ class SudoCommandsTest {
     }
 
     @Test
+    void asyncDispatchKeepsOnlyItsOwnSenderBufferOpenUntilTheDeadline() {
+        var clock = new AtomicLong();
+        var output = new BoundedCommandOutput(clock::get);
+        var commands = new SudoCommands(server, Set.of("list"),
+                () -> new MohistCommandFeedback.Capture(console, output));
+        when(server.dispatchCommand(console, "list")).thenReturn(true);
+        doAnswer(call -> {
+            output.append(call.getArgument(0, String.class));
+            return null;
+        }).when(console).sendMessage(anyString());
+
+        var result = commands.execute("list", true);
+        assertEquals("ok", result.status());
+        assertSame(output, result.pendingOutput());
+        assertFalse(commands.isDispatching());
+        output.collectFor(100);
+        CompletableFuture.runAsync(() -> console.sendMessage("Later\n")).join();
+        assertNull(output.finishIfReady());
+        clock.set(MILLISECONDS.toNanos(100));
+        console.sendMessage("Past deadline\n");
+        assertEquals(new BoundedCommandOutput.Snapshot("Later\n", false), output.finishIfReady());
+        verify(server).dispatchCommand(console, "list");
+    }
+
+    @Test
     void retainsFullUtf8BudgetAndTruncatesOnCharacterBoundaryWithNotice() {
         var output = new BoundedCommandOutput();
         String limit = "😀".repeat(16_384);
@@ -257,6 +285,12 @@ class SudoCommandsTest {
         config.set("sudo.websocket-url", "ws://example.net/internal/mc/sudo/ws");
         assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
         config.set("sudo.websocket-url", "wss://example.net/internal/mc/sudo/ws");
-        assertNotNull(SudoChannel.Settings.read(config, "auth-token"));
+        assertEquals(Set.of(), SudoChannel.Settings.read(config, "auth-token").asyncFeedbackCommands());
+        config.set("sudo.async-feedback-commands", List.of("example:status check"));
+        var settings = SudoChannel.Settings.read(config, "auth-token");
+        assertTrue(SudoCommands.matchesPrefix("example:status check world", settings.asyncFeedbackCommands()));
+        assertFalse(SudoCommands.matchesPrefix("example:status checked", settings.asyncFeedbackCommands()));
+        config.set("sudo.async-feedback-commands", "example:status check");
+        assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
     }
 }

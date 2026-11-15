@@ -33,6 +33,8 @@ sudo:
   websocket-url: ""
   token: ""
   # 指令允许清单由同目录的 sudo-allowlist.txt 管理。
+  # 仅对这些命令前缀短暂等待发给原发送者的异步反馈。
+  async-feedback-commands: []
 
 messages:
   unauthorized: "此 Minecraft 游戏 ID 未获得授权，请先在 QQ 群中绑定。"

@@ -15,12 +15,11 @@ import java.net.SocketAddress;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 
 import static org.objectweb.asm.Opcodes.*;
 
 final class MohistCommandFeedback {
-    record Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output) {}
+    record Capture(RemoteConsoleCommandSender sender, BoundedCommandOutput output) {}
 
     private record Access(Constructor<?> constructor, Method createStack, Method getSender,
                           Method visit, Class<?> visitorType, Object handle) {}
@@ -54,7 +53,7 @@ final class MohistCommandFeedback {
                     new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), appendComponent, appendString);
             var sender = Objects.requireNonNull(
                     (RemoteConsoleCommandSender) methods.getSender.invoke(source, methods.createStack.invoke(source)));
-            return new Capture(sender, output::snapshot);
+            return new Capture(sender, output);
         } catch (ReflectiveOperationException | LinkageError | ClassCastException | NullPointerException e) {
             throw new IllegalStateException("Mohist command feedback is unavailable", e);
         }

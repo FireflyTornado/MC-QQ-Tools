@@ -1,5 +1,6 @@
 package cn.nightbugclub.mcqqauth;
 
+import org.apache.logging.log4j.LogManager;
 import org.bukkit.Bukkit;
 import org.bukkit.Server;
 import org.bukkit.command.Command;
@@ -21,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.net.SocketAddress;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -61,7 +63,7 @@ class SudoCommandsTest {
         var prefixes = SudoCommands.readAllowlist(file);
         assertEquals(Set.of("whitelist add", "example:inspect world"), prefixes);
         var commands = new SudoCommands(server, prefixes,
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()));
         when(server.dispatchCommand(console, "whitelist add Steve Alex")).thenReturn(true);
         when(server.dispatchCommand(console, "example:inspect world \"夜间 测试\"")).thenReturn(true);
         assertEquals("ok", commands.execute("whitelist add Steve Alex").status());
@@ -73,7 +75,7 @@ class SudoCommandsTest {
     @Test
     void rootPrefixIncludesExactCommandAndEverySubcommand() {
         var commands = new SudoCommands(server, Set.of("whitelist"),
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()));
         when(server.dispatchCommand(eq(console), anyString())).thenReturn(true);
         for (String input : Set.of("whitelist", "whitelist on", "whitelist remove Steve", "whitelist add Alex")) {
             assertEquals("ok", commands.execute(input).status());
@@ -94,7 +96,7 @@ class SudoCommandsTest {
                 .thenAnswer(call -> commandMap.dispatch(console, call.getArgument(1, String.class)));
 
         var commands = new SudoCommands(server, Set.of("greet", "minecraft:greet"),
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()));
         try (var bukkit = mockStatic(Bukkit.class)) {
             bukkit.when(Bukkit::getPluginManager).thenReturn(mock(PluginManager.class));
             assertEquals("ok", commands.execute("greet").status());
@@ -127,7 +129,7 @@ class SudoCommandsTest {
         assertInstanceOf(FormattedCommandAlias.class, commandMap.getCommand(alias));
 
         var commands = new SudoCommands(server, Set.of(alias),
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()));
         assertEquals("rejected", commands.execute(alias + " argument").status());
         verify(server, never()).dispatchCommand(any(), anyString());
     }
@@ -141,7 +143,7 @@ class SudoCommandsTest {
                 output.append(call.getArgument(0, String.class));
                 return null;
             }).when(sender).sendMessage(anyString());
-            return new MohistCommandFeedback.Capture(sender, output::snapshot);
+            return new MohistCommandFeedback.Capture(sender, output);
         });
         when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("list")))
                 .thenAnswer(call -> {
@@ -157,6 +159,31 @@ class SudoCommandsTest {
         assertEquals(new SudoCommands.Result("error", "Incorrect argument\n"), commands.execute("list"));
         assertEquals(new SudoCommands.Result("error", "服务端未找到该命令。"), commands.execute("list"));
         assertFalse(commands.isDispatching());
+    }
+
+    @Test
+    void mergesConsoleLogsFromTheDispatchThreadWithSenderFeedback() {
+        var logger = LogManager.getLogger(SudoCommandsTest.class);
+        var commands = new SudoCommands(server, Set.of("list"), () -> {
+            var output = new BoundedCommandOutput();
+            doAnswer(call -> {
+                output.append(call.getArgument(0, String.class));
+                return null;
+            }).when(console).sendMessage(anyString());
+            return new MohistCommandFeedback.Capture(console, output);
+        });
+        when(server.dispatchCommand(console, "list")).thenAnswer(call -> {
+            logger.error("Console output {}", 1);
+            CompletableFuture.runAsync(() -> logger.error("Unrelated worker output")).join();
+            console.sendMessage("Direct feedback\n");
+            logger.error("Console output {}", 2);
+            throw new CommandException("Test command failure");
+        }).thenReturn(true);
+
+        assertEquals(new SudoCommands.Result("error", "Console output 1\nDirect feedback\nConsole output 2\n"),
+                commands.execute("list"));
+        logger.error("Output after dispatch");
+        assertEquals(new SudoCommands.Result("ok"), commands.execute("list"));
     }
 
     @Test

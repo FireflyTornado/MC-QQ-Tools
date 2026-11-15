@@ -96,16 +96,16 @@ final class SudoCommands {
         dispatching = true;
         try {
             boolean dispatched;
-            try {
+            try (var console = ConsoleLogCapture.open(server.getClass().getClassLoader(), feedback.output())) {
                 dispatched = server.dispatchCommand(feedback.sender(), command);
             } catch (CommandException e) {
-                var output = feedback.output().get();
+                var output = feedback.output().snapshot();
                 if (output.text().isBlank() && !output.truncated()) {
                     throw e;
                 }
                 return new Result("error", output.text(), output.truncated());
             }
-            var output = feedback.output().get();
+            var output = feedback.output().snapshot();
             if (!dispatched && output.text().isBlank() && !output.truncated()) {
                 return new Result("error", "服务端未找到该命令。");
             }

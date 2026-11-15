@@ -6,11 +6,17 @@ import org.junit.jupiter.api.Test;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -19,13 +25,61 @@ import static org.mockito.Mockito.*;
 
 class SudoChannelTest {
     @Test
+    void failedHandshakesBackOffAndOpeningResetsTheDelay() {
+        try (var fixture = new ChannelFixture()) {
+            when(fixture.builder.buildAsync(any(URI.class), any(WebSocket.Listener.class)))
+                    .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("handshake failed")));
+            fixture.channel.start();
+            fixture.runNext(0, MILLISECONDS);
+            for (int delay : new int[]{1000, 2000, 4000, 8000, 16000, 30000, 30000}) {
+                fixture.runNext(delay, MILLISECONDS);
+            }
+
+            Peer peer = fixture.openNext(30000);
+            ScheduledTask firstPing = fixture.takeNext(20, SECONDS);
+            peer.disconnect();
+            verify(firstPing.future()).cancel(false);
+            fixture.takeNext(1000, MILLISECONDS);
+            assertTrue(fixture.scheduled.isEmpty());
+        }
+    }
+
+    @Test
+    void onlyMatchingPongSchedulesNextPingAndMissingPongReconnects() {
+        try (var fixture = new ChannelFixture()) {
+            Peer peer = fixture.connect();
+            peer.listener.onPong(peer.socket, ByteBuffer.allocate(0));
+            fixture.runNext(20, SECONDS);
+            ScheduledTask firstTimeout = fixture.takeNext(15, SECONDS);
+            long firstPing = peer.pings.remove();
+
+            peer.pong(firstPing + 1);
+            verifyNoInteractions(firstTimeout.future());
+            assertTrue(fixture.scheduled.isEmpty());
+            peer.pong(firstPing);
+            verify(firstTimeout.future()).cancel(false);
+            fixture.runNext(20, SECONDS);
+            ScheduledTask secondTimeout = fixture.takeNext(15, SECONDS);
+            assertEquals(firstPing + 1, peer.pings.remove());
+
+            peer.pong(firstPing);
+            firstTimeout.action().run();
+            verify(peer.socket, never()).abort();
+            secondTimeout.action().run();
+            verify(peer.socket).abort();
+            fixture.takeNext(1000, MILLISECONDS);
+            assertTrue(fixture.scheduled.isEmpty());
+        }
+    }
+
+    @Test
     void reconnectReleasesQueuedRequestWithoutReleasingItsReplacement() {
         try (var fixture = new ChannelFixture()) {
             var original = fixture.connect();
             original.send(1);
             original.disconnect();
 
-            var reconnected = fixture.connect();
+            var reconnected = fixture.openNext(1000);
             reconnected.send(1);
             assertEquals("rejected", reconnected.status());
             reconnected.send(2);
@@ -49,7 +103,7 @@ class SudoChannelTest {
             var reconnected = new ArrayDeque<Peer>();
             when(fixture.commands.execute("test1")).thenAnswer(call -> {
                 original.disconnect();
-                var next = fixture.connect();
+                var next = fixture.openNext(1000);
                 next.send(2);
                 assertEquals("busy", next.status());
                 assertTrue(fixture.tasks.isEmpty());
@@ -72,19 +126,33 @@ class SudoChannelTest {
 
     private static final class ChannelFixture implements AutoCloseable {
         final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
+        final ArrayDeque<ScheduledTask> scheduled = new ArrayDeque<>();
         final SudoCommands commands = mock(SudoCommands.class);
         final WebSocket.Builder builder = mock(WebSocket.Builder.class, RETURNS_SELF);
         final SudoChannel channel;
 
         ChannelFixture() {
             var http = mock(HttpClient.class);
+            var timer = mock(ScheduledExecutorService.class);
+            when(timer.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenAnswer(call -> {
+                var future = mock(ScheduledFuture.class);
+                var task = new ScheduledTask(call.getArgument(0), call.getArgument(1), call.getArgument(2), future);
+                when(future.cancel(false)).thenAnswer(cancel -> scheduled.remove(task));
+                scheduled.add(task);
+                return future;
+            });
             when(http.newWebSocketBuilder()).thenReturn(builder);
             when(commands.execute(anyString())).thenReturn(new SudoCommands.Result("ok"));
             var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token");
-            channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), http);
+            channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), 1000, 30000, http, timer);
         }
 
         Peer connect() {
+            channel.start();
+            return openNext(0);
+        }
+
+        Peer openNext(int delayMs) {
             var opened = new ArrayDeque<Peer>();
             doAnswer(call -> {
                 var peer = new Peer(call.getArgument(1));
@@ -92,8 +160,19 @@ class SudoChannelTest {
                 opened.add(peer);
                 return CompletableFuture.completedFuture(peer.socket);
             }).when(builder).buildAsync(any(URI.class), any(WebSocket.Listener.class));
-            channel.maintain();
+            runNext(delayMs, MILLISECONDS);
             return opened.remove();
+        }
+
+        ScheduledTask takeNext(long delay, TimeUnit unit) {
+            ScheduledTask next = scheduled.remove();
+            assertEquals(delay, next.delay());
+            assertEquals(unit, next.unit());
+            return next;
+        }
+
+        void runNext(long delay, TimeUnit unit) {
+            takeNext(delay, unit).action().run();
         }
 
         @Override
@@ -102,13 +181,20 @@ class SudoChannelTest {
         }
     }
 
+    private record ScheduledTask(Runnable action, long delay, TimeUnit unit, ScheduledFuture<?> future) {}
+
     private static final class Peer {
         final WebSocket.Listener listener;
         final WebSocket socket = mock(WebSocket.class);
         final ArrayDeque<String> replies = new ArrayDeque<>();
+        final ArrayDeque<Long> pings = new ArrayDeque<>();
 
         Peer(WebSocket.Listener listener) {
             this.listener = listener;
+            when(socket.sendPing(any(ByteBuffer.class))).thenAnswer(call -> {
+                pings.add(call.<ByteBuffer>getArgument(0).getLong());
+                return CompletableFuture.completedFuture(socket);
+            });
             when(socket.sendText(anyString(), eq(true))).thenAnswer(call -> {
                 replies.add(call.getArgument(0));
                 return CompletableFuture.completedFuture(socket);
@@ -129,6 +215,10 @@ class SudoChannelTest {
 
         void disconnect() {
             listener.onClose(socket, 1000, "");
+        }
+
+        void pong(long ping) {
+            listener.onPong(socket, ByteBuffer.allocate(Long.BYTES).putLong(ping).flip());
         }
     }
 

@@ -63,7 +63,7 @@ public final class AuthorizationService implements AutoCloseable {
     private WebSocketClient websocket;
     private Connection connection;
     private long wantedVersion = -1;
-    private int reconnectDelay;
+    private final ReconnectBackoff reconnect;
 
     AuthorizationService(PluginSettings settings, SslContextFactory.Client tls, Logger logger,
                          Runnable onSynchronized) {
@@ -71,7 +71,7 @@ public final class AuthorizationService implements AutoCloseable {
         this.tls = tls;
         this.logger = logger;
         this.onSynchronized = onSynchronized;
-        reconnectDelay = settings.reconnectMinMs;
+        reconnect = new ReconnectBackoff(settings.reconnectMinMs, settings.reconnectMaxMs);
         worker = new ScheduledThreadPoolExecutor(1, task -> {
             Thread thread = new Thread(task, "MCQQAuth-sync");
             thread.setDaemon(true);
@@ -231,7 +231,7 @@ public final class AuthorizationService implements AutoCloseable {
         }
         wantedVersion = candidate.version();
         published = new Published(new View(candidate, true), source);
-        reconnectDelay = settings.reconnectMinMs;
+        reconnect.reset();
         onSynchronized.run();
     }
 
@@ -259,9 +259,9 @@ public final class AuthorizationService implements AutoCloseable {
         if (source.session != null) {
             source.session.disconnect();
         }
-        logger.warning(reason + "，" + reconnectDelay + " 毫秒后重连");
-        worker.schedule(this::connect, reconnectDelay, MILLISECONDS);
-        reconnectDelay = Math.min(reconnectDelay * 2, settings.reconnectMaxMs);
+        int delay = reconnect.nextDelayMs();
+        logger.warning(reason + "，" + delay + " 毫秒后重连");
+        worker.schedule(this::connect, delay, MILLISECONDS);
     }
 
     private void markUnready() {

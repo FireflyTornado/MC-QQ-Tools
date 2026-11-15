@@ -13,15 +13,19 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.function.Consumer;
 import java.util.logging.Logger;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 final class SudoChannel implements AutoCloseable {
     private static final int MAX_MESSAGE = 8192;
+    private static final int PING_INTERVAL_SECONDS = 20;
+    private static final int PONG_TIMEOUT_SECONDS = 15;
     private static final long TTL_MS = 30_000;
     private static final long CLOCK_SKEW_MS = 1_000;
     private static final Gson JSON = new Gson();
@@ -94,12 +98,9 @@ final class SudoChannel implements AutoCloseable {
     private final SudoCommands commands;
     private final Consumer<Runnable> onMain;
     private final Logger log;
-    private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(task -> {
-        Thread thread = new Thread(task, "MCQQAuth-sudo");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final ScheduledExecutorService timer;
     private final HttpClient http;
+    private final ReconnectBackoff reconnect;
 
     // Guard the connection and execution slot across both the network and server threads.
     private boolean closed;
@@ -108,30 +109,46 @@ final class SudoChannel implements AutoCloseable {
     private boolean executing;
     private final RequestHistory history = new RequestHistory();
 
-    SudoChannel(Settings settings, SudoCommands commands, Consumer<Runnable> onMain, Logger log) {
-        this(settings, commands, onMain, log, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
-                .proxy(ProxySelector.of(null)).followRedirects(HttpClient.Redirect.NEVER).build());
+    SudoChannel(Settings settings, SudoCommands commands, Consumer<Runnable> onMain, Logger log,
+                int reconnectMinMs, int reconnectMaxMs) {
+        this(settings, commands, onMain, log, reconnectMinMs, reconnectMaxMs,
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
+                        .proxy(ProxySelector.of(null)).followRedirects(HttpClient.Redirect.NEVER).build(),
+                createTimer());
     }
 
-    SudoChannel(Settings settings, SudoCommands commands, Consumer<Runnable> onMain, Logger log, HttpClient http) {
+    SudoChannel(Settings settings, SudoCommands commands, Consumer<Runnable> onMain, Logger log,
+                int reconnectMinMs, int reconnectMaxMs, HttpClient http, ScheduledExecutorService timer) {
         this.settings = settings;
         this.commands = commands;
         this.onMain = onMain;
         this.log = log;
         this.http = http;
+        this.timer = timer;
+        this.reconnect = new ReconnectBackoff(reconnectMinMs, reconnectMaxMs);
+    }
+
+    private static ScheduledExecutorService createTimer() {
+        var executor = new ScheduledThreadPoolExecutor(1, task -> {
+            Thread thread = new Thread(task, "MCQQAuth-sudo");
+            thread.setDaemon(true);
+            return thread;
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        return executor;
     }
 
     void start() {
-        timer.scheduleWithFixedDelay(this::maintain, 0, 5, SECONDS);
+        timer.schedule(this::connect, 0, MILLISECONDS);
     }
 
-    synchronized void maintain() {
-        if (closed) {
+    private synchronized void connect() {
+        if (closed || active != null) {
             return;
         }
-        if (active == null) {
-            Connection attempt = new Connection();
-            active = attempt;
+        Connection attempt = new Connection();
+        active = attempt;
+        try {
             http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(5))
                     .header("Authorization", "Bearer " + settings.token())
                     .buildAsync(settings.url(), attempt)
@@ -140,17 +157,33 @@ final class SudoChannel implements AutoCloseable {
                             disconnect(attempt, "握手失败");
                         }
                     });
-        } else if (active.socket != null) {
-            Connection connection = active;
-            if (System.nanoTime() - connection.lastPong > SECONDS.toNanos(15)) {
-                disconnect(connection, "心跳超时");
-            } else {
-                connection.socket.sendPing(ByteBuffer.allocate(0)).whenComplete((socket, failure) -> {
+        } catch (RuntimeException e) {
+            disconnect(attempt, "握手失败");
+        }
+    }
+
+    private void schedulePing(Connection connection) {
+        connection.heartbeat = timer.schedule(() -> sendPing(connection), PING_INTERVAL_SECONDS, SECONDS);
+    }
+
+    private synchronized void sendPing(Connection connection) {
+        if (active != connection) {
+            return;
+        }
+        long ping = ++connection.ping;
+        connection.awaitingPong = true;
+        connection.heartbeat = timer.schedule(() -> pongTimedOut(connection, ping), PONG_TIMEOUT_SECONDS, SECONDS);
+        connection.socket.sendPing(ByteBuffer.allocate(Long.BYTES).putLong(ping).flip())
+                .whenComplete((socket, failure) -> {
                     if (failure != null) {
                         disconnect(connection, "心跳发送失败");
                     }
                 });
-            }
+    }
+
+    private synchronized void pongTimedOut(Connection connection, long ping) {
+        if (connection.awaitingPong && connection.ping == ping) {
+            disconnect(connection, "心跳超时");
         }
     }
 
@@ -162,10 +195,10 @@ final class SudoChannel implements AutoCloseable {
         if (!executing) {
             running = null;
         }
-        if (connection.socket != null) {
-            connection.socket.abort();
-        }
-        log.warning("/sudo 通道断开：" + reason);
+        connection.abort();
+        int delay = reconnect.nextDelayMs();
+        log.warning("/sudo 通道断开：" + reason + "，" + delay + " 毫秒后重连");
+        timer.schedule(this::connect, delay, MILLISECONDS);
     }
 
     private void receive(Connection source, Request request) {
@@ -254,18 +287,27 @@ final class SudoChannel implements AutoCloseable {
             running = null;
         }
         if (active != null) {
-            WebSocket socket = active.socket;
+            Connection connection = active;
             active = null;
-            if (socket != null) {
-                socket.abort();
-            }
+            connection.abort();
         }
     }
 
     private final class Connection implements WebSocket.Listener {
         private final StringBuilder message = new StringBuilder();
         private WebSocket socket;
-        private volatile long lastPong;
+        private ScheduledFuture<?> heartbeat;
+        private long ping;
+        private boolean awaitingPong;
+
+        private void abort() {
+            if (heartbeat != null) {
+                heartbeat.cancel(false);
+            }
+            if (socket != null) {
+                socket.abort();
+            }
+        }
 
         @Override
         public void onOpen(WebSocket opened) {
@@ -275,7 +317,8 @@ final class SudoChannel implements AutoCloseable {
                     return;
                 }
                 socket = opened;
-                lastPong = System.nanoTime();
+                reconnect.reset();
+                schedulePing(this);
             }
             opened.request(1);
         }
@@ -304,7 +347,13 @@ final class SudoChannel implements AutoCloseable {
 
         @Override
         public CompletionStage<?> onPong(WebSocket socket, ByteBuffer data) {
-            lastPong = System.nanoTime();
+            synchronized (SudoChannel.this) {
+                if (active == this && awaitingPong && data.remaining() == Long.BYTES && data.getLong() == ping) {
+                    awaitingPong = false;
+                    heartbeat.cancel(false);
+                    schedulePing(this);
+                }
+            }
             socket.request(1);
             return null;
         }

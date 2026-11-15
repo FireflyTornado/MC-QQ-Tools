@@ -85,17 +85,17 @@ public final class MCQQAuthPlugin extends JavaPlugin {
                     }
                 }));
         authorization.start();
-        startSudo(config, settings.token);
+        startSudo(config, settings);
     }
 
-    private void startSudo(YamlConfiguration config, String authToken) {
+    private void startSudo(YamlConfiguration config, PluginSettings settings) {
         try {
             createSudoAllowlist();
         } catch (IOException | SecurityException e) {
             getLogger().warning("无法创建 " + SudoCommands.ALLOWLIST_FILE + "，请检查插件目录权限。");
         }
         try {
-            SudoChannel.Settings sudo = SudoChannel.Settings.read(config, authToken);
+            SudoChannel.Settings sudo = SudoChannel.Settings.read(config, settings.token);
             if (sudo != null) {
                 Server server = getServer();
                 sudoCommands = new SudoCommands(server, Set.of());
@@ -105,7 +105,8 @@ public final class MCQQAuthPlugin extends JavaPlugin {
                     getLogger().warning(sudoReloadFailure(e));
                 }
                 sudoChannel = new SudoChannel(sudo, sudoCommands,
-                        task -> server.getScheduler().runTask(this, task), getLogger());
+                        task -> server.getScheduler().runTask(this, task), getLogger(),
+                        settings.reconnectMinMs, settings.reconnectMaxMs);
                 sudoChannel.start();
             }
         } catch (IllegalArgumentException e) {

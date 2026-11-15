@@ -9,7 +9,6 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -92,7 +91,7 @@ class SudoChannelTest {
             assertEquals("busy", reconnected.status());
             fixture.tasks.remove().run();
             assertEquals("ok", reconnected.status());
-            verify(fixture.commands).execute("test2");
+            verify(fixture.commands).execute("test2", false);
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
@@ -103,7 +102,7 @@ class SudoChannelTest {
         try (var fixture = new ChannelFixture()) {
             var original = fixture.connect();
             var reconnected = new ArrayDeque<Peer>();
-            when(fixture.commands.execute("test1")).thenAnswer(call -> {
+            when(fixture.commands.execute("test1", false)).thenAnswer(call -> {
                 original.disconnect();
                 var next = fixture.openNext(1000);
                 next.send(2);
@@ -119,16 +118,16 @@ class SudoChannelTest {
             next.send(3);
             fixture.tasks.remove().run();
             assertEquals("ok", next.status());
-            verify(fixture.commands).execute("test1");
-            verify(fixture.commands).execute("test3");
+            verify(fixture.commands).execute("test1", false);
+            verify(fixture.commands).execute("test3", false);
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
     }
 
     @Test
-    void configuredCommandWaitsForLateFeedbackAndReturnsOneCombinedResult() {
-        try (var fixture = new ChannelFixture(Set.of("test1"))) {
+    void asyncFeedbackEnabledWaitsForLateFeedbackAndReturnsOneCombinedResult() {
+        try (var fixture = new ChannelFixture(true)) {
             var clock = new AtomicLong();
             var output = new BoundedCommandOutput(clock::get);
             output.append("Initial feedback\n");
@@ -169,7 +168,7 @@ class SudoChannelTest {
 
     @Test
     void disconnectCancelsFeedbackCollectionAndReleasesSlot() {
-        try (var fixture = new ChannelFixture(Set.of("test1"))) {
+        try (var fixture = new ChannelFixture(true)) {
             var output = new BoundedCommandOutput();
             when(fixture.commands.execute("test1", true))
                     .thenReturn(new SudoCommands.Result("ok", "", false, output));
@@ -190,6 +189,7 @@ class SudoChannelTest {
             assertTrue(reconnected.replies.isEmpty());
             fixture.tasks.remove().run();
             assertEquals("ok", reconnected.status());
+            verify(fixture.commands).execute("test2", true);
         }
     }
 
@@ -201,10 +201,10 @@ class SudoChannelTest {
         final SudoChannel channel;
 
         ChannelFixture() {
-            this(Set.of());
+            this(false);
         }
 
-        ChannelFixture(Set<String> asyncFeedbackCommands) {
+        ChannelFixture(boolean asyncFeedback) {
             var http = mock(HttpClient.class);
             var timer = mock(ScheduledExecutorService.class);
             when(timer.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenAnswer(call -> {
@@ -215,9 +215,9 @@ class SudoChannelTest {
                 return future;
             });
             when(http.newWebSocketBuilder()).thenReturn(builder);
-            when(commands.execute(anyString())).thenReturn(new SudoCommands.Result("ok"));
+            when(commands.execute(anyString(), anyBoolean())).thenReturn(new SudoCommands.Result("ok"));
             var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token",
-                    asyncFeedbackCommands);
+                    asyncFeedback);
             channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), 1000, 30000, http, timer);
         }
 

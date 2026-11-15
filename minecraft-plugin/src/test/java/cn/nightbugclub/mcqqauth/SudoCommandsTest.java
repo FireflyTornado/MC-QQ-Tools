@@ -20,7 +20,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.net.SocketAddress;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -44,6 +43,7 @@ class SudoCommandsTest {
             "whitelist add Steve\u2028stop"})
     void rejectsCommandsOutsideTheTokenPrefix(String input) {
         assertEquals("rejected", new SudoCommands(server, Set.of("whitelist add")).execute(input).status());
+        assertEquals("rejected", new SudoCommands(server, Set.of("whitelist add")).execute(input, true).status());
         verifyNoInteractions(server);
     }
 
@@ -285,12 +285,12 @@ class SudoCommandsTest {
         config.set("sudo.websocket-url", "ws://example.net/internal/mc/sudo/ws");
         assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
         config.set("sudo.websocket-url", "wss://example.net/internal/mc/sudo/ws");
-        assertEquals(Set.of(), SudoChannel.Settings.read(config, "auth-token").asyncFeedbackCommands());
-        config.set("sudo.async-feedback-commands", List.of("example:status check"));
-        var settings = SudoChannel.Settings.read(config, "auth-token");
-        assertTrue(SudoCommands.matchesPrefix("example:status check world", settings.asyncFeedbackCommands()));
-        assertFalse(SudoCommands.matchesPrefix("example:status checked", settings.asyncFeedbackCommands()));
-        config.set("sudo.async-feedback-commands", "example:status check");
+        assertFalse(SudoChannel.Settings.read(config, "auth-token").asyncFeedback());
+        config.set("sudo.async-feedback", true);
+        assertTrue(SudoChannel.Settings.read(config, "auth-token").asyncFeedback());
+        config.set("sudo.async-feedback", false);
+        assertFalse(SudoChannel.Settings.read(config, "auth-token").asyncFeedback());
+        config.set("sudo.async-feedback", "true");
         assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
     }
 }

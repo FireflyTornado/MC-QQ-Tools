@@ -75,7 +75,7 @@ final class SudoCommands {
                 if (prefix.isEmpty() || prefix.startsWith("#")) {
                     continue;
                 }
-                if (!validPrefix(prefix)) {
+                if (!validCommand(prefix) || !COMMAND_LABEL.matcher(label(prefix)).matches()) {
                     throw new IllegalArgumentException(ALLOWLIST_FILE + " 第 " + lineNumber + " 行的命令前缀无效");
                 }
                 prefixes.add(prefix);
@@ -89,7 +89,8 @@ final class SudoCommands {
     }
 
     Result execute(String command, boolean collectAsync) {
-        if (!validCommand(command) || !matchesPrefix(command, allowed)) {
+        if (!validCommand(command) || allowed.stream().noneMatch(
+                prefix -> command.equals(prefix) || command.startsWith(prefix + " "))) {
             return new Result("rejected");
         }
 
@@ -133,14 +134,6 @@ final class SudoCommands {
             }
             dispatching = false;
         }
-    }
-
-    static boolean validPrefix(String prefix) {
-        return validCommand(prefix) && COMMAND_LABEL.matcher(label(prefix)).matches();
-    }
-
-    static boolean matchesPrefix(String command, Set<String> prefixes) {
-        return prefixes.stream().anyMatch(prefix -> command.equals(prefix) || command.startsWith(prefix + " "));
     }
 
     private static String label(String command) {

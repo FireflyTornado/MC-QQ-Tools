@@ -47,6 +47,7 @@ REPLIES = {
     "disconnected": "指令通道已断开，执行结果未知。",
     "expired": "指令已过期，未执行。",
     "timeout": "执行超时，结果未知。",
+    "partial": "命令已返回，输出采集不完整。",
 }
 
 
@@ -190,14 +191,20 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
         except TimeoutError:
             status, output, truncated = "timeout", "", False
         logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, status)
-        if truncated or output_settings.use_file(output):
-            if await upload_output(bot, event.group_id, request_id, output):
-                return
-            await sudo.finish(MessageSegment.text(f"结果文件上传失败或未确认。请求编号：{request_id}"))
-            return
         text = "".join(
             char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
         )
+        if truncated or (output and not text.strip()) or output_settings.use_file(output):
+            if await upload_output(bot, event.group_id, request_id, output):
+                if status == "partial":
+                    await sudo.finish(MessageSegment.text(REPLIES[status]))
+                return
+            await sudo.finish(MessageSegment.text(f"结果文件上传失败或未确认。请求编号：{request_id}"))
+            return
         if not text.strip():
             text = REPLIES[status]
+        elif status == "partial":
+            if not text.endswith("\n"):
+                text += "\n"
+            text += REPLIES[status]
         await sudo.finish(MessageSegment.text(text))

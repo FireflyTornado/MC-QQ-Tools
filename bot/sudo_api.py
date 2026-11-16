@@ -19,7 +19,7 @@ from sudo_config import (
 )
 
 logger = logging.getLogger("uvicorn.error.mc_qq_auth.sudo")
-PLUGIN_RESULTS = {"ok", "rejected", "error", "busy", "expired"}
+PLUGIN_RESULTS = {"ok", "rejected", "error", "busy", "expired", "partial"}
 MAX_MESSAGE_BYTES = 8192
 SEND_TIMEOUT = 3
 

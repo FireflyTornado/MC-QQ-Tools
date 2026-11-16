@@ -41,6 +41,16 @@ final class BoundedCommandOutput {
         return new Snapshot(text.toString(), truncated);
     }
 
+    synchronized void appendLine(String line) {
+        if (!text.isEmpty() && text.charAt(text.length() - 1) != '\n') {
+            append("\n");
+        }
+        append(line);
+        if (!line.endsWith("\n")) {
+            append("\n");
+        }
+    }
+
     synchronized boolean truncated() {
         return truncated;
     }

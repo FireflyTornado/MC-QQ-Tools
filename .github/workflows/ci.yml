@@ -62,6 +62,9 @@ jobs:
       - name: Build plugin
         run: mvn -B -ntp -f minecraft-plugin/pom.xml verify
 
+      - name: Build Mohist output capture mod
+        run: mvn -B -ntp -f minecraft-output-capture/pom.xml verify
+
       - name: Verify plugin JAR entries
         shell: bash
         run: |

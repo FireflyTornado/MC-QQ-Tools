@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "compatibilityLevel": "JAVA_17",
+  "package": "cn.nightbugclub.mcqqauthcapture.mixin",
+  "server": ["PlayerConnectionMixin", "MessageArgumentMixin", "PlayerListMixin", "ReloadCommandMixin", "EventLoopMixin"],
+  "injectors": {"defaultRequire": 1}
+}

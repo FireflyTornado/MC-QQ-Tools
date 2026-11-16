@@ -90,7 +90,7 @@ class SudoChannelTest {
             assertEquals("busy", reconnected.status());
             fixture.tasks.remove().run();
             assertEquals("ok", reconnected.status());
-            verify(fixture.commands).execute("test2");
+            verify(fixture.commands).execute(eq("test2"), anyLong());
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
@@ -101,14 +101,14 @@ class SudoChannelTest {
         try (var fixture = new ChannelFixture()) {
             var original = fixture.connect();
             var reconnected = new ArrayDeque<Peer>();
-            when(fixture.commands.execute("test1")).thenAnswer(call -> {
+            when(fixture.commands.execute(eq("test1"), anyLong())).thenAnswer(call -> {
                 original.disconnect();
                 var next = fixture.openNext(1000);
                 next.send(2);
                 assertEquals("busy", next.status());
                 assertTrue(fixture.tasks.isEmpty());
                 reconnected.add(next);
-                return new SudoCommands.Result("ok");
+                return CompletableFuture.completedFuture(new SudoCommands.Result("ok"));
             });
             original.send(1);
             fixture.tasks.remove().run();
@@ -117,10 +117,31 @@ class SudoChannelTest {
             next.send(3);
             fixture.tasks.remove().run();
             assertEquals("ok", next.status());
-            verify(fixture.commands).execute("test1");
-            verify(fixture.commands).execute("test3");
+            verify(fixture.commands).execute(eq("test1"), anyLong());
+            verify(fixture.commands).execute(eq("test3"), anyLong());
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
+        }
+    }
+
+    @Test
+    void repliesOnlyAfterOutputCollectionCompletes() {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            var result = new CompletableFuture<SudoCommands.Result>();
+            when(fixture.commands.execute(eq("test1"), anyLong())).thenReturn(result);
+
+            peer.send(1);
+            fixture.tasks.remove().run();
+            assertTrue(peer.replies.isEmpty());
+            peer.send(2);
+            assertEquals("busy", peer.status());
+            result.complete(new SudoCommands.Result("partial", "some output\n"));
+            assertEquals("partial", peer.status());
+
+            peer.send(3);
+            fixture.tasks.remove().run();
+            assertEquals("ok", peer.status());
         }
     }
 
@@ -142,7 +163,8 @@ class SudoChannelTest {
                 return future;
             });
             when(http.newWebSocketBuilder()).thenReturn(builder);
-            when(commands.execute(anyString())).thenReturn(new SudoCommands.Result("ok"));
+            when(commands.execute(anyString(), anyLong()))
+                    .thenReturn(CompletableFuture.completedFuture(new SudoCommands.Result("ok")));
             var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token");
             channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), 1000, 30000, http, timer);
         }

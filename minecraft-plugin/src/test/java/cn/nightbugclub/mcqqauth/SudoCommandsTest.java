@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.net.SocketAddress;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -167,6 +168,26 @@ class SudoCommandsTest {
         assertEquals(new SudoCommands.Result("error", "服务端命令反馈接口不可用，指令未执行。"),
                 commands.execute("list"));
         verify(server, never()).dispatchCommand(any(), anyString());
+    }
+
+    @Test
+    void waitsForTrackedOutputWithoutBlockingTheServerThreadAndPreservesItOnTimeout() {
+        var completed = new CompletableFuture<Boolean>();
+        var output = new BoundedCommandOutput();
+        var commands = new SudoCommands(server, Set.of("say"), () ->
+                new MohistCommandFeedback.Capture(console, output::snapshot, () -> () -> completed));
+        when(server.dispatchCommand(console, "say hello")).thenReturn(true);
+
+        var waiting = commands.execute("say hello", System.currentTimeMillis() + 30_000);
+        assertFalse(waiting.isDone());
+        assertFalse(commands.isDispatching());
+        output.appendLine("hello");
+        completed.complete(true);
+        assertEquals(new SudoCommands.Result("ok", "hello\n"), waiting.join());
+
+        var incomplete = new SudoCommands(server, Set.of("say"), () ->
+                new MohistCommandFeedback.Capture(console, output::snapshot, () -> CompletableFuture::new));
+        assertEquals(new SudoCommands.Result("partial", "hello\n"), incomplete.execute("say hello"));
     }
 
     @Test

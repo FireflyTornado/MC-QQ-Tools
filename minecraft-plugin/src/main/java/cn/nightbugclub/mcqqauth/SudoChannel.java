@@ -239,17 +239,24 @@ final class SudoChannel implements AutoCloseable {
             // Claim execution under the same lock used to invalidate queued work on disconnect.
             executing = canRun;
         }
-        SudoCommands.Result result = new SudoCommands.Result("expired");
-        try {
-            if (canRun) {
-                result = commands.execute(request.command);
-            }
-        } catch (RuntimeException e) {
-            result = new SudoCommands.Result("error");
-            log.warning("/sudo #" + request.id + " 执行异常（" + e.getClass().getSimpleName() + "）");
-        } finally {
-            finish(source, request, result);
+        if (!canRun) {
+            finish(source, request, new SudoCommands.Result("expired"));
+            return;
         }
+        try {
+            commands.execute(request.command, request.deadlineMs - CLOCK_SKEW_MS)
+                    .whenComplete((result, failure) -> finishExecution(source, request, result, failure));
+        } catch (RuntimeException e) {
+            finishExecution(source, request, null, e);
+        }
+    }
+
+    private void finishExecution(Connection source, Request request, SudoCommands.Result result, Throwable failure) {
+        if (failure != null) {
+            log.warning("/sudo #" + request.id + " 执行异常（" + failure.getClass().getSimpleName() + "）");
+            result = new SudoCommands.Result("error");
+        }
+        finish(source, request, result);
     }
 
     private synchronized void finish(Connection source, Request request, SudoCommands.Result result) {

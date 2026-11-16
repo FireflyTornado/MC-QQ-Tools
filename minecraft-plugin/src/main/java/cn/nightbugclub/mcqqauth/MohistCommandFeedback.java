@@ -14,16 +14,26 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import static org.objectweb.asm.Opcodes.*;
 
 final class MohistCommandFeedback {
-    record Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output) {}
+    interface Session {
+        CompletableFuture<Boolean> finish();
+    }
+
+    record Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output,
+                   Supplier<Session> beginExtendedCapture) {
+        Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output) {
+            this(sender, output, () -> null);
+        }
+    }
 
     private record Access(Constructor<?> constructor, Method createStack, Method getSender,
-                          Method visit, Class<?> visitorType, Object handle) {}
+                          Method visit, Class<?> visitorType, Object handle, Method beginCapture) {}
 
     private final Server server;
     private Access access;
@@ -54,7 +64,7 @@ final class MohistCommandFeedback {
                     new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), appendComponent, appendString);
             var sender = Objects.requireNonNull(
                     (RemoteConsoleCommandSender) methods.getSender.invoke(source, methods.createStack.invoke(source)));
-            return new Capture(sender, output::snapshot);
+            return new Capture(sender, output::snapshot, () -> begin(methods.beginCapture, output));
         } catch (ReflectiveOperationException | LinkageError | ClassCastException | NullPointerException e) {
             throw new IllegalStateException("Mohist command feedback is unavailable", e);
         }
@@ -73,7 +83,30 @@ final class MohistCommandFeedback {
         Method sendString = source.getMethod("sendMessage", String.class);
         Object handle = server.getClass().getMethod("getServer").invoke(server);
         return new Access(createSource(source, minecraftServer, sendComponent, sendString),
-                createStack, getSender, visit, visitor, handle);
+                createStack, getSender, visit, visitor, handle, captureBridge(loader));
+    }
+
+    private static Method captureBridge(ClassLoader loader) throws NoSuchMethodException {
+        try {
+            return loader.loadClass("cn.nightbugclub.mcqqauthcapture.OutputCapture")
+                    .getMethod("begin", Consumer.class);
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Session begin(Method bridge, BoundedCommandOutput output) {
+        if (bridge == null) {
+            return null;
+        }
+        Consumer<String> appendLine = text -> output.appendLine(text);
+        try {
+            var scope = (Supplier<CompletableFuture<Boolean>>) bridge.invoke(null, appendLine);
+            return scope::get;
+        } catch (ReflectiveOperationException | LinkageError | ClassCastException e) {
+            return () -> CompletableFuture.completedFuture(false);
+        }
     }
 
     private static Method mappedMethod(Class<?> source, String named, String srg, Class<?>... args)

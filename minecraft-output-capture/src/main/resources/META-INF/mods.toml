@@ -1,0 +1,17 @@
+modLoader="lowcodefml"
+loaderVersion="[47,)"
+license="All Rights Reserved"
+
+[[mods]]
+modId="mcqqauth_output_capture"
+version="0.1.0"
+displayName="MCQQAuth Output Capture"
+displayTest="IGNORE_ALL_VERSION"
+description="Captures command output for the MCQQAuth plugin on Mohist 1.20.1."
+
+[[dependencies.mcqqauth_output_capture]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1]"
+ordering="NONE"
+side="SERVER"

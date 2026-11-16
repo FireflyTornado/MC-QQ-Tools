@@ -8,6 +8,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -77,42 +79,59 @@ final class SudoCommands {
     }
 
     Result execute(String command) {
+        return execute(command, System.currentTimeMillis()).join();
+    }
+
+    CompletableFuture<Result> execute(String command, long captureDeadlineMs) {
         if (!validCommand(command) || allowed.stream().noneMatch(
                 prefix -> command.equals(prefix) || command.startsWith(prefix + " "))) {
-            return new Result("rejected");
+            return CompletableFuture.completedFuture(new Result("rejected"));
         }
 
         String target = label(command);
         // Configured Bukkit aliases can expand to multiple commands.
         if (server.getCommandAliases().keySet().stream().anyMatch(target::equalsIgnoreCase)) {
-            return new Result("rejected");
+            return CompletableFuture.completedFuture(new Result("rejected"));
         }
         MohistCommandFeedback.Capture feedback;
         try {
             feedback = openFeedback.get();
         } catch (IllegalStateException e) {
-            return new Result("error", "服务端命令反馈接口不可用，指令未执行。");
+            return CompletableFuture.completedFuture(new Result("error", "服务端命令反馈接口不可用，指令未执行。"));
         }
+        MohistCommandFeedback.Session session = feedback.beginExtendedCapture().get();
+        CommandException dispatchFailure = null;
+        boolean dispatched = false;
+        CompletableFuture<Boolean> complete;
         dispatching = true;
         try {
-            boolean dispatched;
-            try {
-                dispatched = server.dispatchCommand(feedback.sender(), command);
-            } catch (CommandException e) {
-                var output = feedback.output().get();
-                if (output.text().isBlank() && !output.truncated()) {
-                    throw e;
-                }
-                return new Result("error", output.text(), output.truncated());
-            }
-            var output = feedback.output().get();
-            if (!dispatched && output.text().isBlank() && !output.truncated()) {
-                return new Result("error", "服务端未找到该命令。");
-            }
-            return new Result(dispatched ? "ok" : "error", output.text(), output.truncated());
+            dispatched = server.dispatchCommand(feedback.sender(), command);
+        } catch (CommandException e) {
+            dispatchFailure = e;
         } finally {
             dispatching = false;
+            complete = session == null ? CompletableFuture.completedFuture(true) : session.finish();
         }
+        boolean found = dispatched;
+        CommandException failure = dispatchFailure;
+        return complete.completeOnTimeout(false, Math.max(0, captureDeadlineMs - System.currentTimeMillis()),
+                        TimeUnit.MILLISECONDS)
+                .thenApply(captured -> commandResult(feedback.output().get(), found, failure, captured, session != null));
+    }
+
+    private static Result commandResult(BoundedCommandOutput.Snapshot output, boolean dispatched, CommandException failure,
+                                        boolean captured, boolean extended) {
+        boolean empty = output.text().isEmpty() && !output.truncated();
+        if (!dispatched && empty && failure == null && captured) {
+            return new Result("error", "服务端未找到该命令。");
+        }
+        if (failure != null && empty && captured) {
+            throw failure;
+        }
+        if (dispatched && empty && !extended) {
+            return new Result("ok", "命令已返回，未收到执行者反馈。扩展输出采集模块未启用。");
+        }
+        return new Result(!captured ? "partial" : dispatched ? "ok" : "error", output.text(), output.truncated());
     }
 
     private static String label(String command) {

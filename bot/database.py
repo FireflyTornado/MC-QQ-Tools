@@ -1,11 +1,13 @@
 import re
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "auth.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_AUTH_VERSION = (1 << 63) - 1
+NAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,16}")
 
 MIGRATIONS = Path(__file__).with_name("migrations")
 ACTIVE_INDEXES = {
@@ -13,7 +15,14 @@ ACTIVE_INDEXES = {
     "idx_offline_active_name": ("mc_name_key",),
 }
 CURRENT_TABLES = {
-    "auth_state": {"id": "INTEGER", "version": "INTEGER"},
+    "auth_state": {
+        "id": "INTEGER",
+        "version": "INTEGER",
+        "ban_generation": "INTEGER",
+        "ban_sequence": "INTEGER",
+        "ban_client_id": "TEXT",
+        "ban_digest": "TEXT",
+    },
     "offline_bindings": {
         "id": "INTEGER",
         "group_id": "TEXT",
@@ -43,6 +52,28 @@ LEGACY_TABLES = {"bindings", "pending_bindings"}
 
 class MigrationError(sqlite3.DatabaseError):
     """The database cannot safely be initialized or upgraded."""
+
+
+def update_auth_version(conn: sqlite3.Connection) -> None:
+    """使用系统时间更新授权版本，保证严格递增。"""
+    now_ms = time.time_ns() // 1_000_000
+    result = conn.execute(
+        """
+        UPDATE auth_state
+        SET version = MAX(version + 1, ?)
+        WHERE id = 1
+          AND typeof(version) = 'integer'
+          AND version >= 0
+          AND version < ?
+        """,
+        (now_ms, MAX_AUTH_VERSION),
+    )
+    if result.rowcount != 1:
+        raise sqlite3.IntegrityError("授权版本记录缺失、无效或已达到整数上限")
+
+
+def valid_mc_name(name: str) -> bool:
+    return bool(NAME_PATTERN.fullmatch(name))
 
 
 def _apply_migration(conn: sqlite3.Connection, filename: str) -> None:
@@ -103,12 +134,22 @@ def _validate_server_bans(conn: sqlite3.Connection) -> None:
 
 
 def _validate_auth_state(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("SELECT id, version FROM auth_state LIMIT 2").fetchall()
+    rows = conn.execute(
+        "SELECT id, version, ban_generation, ban_sequence, ban_client_id, ban_digest FROM auth_state LIMIT 2"
+    ).fetchall()
     if len(rows) != 1 or rows[0][0] != 1:
         raise MigrationError("auth_state must contain exactly one row with id = 1")
     version = rows[0][1]
     if not isinstance(version, int) or not 0 <= version < MAX_AUTH_VERSION:
         raise MigrationError("auth_state.version must be a nonnegative integer with room to increment")
+    generation, sequence, client_id, digest = rows[0][2:]
+    if (generation, sequence, client_id, digest) == (0, 0, "", ""):
+        return
+    if (type(generation) is not int or not 0 < generation <= MAX_AUTH_VERSION
+            or type(sequence) is not int or not 0 < sequence <= MAX_AUTH_VERSION
+            or not isinstance(client_id, str) or not re.fullmatch(r"[0-9a-f]{32}", client_id)
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+        raise MigrationError("Invalid banlist upload cursor in auth_state")
 
 
 def _validate_offline_bindings(conn: sqlite3.Connection) -> None:
@@ -175,7 +216,7 @@ def init_database(db_path: Path | None = None) -> None:
     with closing(sqlite3.connect(path, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, SCHEMA_VERSION):
+        if not 0 <= version <= SCHEMA_VERSION:
             raise MigrationError(f"Unsupported SQLite schema version {version}")
 
         tables = dict(conn.execute(
@@ -196,6 +237,8 @@ def init_database(db_path: Path | None = None) -> None:
                 conn.execute("INSERT INTO auth_state (id, version) VALUES (1, 0)")
         if version < 2:
             _apply_migration(conn, "002_server_bans.sql")
+        if version < 3:
+            _apply_migration(conn, "003_banlist_upload.sql")
 
         for table in CURRENT_TABLES:
             _validate_table(conn, table)

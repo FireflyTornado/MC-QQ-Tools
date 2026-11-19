@@ -31,6 +31,7 @@ public final class MCQQAuthPlugin extends JavaPlugin {
     private AuthorizationListener listener;
     private ObserveNotice observeNotice;
     private BanListMonitor banListMonitor;
+    private BanListReporter banListReporter;
     private boolean changingMode;
 
     @Override
@@ -71,7 +72,7 @@ public final class MCQQAuthPlugin extends JavaPlugin {
             return;
         }
         if (config.getBoolean("banlist-watch.enabled")) {
-            startBanListMonitor();
+            startBanListMonitor(config);
         }
         PluginSettings settings;
         try {
@@ -93,11 +94,25 @@ public final class MCQQAuthPlugin extends JavaPlugin {
         startSudo(config, settings);
     }
 
-    private void startBanListMonitor() {
+    private void startBanListMonitor(YamlConfiguration config) {
         try {
-            banListMonitor = new BanListMonitor(this, Path.of("banned-players.json"), Clock.systemUTC());
+            var settings = BanListReporter.Settings.read(config);
+            if (settings != null) {
+                banListReporter = new BanListReporter(settings, getLogger());
+            }
+        } catch (IllegalArgumentException e) {
+            getLogger().warning("封禁名单上报已关闭：" + e.getMessage());
+        }
+        BanListReporter reporter = banListReporter;
+        try {
+            banListMonitor = new BanListMonitor(this, Path.of("banned-players.json"), Clock.systemUTC(),
+                    reporter == null ? snapshot -> {} : reporter::submit);
             banListMonitor.start();
         } catch (IOException | SecurityException | UnsupportedOperationException e) {
+            if (reporter != null) {
+                reporter.close();
+                banListReporter = null;
+            }
             getLogger().warning("无法监听 banned-players.json：" + e.getMessage());
         }
     }
@@ -159,6 +174,10 @@ public final class MCQQAuthPlugin extends JavaPlugin {
         if (banListMonitor != null) {
             banListMonitor.close();
             banListMonitor = null;
+        }
+        if (banListReporter != null) {
+            banListReporter.close();
+            banListReporter = null;
         }
         sudoCommands = null;
         if (sudoChannel != null) {

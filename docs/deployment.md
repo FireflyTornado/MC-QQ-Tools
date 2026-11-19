@@ -314,6 +314,19 @@ FastAPI 按上面的命令监听回环地址。异地游戏主机接入时，只
 
 `/internal/mc/notify` 应从公网路由中排除，`/internal/health` 留给本机或受信探活。WebUI 和 OneBot 端口同样保留在回环地址。完整协议见 [API 文档](api.md)。
 
+### 玩家封禁名单联动
+
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。升级数据库到版本 3 后重启 FastAPI 和 Bot，再在 HTTPS 反代上开放 `/internal/mc/banlist` 的 `GET` 和 `PUT`，保留 `Authorization` 头。每个授权数据库只启用一个上报实例。
+
+```yaml
+banlist-watch:
+  enabled: true
+  upload-url: "https://auth.example.org/internal/mc/banlist"
+  token: "REPLACE_WITH_MC_BANLIST_TOKEN"
+```
+
+填入与后端相同的 Token，换上插件 JAR 并重启 Minecraft。首次上报成功时，控制台会记录「封禁名单快照已获 API 确认」。测试服可用一个已绑定账号执行 `/ban`，检查 `/我的绑定` 和 `/解绑`，再执行 `/pardon`，等待 Bot 核实群成员状态。上报地址和 Token 均留空时，插件只记录本地监听日志。
+
 ### QQ群管理指令
 
 请勿通过 `/sudo` 发送含密码、令牌或其他凭据的指令。指令参数会出现在群消息中，FastAPI 也会记录完整指令。需要输入凭据时，请直接使用 Minecraft 服务端控制台。

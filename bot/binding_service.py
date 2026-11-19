@@ -1,16 +1,12 @@
-import re
 import sqlite3
 import time
 from collections.abc import Mapping, Set
 from contextlib import closing
 from dataclasses import dataclass
 
-from database import DB_PATH, MAX_AUTH_VERSION
+from banlist_sync import apply_normalized_bans, normalize_ban_snapshot
+from database import DB_PATH, update_auth_version, valid_mc_name
 from notify_client import notify_auth_updated
-
-
-# 离线服允许短名，登录名最多 16 位。
-NAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,16}")
 
 
 @dataclass(frozen=True)
@@ -18,28 +14,6 @@ class MembershipAudit:
     version: int
     bindings: dict[str, int]
     pending: dict[str, tuple[str, int]]
-
-
-def update_auth_version(conn: sqlite3.Connection) -> None:
-    """使用系统时间更新授权版本，保证严格递增。"""
-    now_ms = time.time_ns() // 1_000_000
-    result = conn.execute(
-        """
-        UPDATE auth_state
-        SET version = MAX(version + 1, ?)
-        WHERE id = 1
-          AND typeof(version) = 'integer'
-          AND version >= 0
-          AND version < ?
-        """,
-        (now_ms, MAX_AUTH_VERSION),
-    )
-    if result.rowcount != 1:
-        raise sqlite3.IntegrityError("授权版本记录缺失、无效或已达到整数上限")
-
-
-def valid_mc_name(name: str) -> bool:
-    return bool(NAME_PATTERN.fullmatch(name))
 
 
 def _active_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[int, str, int] | None:
@@ -138,73 +112,11 @@ def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> s
 
 
 def apply_ban_snapshot(entries: Mapping[str, int | None]) -> int:
-    """Apply the effective player banlist and return the number of bindings frozen.
-
-    Expirations are Unix milliseconds. A name stays banned while any entry for
-    that case-insensitive name is active.
-    """
-    bans: dict[str, int | None] = {}
-    for name, expiration in entries.items():
-        if not isinstance(name, str) or not valid_mc_name(name):
-            raise ValueError("Invalid player name in ban snapshot")
-        if expiration is not None and (type(expiration) is not int or not 0 <= expiration <= MAX_AUTH_VERSION):
-            raise ValueError("Invalid expiration in ban snapshot")
-        name_key = name.lower()
-        if name_key in bans:
-            previous = bans[name_key]
-            expiration = max(previous, expiration) if previous is not None and expiration is not None else None
-        bans[name_key] = expiration
-
-    frozen_count = 0
+    """Apply the effective player banlist with Unix millisecond expirations."""
+    bans = normalize_ban_snapshot(entries)
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
-        existing = {
-            name: (state, expiration, binding_id)
-            for name, state, expiration, binding_id in conn.execute(
-                "SELECT mc_name_key, state, expires_at, binding_id FROM server_bans"
-            )
-        }
-        for name, expiration in bans.items():
-            old = existing.get(name)
-            if old is None:
-                conn.execute(
-                    """
-                    INSERT INTO server_bans (mc_name_key, state, expires_at,
-                        binding_id, group_id, qq_id, mc_name, bound_at, updated_at)
-                    SELECT ?, 'BANNED', ?, id, group_id, qq_id, mc_name, bound_at, updated_at
-                    FROM (SELECT 1)
-                    LEFT JOIN offline_bindings ON mc_name_key = ? AND status = 'ACTIVE'
-                    """,
-                    (name, expiration, name),
-                )
-                frozen_count += conn.execute(
-                    "DELETE FROM offline_bindings WHERE mc_name_key = ? AND status = 'ACTIVE'", (name,),
-                ).rowcount
-            elif old[:2] != ("BANNED", expiration):
-                conn.execute(
-                    """
-                    UPDATE server_bans SET revision = revision + (state != 'BANNED'),
-                        state = 'BANNED', expires_at = ? WHERE mc_name_key = ?
-                    """,
-                    (expiration, name),
-                )
-        for name in existing.keys() - bans.keys():
-            state, _, binding_id = existing[name]
-            if state != "BANNED":
-                continue
-            if binding_id is None:
-                conn.execute("DELETE FROM server_bans WHERE mc_name_key = ?", (name,))
-            else:
-                conn.execute(
-                    """
-                    UPDATE server_bans SET state = 'PENDING_MEMBERSHIP_CHECK', expires_at = NULL,
-                        revision = revision + 1 WHERE mc_name_key = ?
-                    """,
-                    (name,),
-                )
-        if frozen_count:
-            update_auth_version(conn)
-
+        frozen_count = apply_normalized_bans(conn, bans)
     if frozen_count:
         notify_auth_updated()
     return frozen_count

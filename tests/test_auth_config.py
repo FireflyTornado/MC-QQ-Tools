@@ -27,6 +27,7 @@ import notify_client
 
 API_TOKEN = "test-only.api~token+="
 NOTIFY_TOKEN = "test-only.notify-token"
+BANLIST_TOKEN = "test-only.banlist-token"
 GROUP_ID = "12345"
 VERSION = 1_800_000_000_001
 ENV = {
@@ -37,6 +38,7 @@ ENV = {
 SNAPSHOT_PATH = "/internal/mc/snapshot"
 NOTIFY_PATH = "/internal/mc/notify"
 WS_PATH = "/internal/mc/ws"
+BANLIST_PATH = "/internal/mc/banlist"
 
 
 def bearer(token):
@@ -83,17 +85,19 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         env_file = root / ".env"
         env_file.write_text("TARGET_GROUP_ID=00" + GROUP_ID + "\n", encoding="utf-8")
         with patch.object(app_config, "ENV_FILE", env_file), patch.dict(
-            os.environ, {"MC_API_TOKEN": API_TOKEN, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN}, clear=True
+            os.environ, {
+                "MC_API_TOKEN": API_TOKEN, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN, "MC_BANLIST_TOKEN": BANLIST_TOKEN,
+            }, clear=True
         ):
             self.api = importlib.import_module("mc_api")
         self.addCleanup(sys.modules.pop, "mc_api", None)
         self.api.DB_PATH = db_path
 
-    async def request(self, path, authorization=(), method="GET"):
+    async def request(self, path, authorization=(), method="GET", body=b""):
         sent = []
 
         async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": False}
 
         async def send(message):
             sent.append(message)
@@ -112,6 +116,70 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(headers[b"cache-control"], b"no-store")
                 self.assertEqual(payload, {"version": VERSION, "active_names": ["alex", "steve"]})
                 self.assertIsInstance(payload["version"], int)
+
+    async def upload_banlist(self, generation, sequence, entries, client_id="a" * 32):
+        payload = {"generation": generation, "client_id": client_id, "sequence": sequence, "entries": entries}
+        return await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", json.dumps(payload).encode())
+
+    async def test_banlist_upload_freezes_broadcasts_and_only_restores_after_membership_check(self):
+        status, headers, cursor = await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)])
+        self.assertEqual((status, headers[b"cache-control"], cursor), (200, b"no-store", {"generation": 0}))
+
+        async with self.websocket() as (updates, _):
+            status, _, reply = await self.upload_banlist(1, 1, {"Steve": None})
+            self.assertEqual((status, reply), (200, {"generation": 1, "sequence": 1}))
+            _, _, frozen = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(frozen["active_names"], ["alex"])
+            self.assertGreater(frozen["version"], VERSION)
+            update = json.loads((await asyncio.wait_for(updates.get(), 2))["text"])
+            self.assertEqual(update, {"type": "auth_updated", "version": frozen["version"]})
+
+            self.assertEqual((await self.upload_banlist(1, 1, {"STEVE": None}))[0], 200)
+            self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 409)
+            self.assertEqual((await self.upload_banlist(1, 3, {}))[0], 409)
+            self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 200)
+            self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2], frozen)
+            self.assertTrue(updates.empty())
+
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual(binding_service.request_unbind(GROUP_ID, "1"), ("pending", "Steve"))
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1"}, 2)
+        restored = (await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]
+        self.assertEqual(restored["active_names"], ["alex", "steve"])
+        self.assertGreater(restored["version"], frozen["version"])
+
+    async def test_new_banlist_session_fences_old_writers_and_cursor_survives_api_restart(self):
+        self.assertEqual((await self.upload_banlist(1, 1, {"Steve": None}))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 1, {}, client_id="b" * 32))[0], 409)
+        self.assertEqual((await self.upload_banlist(2, 1, {"Alex": None}, client_id="b" * 32))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
+        self.assertEqual((await self.upload_banlist(3, 1, {"Steve": None}, client_id="b" * 32))[0], 409)
+        db_path = self.api.DB_PATH
+        database.init_database(db_path)
+        with patch.object(app_config, "load_config", return_value={**ENV, "MC_BANLIST_TOKEN": BANLIST_TOKEN}):
+            self.api = importlib.reload(self.api)
+        self.api.DB_PATH = db_path
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 2})
+        self.assertEqual((await self.upload_banlist(2, 1, {"alex": None}, client_id="b" * 32))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
+
+    async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
+        for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):
+            self.assertEqual((await self.request(BANLIST_PATH, header, "PUT", b"{}"))[0], 401)
+        with patch.object(self.api, "BANLIST_TOKEN", None):
+            self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 404)
+        with patch.object(self.api, "MAX_BANLIST_BYTES", 4):
+            self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 413)
+        for entries in ({"Bad Name": None}, {"Steve": True}, {"Steve": "42"}):
+            self.assertEqual((await self.upload_banlist(1, 1, entries))[0], 422)
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", b'{"entries":'))[0], 422)
+        self.set_version(database.MAX_AUTH_VERSION)
+        with self.assertLogs("mc_qq_auth", "ERROR"):
+            self.assertEqual((await self.upload_banlist(1, 1, {"Steve": None}))[0], 503)
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 0})
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
 
     async def test_snapshot_excludes_frozen_and_pending_bindings_until_membership_is_verified(self):
         with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
@@ -499,7 +567,7 @@ class ConfigTests(unittest.TestCase):
         project = self.root / "source"
         (project / "plugins").mkdir(parents=True)
         for rel in (
-            "app_config.py", "bot.py", "binding_service.py", "database.py", "mc_api.py",
+            "app_config.py", "banlist_sync.py", "bot.py", "binding_service.py", "database.py", "mc_api.py",
             "notify_client.py", "qq_avatar.py", "qq_group.py", "runtime_status.py", "status_image.py",
             "status_card.svg", "message_config.py", "sudo_api.py", "sudo_config.py",
             "plugins/qq_bindings.py", "plugins/qq_events.py", "plugins/status_commands.py", "plugins/qq_sudo.py",
@@ -539,6 +607,7 @@ assert {plugin.module_name for plugin in nonebot.get_loaded_plugins()} == {
     "plugins.qq_bindings", "plugins.qq_events", "plugins.status_commands", "plugins.qq_sudo",
 }
 assert mc_api.sudo_settings is None
+assert mc_api.BANLIST_TOKEN is None
 """
         env = {
             key: value for key, value in os.environ.items()
@@ -546,6 +615,7 @@ assert mc_api.sudo_settings is None
                 *ENV, "DRIVER", "LOG_LEVEL", "ENVIRONMENT", "ONEBOT_ACCESS_TOKEN",
                 "ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_WS_URLS", "ONEBOT_V11_WS_URLS",
                 "MC_SUDO_QQ_IDS", "MC_SUDO_BOT_TOKEN", "MC_SUDO_PLUGIN_TOKEN",
+                "MC_BANLIST_TOKEN",
             }
         }
         env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, PYTHONUTF8="1")

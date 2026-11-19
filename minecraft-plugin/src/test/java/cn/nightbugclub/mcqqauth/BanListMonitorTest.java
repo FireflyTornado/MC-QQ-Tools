@@ -18,7 +18,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
@@ -27,6 +29,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class BanListMonitorTest {
@@ -39,6 +43,7 @@ class BanListMonitorTest {
     private final BukkitScheduler scheduler = mock(BukkitScheduler.class);
     private final Clock clock = mock(Clock.class);
     private final BlockingQueue<Runnable> mainTasks = new LinkedBlockingQueue<>();
+    private final List<Set<BanListMonitor.PlayerBan>> reports = new ArrayList<>();
 
     @BeforeEach
     void setUp() {
@@ -58,10 +63,11 @@ class BanListMonitorTest {
     void fileCreationAndReplacementRefreshTheLiveListAndDuplicateWritesDoNotLogChanges() throws Exception {
         Path banFile = directory.resolve("banned-players.json");
         when(list.getEntries()).thenReturn(Set.of());
-        try (var monitor = new BanListMonitor(plugin, banFile, clock)) {
+        try (var monitor = new BanListMonitor(plugin, banFile, clock, reports::add)) {
             monitor.start();
             runQueuedRefresh();
             verify(logger).info(contains("当前有效封禁 0 条"));
+            assertEquals(List.of(Set.of()), reports);
 
             var playerBan = ban(null);
             when(list.getEntries()).thenReturn(Set.of(playerBan));
@@ -72,12 +78,15 @@ class BanListMonitorTest {
             Files.writeString(banFile, "[]");
             runQueuedRefresh();
             verify(logger, times(1)).info(contains("名单已变化"));
+            assertEquals(2, reports.size());
 
             when(list.getEntries()).thenReturn(Set.of());
             Path replacement = Files.writeString(directory.resolve("replacement.json"), "[]");
             Files.move(replacement, banFile, StandardCopyOption.REPLACE_EXISTING);
             runQueuedRefresh();
             verify(logger).info(contains("1 → 0"));
+            assertEquals(3, reports.size());
+            assertTrue(reports.get(2).isEmpty());
         }
     }
 
@@ -88,7 +97,7 @@ class BanListMonitorTest {
         when(list.getEntries()).thenReturn(Set.of(playerBan));
         when(scheduler.runTaskLater(eq(plugin), any(Runnable.class), anyLong()))
                 .thenReturn(mock(BukkitTask.class));
-        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock)) {
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock, reports::add)) {
             monitor.start();
             runQueuedRefresh();
             verify(logger).info(contains("当前有效封禁 1 条"));
@@ -98,7 +107,24 @@ class BanListMonitorTest {
             when(clock.instant()).thenReturn(expiration);
             timeout.getValue().run();
             verify(logger).info(contains("1 → 0"));
+            assertEquals(2, reports.size());
+            assertTrue(reports.get(1).isEmpty());
             verify(scheduler, times(1)).runTaskLater(eq(plugin), any(Runnable.class), anyLong());
+        }
+    }
+
+    @Test
+    void failedReadDoesNotPublishAnEmptySnapshotAndQueuesOneRetry() throws Exception {
+        when(list.getEntries()).thenThrow(new IllegalStateException()).thenReturn(Set.of());
+        when(scheduler.runTaskLater(eq(plugin), any(Runnable.class), anyLong())).thenReturn(mock(BukkitTask.class));
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock, reports::add)) {
+            monitor.start();
+            runQueuedRefresh();
+            assertTrue(reports.isEmpty());
+            var retry = ArgumentCaptor.forClass(Runnable.class);
+            verify(scheduler).runTaskLater(eq(plugin), retry.capture(), eq(100L));
+            retry.getValue().run();
+            assertEquals(List.of(Set.of()), reports);
         }
     }
 

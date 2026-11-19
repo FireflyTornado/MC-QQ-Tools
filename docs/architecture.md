@@ -4,8 +4,9 @@
 
 ```text
 QQ 群 → NapCat → NoneBot2 → SQLite
-NoneBot2 ── 提交后 POST 通知 ──→ FastAPI ←── 只读数据 ── SQLite
+NoneBot2 ── 提交后 POST 通知 ──→ FastAPI ←→ SQLite
 FastAPI ── HTTPS 快照 / WSS 更新提醒 ──→ Minecraft 插件
+Minecraft 插件 ── HTTPS 封禁快照 ──→ FastAPI
 ```
 
 NapCat、NoneBot2 和 FastAPI 通常部署在同一台主机。NoneBot2 使用 OneBot v11 WebSocket 客户端连接 NapCat，接收目标群的消息和事件。Minecraft 运行在异地主机，插件通过受控的 HTTPS/WSS 入口接入授权 API。反代访问边界见 [部署说明](deployment.md)。
@@ -19,6 +20,8 @@ NapCat、NoneBot2 和 FastAPI 通常部署在同一台主机。NoneBot2 使用 O
 ## 封禁与绑定冻结
 
 数据库版本 2 新增 `server_bans` 表。`BANNED` 行对应服务端有效玩家封禁。若玩家已有有效绑定，应用名单快照时会在同一事务中将原绑定移入对应行，并更新授权版本。`/绑定` 检查封禁游戏名和已占用的 QQ。`/我的绑定` 会显示冻结状态。
+
+插件在启动、原版封禁名单文件变化和临时封禁到期时读取服务端内存中的有效名单。插件异步上报完整名单，并重试尚未收到确认的快照，待确认后继续发送最新名单。数据库版本 3 将上报会话和序号保存在既有的 `auth_state` 中。FastAPI 在同一事务内应用名单并记录确认位置，随后广播有变化的授权版本。
 
 服务端解封后，有原绑定的行进入 `PENDING_MEMBERSHIP_CHECK`，继续占用游戏名和 QQ 的绑定名额。自行解绑、退群事件和普通成员对账都保留 `server_bans` 内的绑定。Bot 有连接时会检查待核实行，复用群成员对账流程。确认在群就恢复授权，确认离群就释放记录，查询失败会重试。写回前检查行的 `revision`，避免使用再次封禁之前的核实结果。恢复时保留原绑定时间，用本轮核实开始时间防止早先的退群通知撤销已恢复的绑定。
 

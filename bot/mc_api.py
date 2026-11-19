@@ -4,8 +4,13 @@ import secrets
 import sqlite3
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
+)
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import ClientDisconnect
 
 from app_config import (
     ConfigError,
@@ -15,7 +20,8 @@ from app_config import (
     require_token as config_token,
     target_group_id,
 )
-from database import DB_PATH
+from banlist_sync import UploadConflict, read_generation, store_upload
+from database import DB_PATH, MAX_AUTH_VERSION
 from sudo_api import sudo_router
 from sudo_config import read_sudo_settings
 
@@ -30,13 +36,39 @@ try:
 except ConfigError as exc:
     logging.getLogger("mc_qq_auth").error("/sudo 已关闭：%s", exc)
     sudo_settings = None
+BANLIST_TOKEN = None
+if config.get("MC_BANLIST_TOKEN"):
+    try:
+        banlist_token = config_token(config, "MC_BANLIST_TOKEN")
+        if banlist_token in {config.get(key) for key in (
+            "MC_API_TOKEN", "MC_NOTIFY_TOKEN", "MC_SUDO_BOT_TOKEN", "MC_SUDO_PLUGIN_TOKEN", "ONEBOT_ACCESS_TOKEN",
+        )}:
+            raise ConfigError("MC_BANLIST_TOKEN 必须使用独立凭据")
+        BANLIST_TOKEN = banlist_token.encode("ascii")
+    except ConfigError as exc:
+        logging.getLogger("mc_qq_auth").error("封禁名单上报已关闭：%s", exc)
 del config
 
 MAX_AUTHORIZATION_LENGTH = MAX_TOKEN_LENGTH + 128
 WS_SEND_TIMEOUT = 3
 WS_CLOSE_TIMEOUT = 3
 RECONCILE_INTERVAL = 60
+BANLIST_PATH = "/internal/mc/banlist"
+MAX_BANLIST_BYTES = 2 * 1024 * 1024
 logger = logging.getLogger("mc_qq_auth")
+
+
+UploadNumber = Annotated[int, Field(strict=True, ge=1, le=MAX_AUTH_VERSION)]
+Expiration = Annotated[int, Field(strict=True, ge=0, le=MAX_AUTH_VERSION)]
+
+
+class BanlistUpload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generation: UploadNumber
+    client_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    sequence: UploadNumber
+    entries: dict[str, Expiration | None]
 
 
 # 不对外暴露自动生成的 API 文档
@@ -75,6 +107,12 @@ def require_bearer(authorization: list[str] | None, expected_token: bytes) -> No
 
 def require_token(authorization: list[str] | None = Header(default=None)) -> None:
     require_bearer(authorization, API_TOKEN)
+
+
+def require_banlist_token(authorization: list[str] | None = Header(default=None)) -> None:
+    if BANLIST_TOKEN is None:
+        raise HTTPException(status_code=404, detail="Banlist uploads disabled")
+    require_bearer(authorization, BANLIST_TOKEN)
 
 
 app.include_router(sudo_router(sudo_settings, TARGET_GROUP_ID, verify_bearer))
@@ -207,6 +245,47 @@ async def broadcast_latest():
         ))
         last_broadcast_version = version
         return version, sum(delivered)
+
+
+@app.get(BANLIST_PATH, dependencies=[Depends(require_banlist_token)])
+def get_banlist_generation(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"generation": read_generation(DB_PATH)}
+    except sqlite3.Error:
+        logger.exception("无法读取封禁名单同步会话")
+        raise HTTPException(status_code=503, detail="Banlist database unavailable") from None
+
+
+@app.put(BANLIST_PATH, dependencies=[Depends(require_banlist_token)])
+async def upload_banlist(request: Request, background: BackgroundTasks, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_BANLIST_BYTES:
+                raise HTTPException(status_code=413, detail="Banlist snapshot is too large")
+            body.extend(chunk)
+        upload = BanlistUpload.model_validate_json(body)
+        frozen = await asyncio.to_thread(store_upload, DB_PATH, **upload.model_dump())
+    except (ValueError, ClientDisconnect):
+        raise HTTPException(status_code=422, detail="Invalid banlist snapshot") from None
+    except UploadConflict:
+        raise HTTPException(status_code=409, detail="Banlist upload cursor conflict") from None
+    except sqlite3.Error:
+        logger.exception("封禁名单写入失败")
+        raise HTTPException(status_code=503, detail="Banlist database unavailable") from None
+
+    if frozen:
+        background.add_task(broadcast_banlist_update)
+    return {"generation": upload.generation, "sequence": upload.sequence}
+
+
+async def broadcast_banlist_update() -> None:
+    try:
+        await broadcast_latest()
+    except (sqlite3.Error, RuntimeError):
+        logger.exception("封禁授权更新通知失败，将等待授权版本补偿检查")
 
 
 # ----------------------------------------

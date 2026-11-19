@@ -17,6 +17,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
 import static java.nio.file.StandardWatchEventKinds.ENTRY_DELETE;
@@ -24,22 +25,26 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 import static java.nio.file.StandardWatchEventKinds.OVERFLOW;
 
 final class BanListMonitor implements AutoCloseable {
+    private static final long READ_RETRY_TICKS = 100;
     private final Plugin plugin;
     private final Path fileName;
     private final Clock clock;
     private final WatchService watcher;
+    private final Consumer<Set<PlayerBan>> onSnapshot;
     private final AtomicBoolean refreshQueued = new AtomicBoolean();
     private volatile boolean closed;
 
-    // The effective snapshot and the expiration task are owned by the Bukkit thread.
+    // The effective snapshot and the next timed refresh are owned by the Bukkit thread.
     private Set<PlayerBan> current;
-    private BukkitTask expirationTask;
+    private BukkitTask refreshTask;
+    private boolean readFailed;
 
-    BanListMonitor(Plugin plugin, Path file, Clock clock) throws IOException {
+    BanListMonitor(Plugin plugin, Path file, Clock clock, Consumer<Set<PlayerBan>> onSnapshot) throws IOException {
         Path absoluteFile = file.toAbsolutePath().normalize();
         this.plugin = plugin;
         this.fileName = absoluteFile.getFileName();
         this.clock = clock;
+        this.onSnapshot = onSnapshot;
         watcher = absoluteFile.getFileSystem().newWatchService();
         try {
             absoluteFile.getParent().register(watcher, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE);
@@ -107,6 +112,31 @@ final class BanListMonitor implements AutoCloseable {
             return;
         }
         Instant now = clock.instant();
+        Set<PlayerBan> active;
+        try {
+            active = readActiveBans(now);
+        } catch (RuntimeException e) {
+            if (!readFailed) {
+                plugin.getLogger().warning("无法读取有效封禁名单，将重试（" + e.getClass().getSimpleName() + "）");
+                readFailed = true;
+            }
+            scheduleRefresh(READ_RETRY_TICKS);
+            return;
+        }
+        readFailed = false;
+        if (current == null) {
+            plugin.getLogger().info("封禁名单文件监听已初始化，当前有效封禁 " + active.size() + " 条。");
+        } else if (!current.equals(active)) {
+            plugin.getLogger().info("玩家封禁名单已变化，有效封禁 " + current.size() + " → " + active.size() + " 条。");
+        }
+        if (!active.equals(current)) {
+            current = Set.copyOf(active);
+            onSnapshot.accept(current);
+        }
+        scheduleExpiration(now);
+    }
+
+    private Set<PlayerBan> readActiveBans(Instant now) {
         ProfileBanList list = plugin.getServer().getBanList(BanList.Type.PROFILE);
         Set<PlayerBan> active = new HashSet<>();
         for (var entry : list.getEntries()) {
@@ -114,42 +144,46 @@ final class BanListMonitor implements AutoCloseable {
             Instant expiration = date == null ? null : date.toInstant();
             if (expiration == null || expiration.isAfter(now)) {
                 var profile = entry.getBanTarget();
-                active.add(new PlayerBan(profile.getUniqueId(), profile.getName(), expiration));
+                String name = profile.getName();
+                if (!AuthProtocol.validPlayerName(name)) {
+                    throw new IllegalStateException("封禁记录缺少可用的游戏名");
+                }
+                active.add(new PlayerBan(profile.getUniqueId(), name, expiration));
             }
         }
-        if (current == null) {
-            plugin.getLogger().info("封禁名单文件监听已初始化，当前有效封禁 " + active.size() + " 条。");
-        } else if (!current.equals(active)) {
-            plugin.getLogger().info("玩家封禁名单已变化，有效封禁 " + current.size() + " → " + active.size() + " 条。");
-        }
-        current = active;
-        scheduleExpiration(now);
+        return active;
     }
 
     private void scheduleExpiration(Instant now) {
-        cancelExpiration();
-        current.stream().map(PlayerBan::expiration).filter(Objects::nonNull).min(Instant::compareTo)
-                .ifPresent(expiration -> {
-                    long millis = expiration.toEpochMilli() - now.toEpochMilli();
-                    long ticks = millis <= 0 ? 1 : (millis - 1) / 50 + 1;
-                    expirationTask = plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
-                        expirationTask = null;
-                        refresh();
-                    }, ticks);
-                });
+        Instant expiration = current.stream().map(PlayerBan::expiration)
+                .filter(Objects::nonNull).min(Instant::compareTo).orElse(null);
+        if (expiration == null) {
+            cancelScheduledRefresh();
+            return;
+        }
+        long millis = expiration.toEpochMilli() - now.toEpochMilli();
+        scheduleRefresh(millis <= 0 ? 1 : (millis - 1) / 50 + 1);
     }
 
-    private void cancelExpiration() {
-        if (expirationTask != null) {
-            expirationTask.cancel();
-            expirationTask = null;
+    private void scheduleRefresh(long ticks) {
+        cancelScheduledRefresh();
+        refreshTask = plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+            refreshTask = null;
+            refresh();
+        }, ticks);
+    }
+
+    private void cancelScheduledRefresh() {
+        if (refreshTask != null) {
+            refreshTask.cancel();
+            refreshTask = null;
         }
     }
 
     @Override
     public void close() {
         closed = true;
-        cancelExpiration();
+        cancelScheduledRefresh();
         try {
             watcher.close();
         } catch (IOException e) {
@@ -157,5 +191,5 @@ final class BanListMonitor implements AutoCloseable {
         }
     }
 
-    private record PlayerBan(UUID uuid, String name, Instant expiration) {}
+    record PlayerBan(UUID uuid, String name, Instant expiration) {}
 }

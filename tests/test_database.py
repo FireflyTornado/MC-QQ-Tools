@@ -428,7 +428,12 @@ class DatabaseTests(unittest.TestCase):
         self.assertGreater(self.auth_version(), version)
         self.notify.assert_called_once_with()
         self.assertIsNone(binding_service.unbind_player("group", "qq", left_at=199))
-        self.assertEqual(binding_service.unbind_player("group", "qq", left_at=200), "MyName")
+        self.assertEqual(binding_service.request_unbind("group", "qq", left_at=200), ("verify_membership", "MyName"))
+        self.assertEqual(binding_service.get_binding("group", "qq"), "MyName")
+        check = binding_service.handle_departure("group", "qq", 200)
+        self.assertIsInstance(check, binding_service.DepartureCheck)
+        self.assertEqual(binding_service.revoke_checked_bindings("group", check.version, {"qq": check.binding_id}), 1)
+        self.assertIsNone(binding_service.get_binding("group", "qq"))
 
     def test_snapshot_and_concurrent_unbind_follow_transaction_order(self):
         database.init_database()

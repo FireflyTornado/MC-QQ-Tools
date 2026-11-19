@@ -26,11 +26,13 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
@@ -43,6 +45,7 @@ class BanListMonitorTest {
     private final Logger logger = mock(Logger.class);
     private final ProfileBanList list = mock(ProfileBanList.class);
     private final BukkitScheduler scheduler = mock(BukkitScheduler.class);
+    private final ScheduledExecutorService timer = mock(ScheduledExecutorService.class);
     private final Clock clock = mock(Clock.class);
     private final BlockingQueue<Runnable> mainTasks = new LinkedBlockingQueue<>();
     private final List<Set<BanListMonitor.PlayerBan>> reports = new ArrayList<>();
@@ -93,39 +96,44 @@ class BanListMonitorTest {
     }
 
     @Test
-    void scheduledExpirationRemovesTheEffectiveBanWithoutAFileEvent() throws Exception {
+    void wallClockExpirationQueuesTheMainThreadWithoutWaitingForBukkitTicks() throws Exception {
         Instant expiration = clock.instant().plusMillis(1001);
         var playerBan = ban(expiration);
         when(list.getEntries()).thenReturn(Set.of(playerBan));
-        when(scheduler.runTaskLater(eq(plugin), any(Runnable.class), anyLong()))
-                .thenReturn(mock(BukkitTask.class));
-        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock, reports::add)) {
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"),
+                clock, reports::add, timer)) {
             monitor.start();
             runQueuedRefresh();
             verify(logger).info(contains("当前有效封禁 1 条"));
             var timeout = ArgumentCaptor.forClass(Runnable.class);
-            verify(scheduler).runTaskLater(eq(plugin), timeout.capture(), eq(21L));
+            verify(timer).schedule(timeout.capture(), eq(1001L), eq(MILLISECONDS));
+            verify(scheduler, never()).runTaskLater(eq(plugin), any(Runnable.class), anyLong());
 
             when(clock.instant()).thenReturn(expiration);
             timeout.getValue().run();
+            assertEquals(1, reports.size());
+            runQueuedRefresh();
             verify(logger).info(contains("1 → 0"));
             assertEquals(2, reports.size());
             assertTrue(reports.get(1).isEmpty());
-            verify(scheduler, times(1)).runTaskLater(eq(plugin), any(Runnable.class), anyLong());
+            verify(timer, times(1)).schedule(any(Runnable.class), anyLong(), eq(MILLISECONDS));
         }
+        verify(timer).shutdownNow();
     }
 
     @Test
     void failedReadDoesNotPublishAnEmptySnapshotAndQueuesOneRetry() throws Exception {
         when(list.getEntries()).thenThrow(new IllegalStateException()).thenReturn(Set.of());
-        when(scheduler.runTaskLater(eq(plugin), any(Runnable.class), anyLong())).thenReturn(mock(BukkitTask.class));
-        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock, reports::add)) {
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"),
+                clock, reports::add, timer)) {
             monitor.start();
             runQueuedRefresh();
             assertTrue(reports.isEmpty());
             var retry = ArgumentCaptor.forClass(Runnable.class);
-            verify(scheduler).runTaskLater(eq(plugin), retry.capture(), eq(100L));
+            verify(timer).schedule(retry.capture(), eq(5_000L), eq(MILLISECONDS));
             retry.getValue().run();
+            assertTrue(reports.isEmpty());
+            runQueuedRefresh();
             assertEquals(List.of(Set.of()), reports);
         }
     }

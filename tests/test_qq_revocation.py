@@ -81,6 +81,7 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         self.notify = notify_patch.start()
         self.addCleanup(notify_patch.stop)
         self.events.recent_departures.clear()
+        self.events.pending_departures.clear()
         self.events.bots_outside_group.clear()
         self.bot = Bot(nonebot.get_adapter(Adapter), str(BOT))
         self.send_group = self.enterContext(patch.object(self.bot, "send_group_msg", new_callable=AsyncMock))
@@ -88,6 +89,7 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         self.driver.bots[self.bot.self_id] = self.bot
         self.addCleanup(self.driver.bots.pop, self.bot.self_id, None)
         self.addCleanup(self.events.recent_departures.clear)
+        self.addCleanup(self.events.pending_departures.clear)
         self.addCleanup(self.events.bots_outside_group.clear)
 
     def bind(self, user=ABSENT, name="Steve", group=GROUP, timestamp=DEPARTED_AT - 1):
@@ -96,6 +98,14 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
 
     def binding(self, user=ABSENT, group=GROUP):
         return binding_service.get_binding(str(group), str(user))
+
+    def restore_binding(self):
+        self.bind()
+        binding_service.apply_ban_snapshot({"Steve": None})
+        binding_service.apply_ban_snapshot({})
+        audit = binding_service.membership_audit_snapshot(str(GROUP), only_pending=True)
+        self.assertEqual(binding_service.reconcile_checked_bindings(str(GROUP), audit, {str(ABSENT)}, DEPARTED_AT), 0)
+        self.notify.reset_mock()
 
     def configure(self, source):
         path = self.path.with_name("messages.yml")
@@ -215,13 +225,78 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
             check = asyncio.create_task(self.events.reconcile_members(self.bot, only_pending=True))
             try:
                 self.assertTrue(await asyncio.to_thread(commit_started.wait, 5))
-                event = departure(timestamp=max(DEPARTED_AT, checked_at))
+                event = departure(timestamp=max(DEPARTED_AT, checked_at + 1))
                 leave = asyncio.create_task(self.events.handle_member_leave(self.bot, event))
                 await asyncio.sleep(0)
             finally:
                 resume.set()
             await asyncio.gather(check, leave)
         self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("not_bound", None))
+
+    async def test_same_second_departure_retains_a_returned_member_but_revokes_a_genuine_departure(self):
+        self.enable_notices("leave")
+        self.restore_binding()
+        event = departure()
+        version = self.version()
+
+        with self.mock_roster(member_rows(BOT, ABSENT)) as queries:
+            await self.events.handle_member_leave(self.bot, event)
+            self.assertEqual(queries.await_count, 3)
+        self.assertEqual(self.binding(), "Steve")
+        self.assertEqual(self.version(), version)
+        self.notify.assert_not_called()
+        self.send_group.assert_not_awaited()
+
+        # There is no event ID to distinguish another departure with the same timestamp and sender.
+        with self.mock_roster(member_rows(BOT, MEMBER)) as queries:
+            await self.events.handle_member_leave(self.bot, event)
+            self.assertEqual(queries.await_count, 3)
+        self.assertIsNone(self.binding())
+        self.notify.assert_called_once_with()
+        self.assert_notice("成员已退出群聊。Minecraft 授权已自动撤销。")
+
+    async def test_same_second_departure_waits_for_a_verified_roster_and_retries_automatically(self):
+        self.restore_binding()
+        with self.mock_roster(member_rows(BOT, MEMBER), count=3):
+            await self.events.handle_member_leave(self.bot, departure())
+        self.assertEqual(self.binding(), "Steve")
+        self.notify.assert_not_called()
+        self.assertEqual(len(self.events.pending_departures), 1)
+
+        completed = asyncio.Event()
+        process = self.events.process_departure
+
+        async def observe_retry(bot, event, *, retry=False):
+            await process(bot, event, retry=retry)
+            completed.set()
+
+        with (self.mock_roster(member_rows(BOT, MEMBER)),
+              patch.object(self.events, "MEMBER_CHECK_RETRY_DELAY", 0.01),
+              patch.object(self.events, "process_departure", observe_retry)):
+            await self.events.start_pending_binding_checks()
+            try:
+                await asyncio.wait_for(completed.wait(), timeout=5)
+            finally:
+                await self.events.stop_pending_binding_checks()
+        self.assertIsNone(self.binding())
+        self.assertFalse(self.events.pending_departures)
+        self.notify.assert_called_once_with()
+
+    async def test_same_second_departure_never_reuses_roster_evidence_after_rebinding(self):
+        self.restore_binding()
+
+        async def api(action, **data):
+            if action == "get_group_detail_info":
+                self.assertEqual(binding_service.unbind_player(str(GROUP), str(ABSENT)), "Steve")
+                self.bind(name="NewSteve", timestamp=DEPARTED_AT)
+                return {"group_id": GROUP, "member_count": 2}
+            return member_rows(BOT, MEMBER)
+
+        with patch.object(self.bot, "call_api", AsyncMock(side_effect=api)):
+            await self.events.handle_member_leave(self.bot, departure())
+        self.assertEqual(self.binding(), "NewSteve")
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(len(self.events.pending_departures), 1)
 
     async def test_leave_revokes_only_target_group_and_notifies_after_commit(self):
         self.enable_notices("leave", "join")
@@ -283,7 +358,8 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         self.bind(name="NewSteve", timestamp=DEPARTED_AT)
         version = self.version()
         self.notify.reset_mock()
-        await self.events.handle_member_leave(self.bot, event)
+        with self.mock_roster(member_rows(BOT, ABSENT)):
+            await self.events.handle_member_leave(self.bot, event)
         self.assertEqual(self.binding(), "NewSteve")
         self.assertEqual(self.version(), version)
         self.notify.assert_not_called()

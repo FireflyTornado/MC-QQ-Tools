@@ -16,6 +16,13 @@ class MembershipAudit:
     pending: dict[str, tuple[str, int]]
 
 
+@dataclass(frozen=True)
+class DepartureCheck:
+    binding_id: int
+    mc_name: str
+    version: int
+
+
 def _active_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[int, str, int] | None:
     return conn.execute(
         """
@@ -89,15 +96,20 @@ def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | Non
     return "success", mc_name
 
 
-def request_unbind(group_id: str, qq_id: str, *, left_at: int | None = None) -> tuple[str, str | None]:
+def _request_unbind(
+    group_id: str, qq_id: str, left_at: int | None, *, only_same_second: bool = False,
+) -> tuple[str, str | None] | DepartureCheck:
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = _active_binding(conn, group_id, qq_id)
         if not row:
             return _reserved_binding(conn, group_id, qq_id) or ("not_bound", None)
         binding_id, mc_name, authorized_at = row
-        if left_at is not None and authorized_at > left_at:
-            return "not_bound", None
+        if left_at is not None:
+            if authorized_at == left_at:
+                return DepartureCheck(binding_id, mc_name, _audit_version(conn))
+            if only_same_second or authorized_at > left_at:
+                return "not_bound", None
         _delete_active_bindings(conn, group_id, {qq_id: binding_id})
         update_auth_version(conn)
 
@@ -105,9 +117,26 @@ def request_unbind(group_id: str, qq_id: str, *, left_at: int | None = None) -> 
     return "success", mc_name
 
 
+def request_unbind(group_id: str, qq_id: str, *, left_at: int | None = None) -> tuple[str, str | None]:
+    result = _request_unbind(group_id, qq_id, left_at)
+    if isinstance(result, DepartureCheck):
+        return "verify_membership", result.mc_name
+    return result
+
+
 def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> str | None:
     """删除当前有效绑定，并更新权限版本号。"""
     status, name = request_unbind(group_id, qq_id, left_at=left_at)
+    return name if status == "success" else None
+
+
+def handle_departure(
+    group_id: str, qq_id: str, left_at: int, *, only_same_second: bool = False,
+) -> DepartureCheck | str | None:
+    result = _request_unbind(group_id, qq_id, left_at, only_same_second=only_same_second)
+    if isinstance(result, DepartureCheck):
+        return result
+    status, name = result
     return name if status == "success" else None
 
 

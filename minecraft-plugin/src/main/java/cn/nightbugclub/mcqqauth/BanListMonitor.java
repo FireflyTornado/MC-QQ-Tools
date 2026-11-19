@@ -4,7 +4,6 @@ import org.bukkit.BanList;
 import org.bukkit.ban.ProfileBanList;
 import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitTask;
 
 import java.io.IOException;
 import java.nio.file.ClosedWatchServiceException;
@@ -16,6 +15,9 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -23,28 +25,36 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
 import static java.nio.file.StandardWatchEventKinds.ENTRY_DELETE;
 import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 import static java.nio.file.StandardWatchEventKinds.OVERFLOW;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 final class BanListMonitor implements AutoCloseable {
-    private static final long READ_RETRY_TICKS = 100;
+    private static final long READ_RETRY_MS = 5_000;
     private final Plugin plugin;
     private final Path fileName;
     private final Clock clock;
     private final WatchService watcher;
+    private final ScheduledExecutorService timer;
     private final Consumer<Set<PlayerBan>> onSnapshot;
     private final AtomicBoolean refreshQueued = new AtomicBoolean();
     private volatile boolean closed;
 
     // The effective snapshot and the next timed refresh are owned by the Bukkit thread.
     private Set<PlayerBan> current;
-    private BukkitTask refreshTask;
+    private ScheduledFuture<?> refreshTask;
     private boolean readFailed;
 
     BanListMonitor(Plugin plugin, Path file, Clock clock, Consumer<Set<PlayerBan>> onSnapshot) throws IOException {
+        this(plugin, file, clock, onSnapshot, refreshTimer());
+    }
+
+    BanListMonitor(Plugin plugin, Path file, Clock clock, Consumer<Set<PlayerBan>> onSnapshot,
+                   ScheduledExecutorService timer) throws IOException {
         Path absoluteFile = file.toAbsolutePath().normalize();
         this.plugin = plugin;
         this.fileName = absoluteFile.getFileName();
         this.clock = clock;
         this.onSnapshot = onSnapshot;
+        this.timer = timer;
         watcher = absoluteFile.getFileSystem().newWatchService();
         try {
             absoluteFile.getParent().register(watcher, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE);
@@ -56,6 +66,16 @@ final class BanListMonitor implements AutoCloseable {
             }
             throw e;
         }
+    }
+
+    private static ScheduledExecutorService refreshTimer() {
+        var timer = new ScheduledThreadPoolExecutor(1, task -> {
+            Thread thread = new Thread(task, "MCQQAuth-banlist-timer");
+            thread.setDaemon(true);
+            return thread;
+        });
+        timer.setRemoveOnCancelPolicy(true);
+        return timer;
     }
 
     void start() {
@@ -120,7 +140,7 @@ final class BanListMonitor implements AutoCloseable {
                 plugin.getLogger().warning("无法读取有效封禁名单，将重试（" + e.getClass().getSimpleName() + "）");
                 readFailed = true;
             }
-            scheduleRefresh(READ_RETRY_TICKS);
+            scheduleRefresh(READ_RETRY_MS);
             return;
         }
         readFailed = false;
@@ -133,7 +153,7 @@ final class BanListMonitor implements AutoCloseable {
             current = Set.copyOf(active);
             onSnapshot.accept(current);
         }
-        scheduleExpiration(now);
+        scheduleExpiration();
     }
 
     private Set<PlayerBan> readActiveBans(Instant now) {
@@ -169,28 +189,25 @@ final class BanListMonitor implements AutoCloseable {
         }
     }
 
-    private void scheduleExpiration(Instant now) {
+    private void scheduleExpiration() {
         Instant expiration = current.stream().map(PlayerBan::expiration)
                 .filter(Objects::nonNull).min(Instant::compareTo).orElse(null);
         if (expiration == null) {
             cancelScheduledRefresh();
             return;
         }
-        long millis = expiration.toEpochMilli() - now.toEpochMilli();
-        scheduleRefresh(millis <= 0 ? 1 : (millis - 1) / 50 + 1);
+        long remaining = expiration.toEpochMilli() - clock.instant().toEpochMilli();
+        scheduleRefresh(Math.max(0, remaining));
     }
 
-    private void scheduleRefresh(long ticks) {
+    private void scheduleRefresh(long millis) {
         cancelScheduledRefresh();
-        refreshTask = plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
-            refreshTask = null;
-            refresh();
-        }, ticks);
+        refreshTask = timer.schedule(this::queueRefresh, millis, MILLISECONDS);
     }
 
     private void cancelScheduledRefresh() {
         if (refreshTask != null) {
-            refreshTask.cancel();
+            refreshTask.cancel(false);
             refreshTask = null;
         }
     }
@@ -199,6 +216,7 @@ final class BanListMonitor implements AutoCloseable {
     public void close() {
         closed = true;
         cancelScheduledRefresh();
+        timer.shutdownNow();
         try {
             watcher.close();
         } catch (IOException e) {

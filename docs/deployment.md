@@ -67,13 +67,15 @@ events:
     enabled: false
   kick:
     enabled: true
+    retained: "成员 {member_qq} 已被移出群聊，Minecraft 绑定 {mc_name} 仍保留。"
 commands:
   bind:
     success: "已绑定 Minecraft ID：{mc_name}"
+    banned_name: "游戏 ID {requested_mc_name} 已被封禁，暂时无法绑定。"
   help:
     message: "发送 /bind 游戏ID 绑定账号，发送 /binding 查询。"
 info:
-  title: "社区授权状态"
+  title: "社区授权状态 · 群 {group_id}"
   labels:
     bindings: "有效绑定"
     bans: "封禁记录"
@@ -81,7 +83,7 @@ info:
 
 三个开关分别控制入群、主动退群和被移出群的消息，默认均为 `false`。现有配置显式设置为 `true` 的通知继续开启。关闭任意开关后，成员事件记录、退群撤权和授权同步照常执行。离群通知按结果选择 `revoked`、`retained`、`no_binding` 或 `failed`。已有冻结或待核实绑定时使用 `retained`。
 
-中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。每个字段可用的占位符见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。指令权限继续由目标群和 `SUPERUSERS` 控制。
+中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。通用变量 `{group_id}` 和 `{bot_qq}` 分别是目标群号和机器人 QQ 号，可用于所有文字文案，包括状态图的标题和标签。业务变量的含义和可用字段见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。可用变量在本次渲染时缺少实际值会显示为 `—`。指令权限继续由目标群和 `SUPERUSERS` 控制。
 
 已有绑定时，`/绑定` 统一使用 `commands.bind.already_bound`，默认提示如需更换请先使用 `/解绑`。旧配置里的 `commands.bind.frozen` 和 `commands.bind.pending` 可以删除。`/解绑` 和 `/我的绑定` 仍可显示冻结或待核实状态。
 

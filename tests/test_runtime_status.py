@@ -235,8 +235,9 @@ class RuntimeStatusTests(unittest.TestCase):
         long_text = ("很长的状态名称" if status_image._font_source(False) else "Long title ") * 80
         qq_id = "12345678901234567890"
         path.write_text(
-            f'info:\n  title: "{long_text}"\n  footer: "legacy footer"\n  labels:\n'
-            f'    database: "Auth DB"\n    api: "{long_text}"\n    onebot: [invalid]\n    bot_uptime: "Bot 进程"\n',
+            f'info:\n  title: "Group {{group_id}} {long_text}"\n  footer: "legacy footer"\n  labels:\n'
+            f'    database: "DB {{group_id}}"\n    api: "{long_text}"\n    onebot: [invalid]\n    bot_uptime: "Bot 进程"\n'
+            '    bindings: "{{QQ}} {bot_qq}"\n',
             encoding="utf-8",
         )
         messages = message_config.load_messages(path)
@@ -244,8 +245,10 @@ class RuntimeStatusTests(unittest.TestCase):
             checked_at=LocalClock(2026, 11, 9, 7, 30, tzinfo=UTC), connected=True, active_bindings=0,
         )
         with patch.object(message_config, "MESSAGES", messages):
-            nodes = self.rendered_svg(status, qq_id=qq_id, nickname=long_text)
-        self.assertEqual(nodes["sqlite-name"].text, "Auth DB")
+            nodes = self.rendered_svg(status, group_id="321", qq_id=qq_id, nickname=long_text)
+        self.assertEqual(nodes["sqlite-name"].text, "DB 321")
+        self.assertTrue(nodes["title"].text.startswith("Group 321 "))
+        self.assertTrue(nodes["bindings-label"].text.startswith("{QQ} 123"))
         self.assertEqual(nodes["onebot-name"].text, "OneBot")
         self.assertEqual(nodes["bot-name"].text, "NoneBot2")
         self.assertEqual(nodes["qq-id"].text, f"QQ {qq_id}")

@@ -36,7 +36,7 @@ DEFAULTS = MappingProxyType({
     "commands.bind.invalid_name": "游戏 ID 格式不正确。\n请填写由英文字母、数字或下划线组成的游戏 ID，最多 16 位。",
     "commands.bind.already_bound": "你已经绑定了游戏 ID：{mc_name}\n如需更换，请先使用 /解绑",
     "commands.bind.name_taken": "该游戏 ID 已经被绑定，无法重复绑定。",
-    "commands.bind.banned_name": "该游戏 ID 已被 Minecraft 服务器封禁，暂时无法绑定。",
+    "commands.bind.banned_name": "游戏 ID {requested_mc_name} 已被 Minecraft 服务器封禁，暂时无法绑定。",
     "commands.bind.error": "绑定服务发生错误，请稍后重试",
     "commands.unbind.success": "解绑成功！\n原 Minecraft ID：{mc_name}\n绑定记录已删除。",
     "commands.unbind.not_bound": "你当前没有有效的绑定记录。",
@@ -90,10 +90,20 @@ DEFAULTS = MappingProxyType({
 })
 SECTIONS = {key.rsplit(".", depth)[0] for key in DEFAULTS for depth in range(1, key.count(".") + 1)}
 
-FIELDS = {
-    "events.join.message": {"member"},
+COMMON_FIELDS = {"group_id", "bot_qq"}
+BUSINESS_FIELDS = {
+    "events.join.message": {"member", "member_qq"},
+    "events.leave.revoked": {"member_qq", "mc_name"},
+    "events.leave.retained": {"member_qq", "mc_name"},
+    "events.leave.no_binding": {"member_qq"},
+    "events.leave.failed": {"member_qq"},
+    "events.kick.revoked": {"member_qq", "mc_name"},
+    "events.kick.retained": {"member_qq", "mc_name"},
+    "events.kick.no_binding": {"member_qq"},
+    "events.kick.failed": {"member_qq"},
     "commands.bind.success": {"mc_name"},
     "commands.bind.already_bound": {"mc_name"},
+    "commands.bind.banned_name": {"requested_mc_name"},
     "commands.unbind.success": {"mc_name"},
     "commands.unbind.frozen": {"mc_name"},
     "commands.unbind.pending": {"mc_name"},
@@ -122,21 +132,21 @@ class MessageConfig:
         assert isinstance(value, str)
         return value
 
-    def info_text(self, key: str) -> str:
-        return self.text(key).replace("{{", "{").replace("}}", "}")
+    def info_text(self, key: str, **values: str | int | None) -> str:
+        return self.render(key, **values).extract_plain_text()
 
     def render(self, key: str, **values: str | int | MessageSegment | None) -> Message:
         template = self.text(key)
-        message = _render(template, values)
-        if message is None:
-            logger.warning("[MC-QQ-AUTH] 消息变量缺失或渲染后过长，使用默认文案（{}）", key)
-            return _render(DEFAULTS[key], values, use_default=True)
+        message, length = _render(template, values)
+        if length > MAX_TEXT_LENGTH:
+            logger.warning("[MC-QQ-AUTH] 消息渲染后过长，使用默认文案（{}）", key)
+            message, _ = _render(DEFAULTS[key], values)
         return message
 
 
 def _render(
-    template: str, values: Mapping[str, str | int | MessageSegment | None], *, use_default: bool = False,
-) -> Message | None:
+    template: str, values: Mapping[str, str | int | MessageSegment | None],
+) -> tuple[Message, int]:
     message = Message()
     text: list[str] = []
     length = 0
@@ -146,8 +156,6 @@ def _render(
                 part = part[0]
             else:
                 value = values.get(part[1:-1])
-                if value is None and not use_default:
-                    return None
                 if isinstance(value, MessageSegment):
                     if text:
                         message.append(MessageSegment.text("".join(text)))
@@ -159,11 +167,9 @@ def _render(
         if part:
             text.append(part)
             length += len(part)
-    if length > MAX_TEXT_LENGTH and not use_default:
-        return None
     if text:
         message.append(MessageSegment.text("".join(text)))
-    return message
+    return message, length
 
 
 def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "") -> None:
@@ -187,7 +193,9 @@ def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "
         elif not isinstance(value, str) or not value.strip() or len(value) > MAX_TEXT_LENGTH or UNSAFE_TEXT.search(value):
             logger.warning("[MC-QQ-AUTH] 消息文案无效或过长，使用默认值（{}）", key)
         elif any(
-            token not in ("{{", "}}") and token[1:-1] not in FIELDS.get(key, ())
+            token not in ("{{", "}}")
+            and token[1:-1] not in COMMON_FIELDS
+            and token[1:-1] not in BUSINESS_FIELDS.get(key, ())
             for token in TOKENS.split(value)[1::2]
         ):
             logger.warning("[MC-QQ-AUTH] 消息占位符无效，使用默认值（{}）", key)

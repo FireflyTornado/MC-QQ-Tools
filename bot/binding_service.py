@@ -142,16 +142,16 @@ def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> s
 
 def handle_departure(
     group_id: str, qq_id: str, left_at: int, *, only_same_second: bool = False,
-) -> DepartureCheck | Literal["revoked", "retained", "no_binding"]:
+) -> DepartureCheck | tuple[Literal["revoked", "retained", "no_binding"], str | None]:
     result = _request_unbind(group_id, qq_id, left_at, only_same_second=only_same_second)
     if isinstance(result, DepartureCheck):
         return result
-    status, _ = result
+    status, mc_name = result
     if status == "success":
-        return "revoked"
+        return "revoked", mc_name
     if status in {"frozen", "pending"}:
-        return "retained"
-    return "no_binding"
+        return "retained", mc_name
+    return "no_binding", None
 
 
 def apply_ban_snapshot(entries: Mapping[str, int | None]) -> int:

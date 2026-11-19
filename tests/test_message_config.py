@@ -89,7 +89,7 @@ info:
 
     def test_rejects_unknown_or_non_simple_placeholders(self):
         key = "commands.bind.success"
-        for token in ("{member}", "{mc_name.__class__}", "{mc_name[0]}", "{mc_name!r}",
+        for token in ("{member}", "{requested_mc_name}", "{groupid}", "{mc_name.__class__}", "{mc_name[0]}", "{mc_name!r}",
                       "{mc_name:}", "{mc_name:{count}}", "{mc_name", "mc_name}"):
             with self.subTest(token=token), patch.object(config.logger, "warning") as warning:
                 snapshot = self.load(f'commands: {{bind: {{success: "{token}"}}}}')
@@ -119,9 +119,7 @@ commands:
         self.assertEqual(message.extract_plain_text(),
                          "第一行 {指南} & [CQ:at,qq=all]\n第二行 [CQ:image,file=injected]")
 
-    def test_missing_placeholder_value_uses_default_with_safe_marker(self):
-        snapshot = self.load('commands: {bind: {success: "custom {mc_name}"}}')
-        with patch.object(config.logger, "warning") as warning:
-            reply = snapshot.render("commands.bind.success", mc_name=None).extract_plain_text()
-        warning.assert_called_once()
-        self.assertEqual(reply, config.DEFAULTS["commands.bind.success"].replace("{mc_name}", "—"))
+    def test_missing_placeholder_value_uses_safe_marker_in_custom_text(self):
+        snapshot = self.load('commands: {bind: {success: "custom {mc_name} / {group_id}"}}')
+        reply = snapshot.render("commands.bind.success", mc_name=None, group_id="123").extract_plain_text()
+        self.assertEqual(reply, "custom — / 123")

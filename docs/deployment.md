@@ -310,13 +310,19 @@ Compose 将 WebUI 映射到本机 `6099`，将容器内的 OneBot WebSocket `300
 
 ## HTTPS/WSS 反向代理边界
 
-FastAPI 按上面的命令监听回环地址。异地游戏主机接入时，只转发所需的 `/internal/mc/snapshot` 和 `/internal/mc/ws`，启用 TLS，并尽可能限制到受信来源。向上游保留 Authorization 头，避免将其写入代理日志。WebSocket 转发需支持 HTTP/1.1 Upgrade 并设置合适的空闲超时，快照应遵循 `Cache-Control: no-store`。
+FastAPI 按上面的命令监听回环地址。授权快照 `/internal/mc/snapshot` 和封禁名单 `/internal/mc/banlist` 共用现有 HTTPS 域名、证书和 FastAPI 上游。Nginx 可在现有 HTTPS `server` 块内引入 [共用 HTTP 规则](../deploy/nginx/mc-qq-api-http.conf)，替换原来的 `/internal/mc/snapshot` 单路径规则。如果已经为 `/internal/mc/banlist` 建了单独规则，一并替换。原规则上的来源限制应应用到共用规则。封禁上报需要允许 `GET` 和 `PUT`。
+
+```nginx
+include /opt/mc-qq-auth/deploy/nginx/mc-qq-api-http.conf;
+```
+
+共用规则仅匹配上述两个完整路径，保留请求路径及 `Authorization` 头，关闭代理缓存，并允许最多 2 MiB 的请求体。避免在代理日志中记录 `Authorization`。`/internal/mc/ws` 继续使用该域名下的 WebSocket 规则。WebSocket 转发需支持 HTTP/1.1 Upgrade 并设置合适的空闲超时。
 
 `/internal/mc/notify` 应从公网路由中排除，`/internal/health` 留给本机或受信探活。WebUI 和 OneBot 端口同样保留在回环地址。完整协议见 [API 文档](api.md)。
 
 ### 玩家封禁名单联动
 
-在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。升级数据库到版本 3 后重启 FastAPI 和 Bot，再在 HTTPS 反代上开放 `/internal/mc/banlist` 的 `GET` 和 `PUT`，保留 `Authorization` 头。每个授权数据库只启用一个上报实例。
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。升级数据库到版本 3 后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。每个授权数据库只启用一个上报实例。
 
 ```yaml
 banlist-watch:

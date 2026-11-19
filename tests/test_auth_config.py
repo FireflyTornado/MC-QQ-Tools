@@ -196,14 +196,14 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_uuid_only_bans_preserve_known_names_without_blocking_other_bans_and_pardons(self):
         steve = "00000000-0000-4000-8000-000000000001"
-        alex = "00000000-0000-4000-8000-000000000002"
         unknown = "00000000-0000-4000-8000-000000000003"
         other = "00000000-0000-4000-8000-000000000004"
+        entries = {"Alex": None, "Legacy": None}
+        self.assertEqual((await self.upload_banlist(1, 1, entries))[0], 200)
         initial = {
             steve: {"name": "Steve", "expires_at": None},
-            alex: {"name": "Alex", "expires_at": None},
         }
-        self.assertEqual((await self.upload_banlist(1, 1, {"Legacy": None}, profiles=initial))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 2, entries, profiles=initial))[0], 200)
         database.init_database(self.api.DB_PATH)
 
         def states():
@@ -218,16 +218,17 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         replacement = "b" * 32
         self.assertEqual((await self.upload_banlist(2, 1, {}, replacement, profiles=profiles))[0], 200)
         self.assertEqual(states(), {
-            "steve": "BANNED", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED", "legacy": "BANNED",
+            "steve": "BANNED", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED",
         })
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"2"}, 2), 0)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
 
         del profiles[steve]
         self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
-        self.assertEqual(states()["steve"], "PENDING_MEMBERSHIP_CHECK")
-        self.assertEqual(states()["legacy"], "BANNED")
-        del profiles[unknown]
-        self.assertEqual((await self.upload_banlist(2, 3, {}, replacement, profiles=profiles))[0], 200)
-        self.assertNotIn("legacy", states())
+        self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED"})
 
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):

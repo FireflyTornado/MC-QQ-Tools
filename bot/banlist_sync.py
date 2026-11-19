@@ -51,7 +51,7 @@ def store_upload(
         elif generation != old_generation + 1 or sequence != 1 or client_id == old_client_id:
             raise UploadConflict
 
-        active, names = _effective_report(conn, bans, normalized_profiles, read_ban_profile_names(old_names))
+        active, names = _effective_report(bans, normalized_profiles, read_ban_profile_names(old_names))
         frozen = apply_normalized_bans(conn, active)
         conn.execute(
             """
@@ -111,7 +111,6 @@ def _merge_ban(bans: dict[str, int | None], name: str, expiration: int | None) -
 
 
 def _effective_report(
-    conn: sqlite3.Connection,
     entries: dict[str, int | None],
     profiles: dict[str, tuple[str | None, int | None]] | None,
     old_names: dict[str, str],
@@ -123,26 +122,14 @@ def _effective_report(
         return active, {uuid: name for uuid, name in old_names.items() if name in active}
 
     names = {}
-    unresolved = False
     for uuid, (reported_name, expiration) in profiles.items():
         if expiration is not None and expiration <= now:
             continue
         name = reported_name or old_names.get(uuid)
         if name is None:
-            unresolved = True
             continue
         names[uuid] = name
         _merge_ban(active, name, expiration)
-
-    if unresolved:
-        # An older name-only report may have seen this ban. Keep only still-active rows with no known UUID.
-        identified = set(old_names.values())
-        for name, expiration in conn.execute(
-            "SELECT mc_name_key, expires_at FROM server_bans WHERE state = 'BANNED' "
-            "AND (expires_at IS NULL OR expires_at > ?)", (now,),
-        ):
-            if name not in identified and name not in active:
-                active[name] = expiration
     return active, names
 
 

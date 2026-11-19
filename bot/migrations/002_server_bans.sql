@@ -23,3 +23,12 @@ CREATE TABLE server_bans (
             AND typeof(bound_at) = 'integer' AND typeof(updated_at) = 'integer')
     )
 );
+
+ALTER TABLE auth_state ADD COLUMN ban_generation INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(ban_generation) = 'integer' AND ban_generation >= 0);
+ALTER TABLE auth_state ADD COLUMN ban_sequence INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(ban_sequence) = 'integer' AND ban_sequence >= 0);
+ALTER TABLE auth_state ADD COLUMN ban_client_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE auth_state ADD COLUMN ban_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE auth_state ADD COLUMN ban_profile_names TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE auth_state ADD COLUMN ban_unnamed_profiles TEXT NOT NULL DEFAULT '{}';

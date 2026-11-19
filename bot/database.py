@@ -6,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "auth.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 2
 MAX_AUTH_VERSION = (1 << 63) - 1
 NAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,16}")
 PROFILE_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -190,17 +190,6 @@ def _validate_auth_state(conn: sqlite3.Connection) -> None:
         raise MigrationError("Invalid banlist upload cursor in auth_state")
 
 
-def _discard_possibly_inferred_profile_names(conn: sqlite3.Connection) -> None:
-    row = conn.execute("SELECT ban_profile_names FROM auth_state WHERE id = 1").fetchone()
-    if row is None:
-        return
-    names = read_ban_profile_names(row[0])
-    # Schema 4 stored inferred offline UUIDs alongside server-confirmed aliases without provenance.
-    confirmed = {uuid: name for uuid, name in names.items() if uuid[14] != "3" or uuid[19] not in "89ab"}
-    if confirmed != names:
-        conn.execute("UPDATE auth_state SET ban_profile_names = ? WHERE id = 1", (json.dumps(confirmed, sort_keys=True),))
-
-
 def _validate_offline_bindings(conn: sqlite3.Connection) -> None:
     invalid = conn.execute(
         """
@@ -286,14 +275,6 @@ def init_database(db_path: Path | None = None) -> None:
                 conn.execute("INSERT INTO auth_state (id, version) VALUES (1, 0)")
         if version < 2:
             _apply_migration(conn, "002_server_bans.sql")
-        if version < 3:
-            _apply_migration(conn, "003_banlist_upload.sql")
-        if version < 4:
-            _apply_migration(conn, "004_banlist_profile_names.sql")
-        if version < 5:
-            _apply_migration(conn, "005_unnamed_ban_profiles.sql")
-        if version == 4:
-            _discard_possibly_inferred_profile_names(conn)
 
         for table in CURRENT_TABLES:
             _validate_table(conn, table)

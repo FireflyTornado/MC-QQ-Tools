@@ -113,6 +113,27 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload, {"version": VERSION, "active_names": ["alex", "steve"]})
                 self.assertIsInstance(payload["version"], int)
 
+    async def test_snapshot_excludes_frozen_and_pending_bindings_until_membership_is_verified(self):
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated") as notify):
+            binding_service.apply_ban_snapshot({"STEVE": None})
+            status, _, frozen = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(status, 200)
+            self.assertEqual(frozen["active_names"], ["alex"])
+            self.assertGreater(frozen["version"], VERSION)
+
+            binding_service.apply_ban_snapshot({})
+            _, _, pending = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(pending, frozen)
+            notify.assert_called_once_with()
+
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1"}, 2)
+            _, _, restored = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(restored["active_names"], ["alex", "steve"])
+            self.assertGreater(restored["version"], frozen["version"])
+            self.assertEqual(notify.call_count, 2)
+
     async def test_http_rejects_invalid_bearer_input(self):
         cases = {
             "missing": [],

@@ -10,13 +10,13 @@ events:
       {member} 欢迎加入！请用 /绑定 游戏ID 或 /bind 游戏ID 绑定 Minecraft 游戏 ID。
       发送 /帮助 或 /help 查看指令。
   leave:
-    # 关闭后仍会撤销离群成员的绑定。
+    # 关闭后仍会撤销离群成员的有效授权绑定。
     enabled: false
     revoked: "成员已退出群聊。Minecraft 授权已自动撤销。"
     no_binding: "成员已退出群聊。"
     failed: "成员已退出群聊。Minecraft 授权撤销暂未确认。"
   kick:
-    # 关闭后仍会撤销被移出成员的绑定。
+    # 关闭后仍会撤销被移出成员的有效授权绑定。
     enabled: false
     revoked: "成员已被移出群聊。Minecraft 授权已自动撤销。"
     no_binding: "成员已被移出群聊。"
@@ -26,7 +26,7 @@ commands:
   # 中英文别名共用同一套文案。
   bind:
     usage: "用法：/绑定 Minecraft玩家名"
-    # success 和 already_bound 支持 {mc_name}。
+    # success、already_bound、frozen 和 pending 支持 {mc_name}。
     success: |-
       绑定成功！
       Minecraft ID：{mc_name}
@@ -38,18 +38,25 @@ commands:
       你已经绑定了游戏 ID：{mc_name}
       如需更换，请先使用 /解绑
     name_taken: "该游戏 ID 已经被绑定，无法重复绑定。"
+    banned_name: "该游戏 ID 已被 Minecraft 服务器封禁，暂时无法绑定。"
+    frozen: "你绑定的 Minecraft ID {mc_name} 处于封禁冻结状态，暂时无法换绑。"
+    pending: "你绑定的 Minecraft ID {mc_name} 已解封，正在核实群成员身份，暂时无法换绑。"
     error: "绑定服务发生错误，请稍后重试"
   unbind:
-    # success 支持 {mc_name}。
+    # success、frozen 和 pending 支持 {mc_name}。
     success: |-
       解绑成功！
       原 Minecraft ID：{mc_name}
       绑定记录已删除。
     not_bound: "你当前没有有效的绑定记录。"
+    frozen: "你绑定的 Minecraft ID {mc_name} 处于封禁冻结状态，暂时无法解绑。"
+    pending: "你绑定的 Minecraft ID {mc_name} 已解封，正在核实群成员身份，暂时无法解绑。"
     error: "解绑失败，请稍后重试"
   binding:
-    # success 支持 {mc_name}。
+    # success、frozen 和 pending 支持 {mc_name}。
     success: "当前绑定的 Minecraft ID：{mc_name}"
+    frozen: "当前绑定的 Minecraft ID：{mc_name}\n状态：封禁冻结。"
+    pending: "当前绑定的 Minecraft ID：{mc_name}\n状态：已解封，正在核实群成员身份。"
     not_bound: |-
       你还没有绑定 Minecraft 游戏 ID。
       请使用 /绑定 玩家名

@@ -4,10 +4,10 @@ from contextlib import closing
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "auth.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_AUTH_VERSION = (1 << 63) - 1
 
-MIGRATION_PATH = Path(__file__).with_name("migrations") / "001_offline_auth.sql"
+MIGRATIONS = Path(__file__).with_name("migrations")
 ACTIVE_INDEXES = {
     "idx_offline_active_qq": ("group_id", "qq_id"),
     "idx_offline_active_name": ("mc_name_key",),
@@ -24,7 +24,20 @@ CURRENT_TABLES = {
         "bound_at": "INTEGER",
         "updated_at": "INTEGER",
     },
+    "server_bans": {
+        "mc_name_key": "TEXT",
+        "state": "TEXT",
+        "expires_at": "INTEGER",
+        "binding_id": "INTEGER",
+        "group_id": "TEXT",
+        "qq_id": "TEXT",
+        "mc_name": "TEXT",
+        "bound_at": "INTEGER",
+        "updated_at": "INTEGER",
+        "revision": "INTEGER",
+    },
 }
+OPTIONAL_BAN_COLUMNS = {"expires_at", "binding_id", "group_id", "qq_id", "mc_name", "bound_at", "updated_at"}
 LEGACY_TABLES = {"bindings", "pending_bindings"}
 
 
@@ -32,30 +45,33 @@ class MigrationError(sqlite3.DatabaseError):
     """The database cannot safely be initialized or upgraded."""
 
 
-def _apply_initial_schema(conn: sqlite3.Connection) -> None:
+def _apply_migration(conn: sqlite3.Connection, filename: str) -> None:
     # executescript() can commit the open transaction before applying DDL.
     statement = ""
-    for line in MIGRATION_PATH.read_text(encoding="utf-8").splitlines(keepends=True):
+    for line in (MIGRATIONS / filename).read_text(encoding="utf-8").splitlines(keepends=True):
         statement += line
         if sqlite3.complete_statement(statement):
             conn.execute(statement)
             statement = ""
     if statement.strip():
-        raise MigrationError("Incomplete statement in the initial migration")
+        raise MigrationError(f"Incomplete statement in {filename}")
 
 
 def _validate_table(conn: sqlite3.Connection, table: str) -> None:
     columns = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
     types = {name.lower(): kind.upper() for _, name, kind, *_ in columns}
+    primary_key = "mc_name_key" if table == "server_bans" else "id"
+    optional = OPTIONAL_BAN_COLUMNS if table == "server_bans" else set()
     if types != CURRENT_TABLES[table] or any(
-        hidden or pk != (name.lower() == "id") or (not required and not pk)
+        hidden or pk != (name.lower() == primary_key)
+        or ((not pk or table == "server_bans") and bool(required) != (name.lower() not in optional))
         for _, name, _, required, _, pk, hidden in columns
     ):
         raise MigrationError(f"Incompatible columns or primary key in {table}")
 
     # An INTEGER PRIMARY KEY must alias the rowid, since inserts omit the ID.
     indexes = conn.execute(f"PRAGMA index_list({table})").fetchall()
-    if any(origin == "pk" for _, _, _, origin, _ in indexes):
+    if table != "server_bans" and any(origin == "pk" for _, _, _, origin, _ in indexes):
         raise MigrationError(f"{table}.id must be an INTEGER PRIMARY KEY that aliases rowid")
 
     trigger = conn.execute(
@@ -64,6 +80,26 @@ def _validate_table(conn: sqlite3.Connection, table: str) -> None:
     ).fetchone()
     if trigger:
         raise MigrationError(f"Unexpected trigger on {table}")
+
+
+def _validate_server_bans(conn: sqlite3.Connection) -> None:
+    unique_keys = set()
+    for _, name, unique, _, partial in conn.execute("PRAGMA index_list(server_bans)"):
+        if unique and not partial:
+            unique_keys.add(tuple(conn.execute(
+                "SELECT name, coll FROM pragma_index_xinfo(?) WHERE key ORDER BY seqno", (name,)
+            )))
+    if unique_keys != {(("mc_name_key", "BINARY"),), (("group_id", "BINARY"), ("qq_id", "BINARY"))}:
+        raise MigrationError("server_bans must uniquely reserve the game name and the bound QQ")
+
+    overlap = conn.execute("""
+        SELECT 1 FROM offline_bindings AS binding
+        JOIN server_bans AS ban ON ban.mc_name_key = binding.mc_name_key
+            OR (ban.group_id = binding.group_id AND ban.qq_id = binding.qq_id)
+        WHERE binding.status = 'ACTIVE' LIMIT 1
+        """).fetchone()
+    if overlap:
+        raise MigrationError("An active binding overlaps a server_bans reservation")
 
 
 def _validate_auth_state(conn: sqlite3.Connection) -> None:
@@ -139,7 +175,7 @@ def init_database(db_path: Path | None = None) -> None:
     with closing(sqlite3.connect(path, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, SCHEMA_VERSION):
             raise MigrationError(f"Unsupported SQLite schema version {version}")
 
         tables = dict(conn.execute(
@@ -155,16 +191,19 @@ def init_database(db_path: Path | None = None) -> None:
         if version == 0:
             if "offline_bindings" in tables and "auth_state" not in tables:
                 raise MigrationError("auth_state is missing for an existing offline_bindings table")
-            _apply_initial_schema(conn)
+            _apply_migration(conn, "001_offline_auth.sql")
             if "auth_state" not in tables:
                 conn.execute("INSERT INTO auth_state (id, version) VALUES (1, 0)")
+        if version < 2:
+            _apply_migration(conn, "002_server_bans.sql")
 
         for table in CURRENT_TABLES:
             _validate_table(conn, table)
         _validate_auth_state(conn)
         _validate_offline_bindings(conn)
+        _validate_server_bans(conn)
 
-        if version == 0:
+        if version < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 

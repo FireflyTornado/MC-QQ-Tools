@@ -10,8 +10,8 @@ from nonebot.params import CommandArg
 
 from binding_service import (
     bind_player,
-    get_binding,
-    unbind_player,
+    query_binding,
+    request_unbind,
 )
 import message_config
 from qq_group import group_rule
@@ -73,8 +73,8 @@ query = on_command(
 @query.handle()
 async def handle_query(event: GroupMessageEvent):
     try:
-        mc_name = await asyncio.to_thread(
-            get_binding,
+        status, mc_name = await asyncio.to_thread(
+            query_binding,
             str(event.group_id),
             str(event.user_id),
         )
@@ -82,10 +82,7 @@ async def handle_query(event: GroupMessageEvent):
         logger.exception("查询绑定数据库失败")
         await query.finish(message_config.MESSAGES.render("commands.binding.error"))
 
-    if mc_name is None:
-        await query.finish(message_config.MESSAGES.render("commands.binding.not_bound"))
-
-    await query.finish(message_config.MESSAGES.render("commands.binding.success", mc_name=mc_name))
+    await query.finish(message_config.MESSAGES.render(f"commands.binding.{status}", mc_name=mc_name))
 
 
 # ========================================
@@ -104,8 +101,8 @@ unbind = on_command(
 @unbind.handle()
 async def handle_unbind(event: GroupMessageEvent):
     try:
-        mc_name = await asyncio.to_thread(
-            unbind_player,
+        status, mc_name = await asyncio.to_thread(
+            request_unbind,
             str(event.group_id),
             str(event.user_id),
         )
@@ -113,7 +110,4 @@ async def handle_unbind(event: GroupMessageEvent):
         logger.exception("解绑数据库操作失败")
         await unbind.finish(message_config.MESSAGES.render("commands.unbind.error"))
 
-    if mc_name is None:
-        await unbind.finish(message_config.MESSAGES.render("commands.unbind.not_bound"))
-
-    await unbind.finish(message_config.MESSAGES.render("commands.unbind.success", mc_name=mc_name))
+    await unbind.finish(message_config.MESSAGES.render(f"commands.unbind.{status}", mc_name=mc_name))

@@ -9,6 +9,7 @@ import unittest
 from contextlib import chdir, closing
 from io import BytesIO
 from pathlib import Path
+from threading import Event
 from unittest.mock import AsyncMock, call, patch
 
 import nonebot
@@ -123,6 +124,104 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
             return next(responses)
 
         return patch.object(self.bot, "call_api", AsyncMock(side_effect=api))
+
+    async def test_ban_freezes_commands_and_leave_until_a_verified_roster_resolves_unlock(self):
+        self.bind()
+        self.bind(MEMBER, "Alex")
+        binding_service.apply_ban_snapshot({"steve": None, "Alex": None})
+        self.notify.reset_mock()
+        version = self.version()
+        self.assertIn("封禁冻结", str(await self.command_reply("/我的绑定")))
+        self.assertIn("无法换绑", str(await self.command_reply("/绑定 NewName")))
+        self.assertIn("无法解绑", str(await self.command_reply("/解绑")))
+        await self.events.handle_member_leave(self.bot, departure())
+        self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("frozen", "Steve"))
+        with patch.object(self.bot, "call_api", AsyncMock()) as api:
+            self.assertEqual(await self.events.reconcile_members(self.bot), 0)
+            api.assert_not_awaited()
+
+        binding_service.apply_ban_snapshot({})
+        self.assertIn("正在核实", str(await self.command_reply("/我的绑定")))
+        self.assertIn("正在核实", str(await self.command_reply("/解绑")))
+        self.assertEqual(self.version(), version)
+        with self.mock_roster(member_rows(BOT, MEMBER), count=3):
+            self.assertIsNone(await self.events.reconcile_members(self.bot, only_pending=True))
+        self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("pending", "Steve"))
+        self.notify.assert_not_called()
+
+        with self.mock_roster(member_rows(BOT, MEMBER)):
+            self.assertEqual(await self.events.reconcile_members(self.bot, only_pending=True), 1)
+        self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("not_bound", None))
+        self.assertEqual(self.binding(MEMBER), "Alex")
+        self.assertGreater(self.version(), version)
+        self.notify.assert_called_once_with()
+
+    async def test_pending_worker_retries_unverified_member_lookup(self):
+        self.bind()
+        binding_service.apply_ban_snapshot({"Steve": None})
+        binding_service.apply_ban_snapshot({})
+        restored = asyncio.Event()
+        first_lookup = True
+
+        async def api(action, **data):
+            nonlocal first_lookup
+            if action == "get_group_detail_info":
+                return {"group_id": GROUP, "member_count": 2}
+            if first_lookup:
+                first_lookup = False
+                return []
+            return member_rows(BOT, ABSENT)
+
+        reconcile = self.events.reconcile_members
+
+        async def observed_reconcile(bot, *, only_pending):
+            self.assertTrue(only_pending)
+            result = await reconcile(bot, only_pending=only_pending)
+            if result == 0:
+                restored.set()
+            return result
+
+        with (patch.object(self.bot, "call_api", AsyncMock(side_effect=api)) as queries,
+              patch.object(self.events, "MEMBER_CHECK_RETRY_DELAY", 0.01),
+              patch.object(self.events, "reconcile_members", observed_reconcile)):
+            await self.events.start_pending_binding_checks()
+            try:
+                await asyncio.wait_for(restored.wait(), timeout=5)
+            finally:
+                await self.events.stop_pending_binding_checks()
+        self.assertGreaterEqual(queries.await_count, 4)
+        self.assertEqual(self.binding(), "Steve")
+
+    async def test_departure_during_restore_is_applied_after_the_commit(self):
+        self.bind()
+        binding_service.apply_ban_snapshot({"Steve": None})
+        binding_service.apply_ban_snapshot({})
+        commit_started = Event()
+        resume = Event()
+        commit = self.events.reconcile_checked_bindings
+        checked_at = 0
+
+        def delayed_commit(*args):
+            nonlocal checked_at
+            checked_at = args[-1]
+            commit_started.set()
+            if not resume.wait(5):
+                raise AssertionError("Timed out waiting to release the test transaction")
+            return commit(*args)
+
+        with (self.mock_roster(member_rows(BOT, ABSENT)),
+              patch.object(self.events, "membership_write_lock", asyncio.Lock()),
+              patch.object(self.events, "reconcile_checked_bindings", delayed_commit)):
+            check = asyncio.create_task(self.events.reconcile_members(self.bot, only_pending=True))
+            try:
+                self.assertTrue(await asyncio.to_thread(commit_started.wait, 5))
+                event = departure(timestamp=max(DEPARTED_AT, checked_at))
+                leave = asyncio.create_task(self.events.handle_member_leave(self.bot, event))
+                await asyncio.sleep(0)
+            finally:
+                resume.set()
+            await asyncio.gather(check, leave)
+        self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("not_bound", None))
 
     async def test_leave_revokes_only_target_group_and_notifies_after_commit(self):
         self.enable_notices("leave", "join")

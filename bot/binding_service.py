@@ -1,21 +1,28 @@
-from notify_client import notify_auth_updated
-
 import re
 import sqlite3
 import time
-
+from collections.abc import Mapping, Set
 from contextlib import closing
+from dataclasses import dataclass
+
 from database import DB_PATH, MAX_AUTH_VERSION
+from notify_client import notify_auth_updated
 
 
 # 离线服允许短名，登录名最多 16 位。
 NAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,16}")
 
-def update_auth_version(conn: sqlite3.Connection):
+
+@dataclass(frozen=True)
+class MembershipAudit:
+    version: int
+    bindings: dict[str, int]
+    pending: dict[str, tuple[str, int]]
+
+
+def update_auth_version(conn: sqlite3.Connection) -> None:
     """使用系统时间更新授权版本，保证严格递增。"""
-
     now_ms = time.time_ns() // 1_000_000
-
     result = conn.execute(
         """
         UPDATE auth_state
@@ -30,97 +37,94 @@ def update_auth_version(conn: sqlite3.Connection):
     if result.rowcount != 1:
         raise sqlite3.IntegrityError("授权版本记录缺失、无效或已达到整数上限")
 
+
 def valid_mc_name(name: str) -> bool:
     return bool(NAME_PATTERN.fullmatch(name))
 
 
+def _active_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[int, str, int] | None:
+    return conn.execute(
+        """
+        SELECT id, mc_name, MAX(bound_at, updated_at)
+        FROM offline_bindings WHERE group_id = ? AND qq_id = ? AND status = 'ACTIVE'
+        """,
+        (group_id, qq_id),
+    ).fetchone()
+
+
+def _reserved_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[str, str] | None:
+    return conn.execute(
+        """
+        SELECT CASE state WHEN 'BANNED' THEN 'frozen' ELSE 'pending' END, mc_name
+        FROM server_bans WHERE group_id = ? AND qq_id = ?
+        """,
+        (group_id, qq_id),
+    ).fetchone()
+
+
+def query_binding(group_id: str, qq_id: str) -> tuple[str, str | None]:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
+        conn.execute("BEGIN")
+        row = _active_binding(conn, group_id, qq_id)
+        if row:
+            return "success", row[1]
+        return _reserved_binding(conn, group_id, qq_id) or ("not_bound", None)
+
+
 def get_binding(group_id: str, qq_id: str) -> str | None:
-    """查询指定 QQ 当前绑定的游戏 ID。"""
-
-    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
-        row = conn.execute(
-            """
-            SELECT mc_name
-            FROM offline_bindings
-            WHERE group_id = ?
-              AND qq_id = ?
-              AND status = 'ACTIVE'
-            """,
-            (group_id, qq_id),
-        ).fetchone()
-
-        return row[0] if row else None
+    """查询指定 QQ 当前具备授权的游戏 ID。"""
+    status, name = query_binding(group_id, qq_id)
+    return name if status == "success" else None
 
 
-def bind_player(
-    group_id: str,
-    qq_id: str,
-    mc_name: str,
-) -> tuple[str, str | None]:
+def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | None]:
     """绑定玩家，返回操作状态和关联的游戏 ID。"""
-
     if not valid_mc_name(mc_name):
         return "invalid_name", None
 
     name_key = mc_name.lower()
     now = int(time.time())
-
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
-        # 申请写锁，使检查与写入成为同一个事务
         conn.execute("BEGIN IMMEDIATE")
-
-        existing = conn.execute(
-            """
-            SELECT mc_name
-            FROM offline_bindings
-            WHERE group_id = ?
-              AND qq_id = ?
-              AND status = 'ACTIVE'
-            """,
-            (group_id, qq_id),
-        ).fetchone()
-
+        existing = _active_binding(conn, group_id, qq_id)
         if existing:
-            conn.rollback()
-            return "already_bound", existing[0]
+            return "already_bound", existing[1]
+        reserved = _reserved_binding(conn, group_id, qq_id)
+        if reserved:
+            return reserved
 
+        ban = conn.execute("SELECT state FROM server_bans WHERE mc_name_key = ?", (name_key,)).fetchone()
+        if ban:
+            return ("banned_name" if ban[0] == "BANNED" else "name_taken"), None
         occupied = conn.execute(
-            """
-            SELECT id
-            FROM offline_bindings
-            WHERE mc_name_key = ?
-              AND status = 'ACTIVE'
-            """,
-            (name_key,),
+            "SELECT 1 FROM offline_bindings WHERE mc_name_key = ? AND status = 'ACTIVE'", (name_key,),
         ).fetchone()
-
         if occupied:
-            conn.rollback()
             return "name_taken", None
 
         conn.execute(
             """
-            INSERT INTO offline_bindings (
-                group_id,
-                qq_id,
-                mc_name,
-                mc_name_key,
-                status,
-                bound_at,
-                updated_at
-            )
+            INSERT INTO offline_bindings (group_id, qq_id, mc_name, mc_name_key, status, bound_at, updated_at)
             VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)
             """,
-            (
-                group_id,
-                qq_id,
-                mc_name,
-                name_key,
-                now,
-                now,
-            ),
+            (group_id, qq_id, mc_name, name_key, now, now),
         )
+        update_auth_version(conn)
 
+    notify_auth_updated()
+    return "success", mc_name
+
+
+def request_unbind(group_id: str, qq_id: str, *, left_at: int | None = None) -> tuple[str, str | None]:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _active_binding(conn, group_id, qq_id)
+        if not row:
+            return _reserved_binding(conn, group_id, qq_id) or ("not_bound", None)
+        binding_id, mc_name, authorized_at = row
+        if left_at is not None and authorized_at > left_at:
+            return "not_bound", None
+        _delete_active_bindings(conn, group_id, {qq_id: binding_id})
         update_auth_version(conn)
 
     notify_auth_updated()
@@ -128,46 +132,130 @@ def bind_player(
 
 
 def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> str | None:
-    """删除当前绑定，并更新权限版本号。"""
+    """删除当前有效绑定，并更新权限版本号。"""
+    status, name = request_unbind(group_id, qq_id, left_at=left_at)
+    return name if status == "success" else None
+
+
+def apply_ban_snapshot(entries: Mapping[str, int | None]) -> int:
+    """Apply the effective player banlist and return the number of bindings frozen.
+
+    Expirations are Unix milliseconds. A name stays banned while any entry for
+    that case-insensitive name is active.
+    """
+    bans: dict[str, int | None] = {}
+    for name, expiration in entries.items():
+        if not isinstance(name, str) or not valid_mc_name(name):
+            raise ValueError("Invalid player name in ban snapshot")
+        if expiration is not None and (type(expiration) is not int or not 0 <= expiration <= MAX_AUTH_VERSION):
+            raise ValueError("Invalid expiration in ban snapshot")
+        name_key = name.lower()
+        if name_key in bans:
+            previous = bans[name_key]
+            expiration = max(previous, expiration) if previous is not None and expiration is not None else None
+        bans[name_key] = expiration
+
+    frozen_count = 0
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            """
-            SELECT id, mc_name, bound_at
-            FROM offline_bindings
-            WHERE group_id = ?
-              AND qq_id = ?
-              AND status = 'ACTIVE'
-            """,
-            (group_id, qq_id),
-        ).fetchone()
+        existing = {
+            name: (state, expiration, binding_id)
+            for name, state, expiration, binding_id in conn.execute(
+                "SELECT mc_name_key, state, expires_at, binding_id FROM server_bans"
+            )
+        }
+        for name, expiration in bans.items():
+            old = existing.get(name)
+            if old is None:
+                conn.execute(
+                    """
+                    INSERT INTO server_bans (mc_name_key, state, expires_at,
+                        binding_id, group_id, qq_id, mc_name, bound_at, updated_at)
+                    SELECT ?, 'BANNED', ?, id, group_id, qq_id, mc_name, bound_at, updated_at
+                    FROM (SELECT 1)
+                    LEFT JOIN offline_bindings ON mc_name_key = ? AND status = 'ACTIVE'
+                    """,
+                    (name, expiration, name),
+                )
+                frozen_count += conn.execute(
+                    "DELETE FROM offline_bindings WHERE mc_name_key = ? AND status = 'ACTIVE'", (name,),
+                ).rowcount
+            elif old[:2] != ("BANNED", expiration):
+                conn.execute(
+                    """
+                    UPDATE server_bans SET revision = revision + (state != 'BANNED'),
+                        state = 'BANNED', expires_at = ? WHERE mc_name_key = ?
+                    """,
+                    (expiration, name),
+                )
+        for name in existing.keys() - bans.keys():
+            state, _, binding_id = existing[name]
+            if state != "BANNED":
+                continue
+            if binding_id is None:
+                conn.execute("DELETE FROM server_bans WHERE mc_name_key = ?", (name,))
+            else:
+                conn.execute(
+                    """
+                    UPDATE server_bans SET state = 'PENDING_MEMBERSHIP_CHECK', expires_at = NULL,
+                        revision = revision + 1 WHERE mc_name_key = ?
+                    """,
+                    (name,),
+                )
+        if frozen_count:
+            update_auth_version(conn)
 
-        if not row:
-            return None
-        binding_id, mc_name, bound_at = row
-        if left_at is not None and bound_at > left_at:
-            return None
-
-        _delete_active_bindings(conn, group_id, {qq_id: binding_id})
-
-    notify_auth_updated()
-    return mc_name
+    if frozen_count:
+        notify_auth_updated()
+    return frozen_count
 
 
-def binding_audit_snapshot(group_id: str) -> tuple[int, dict[str, int]]:
-    """在同一读事务中记录对账所用的版本和绑定。"""
+def membership_audit_snapshot(group_id: str, *, only_pending: bool = False) -> MembershipAudit:
+    """Read authorization and pending checks from one SQLite snapshot."""
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN")
         version = _audit_version(conn)
-        rows = conn.execute(
-            "SELECT qq_id, id FROM offline_bindings WHERE group_id = ? AND status = 'ACTIVE'",
-            (group_id,),
-        )
-        return version, dict(rows)
+        pending = {
+            qq_id: (mc_name_key, revision)
+            for qq_id, mc_name_key, revision in conn.execute(
+                """
+                SELECT qq_id, mc_name_key, revision FROM server_bans
+                WHERE group_id = ? AND state = 'PENDING_MEMBERSHIP_CHECK'
+                """,
+                (group_id,),
+            )
+        }
+        bindings = {} if only_pending else dict(conn.execute(
+            "SELECT qq_id, id FROM offline_bindings WHERE group_id = ? AND status = 'ACTIVE'", (group_id,),
+        ))
+        return MembershipAudit(version, bindings, pending)
+
+
+def binding_audit_snapshot(group_id: str) -> tuple[int, dict[str, int]]:
+    audit = membership_audit_snapshot(group_id)
+    return audit.version, audit.bindings
+
+
+def reconcile_checked_bindings(
+    group_id: str, audit: MembershipAudit, members: Set[str], checked_at: int,
+) -> int | None:
+    missing = {qq_id: audit.bindings[qq_id] for qq_id in audit.bindings.keys() - members}
+    return _finish_membership_audit(group_id, audit.version, missing, audit.pending, members, checked_at)
 
 
 def revoke_checked_bindings(group_id: str, version: int, missing: dict[str, int]) -> int | None:
-    if not missing:
+    return _finish_membership_audit(group_id, version, missing, {}, frozenset(), 0)
+
+
+def _finish_membership_audit(
+    group_id: str,
+    version: int,
+    missing: dict[str, int],
+    pending: dict[str, tuple[str, int]],
+    members: Set[str],
+    checked_at: int,
+) -> int | None:
+    if not missing and not pending:
         return 0
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -175,9 +263,50 @@ def revoke_checked_bindings(group_id: str, version: int, missing: dict[str, int]
         if _audit_version(conn) != version:
             return None
         deleted = _delete_active_bindings(conn, group_id, missing)
-    if deleted:
+        restored, released = _resolve_pending_bindings(conn, group_id, pending, members, checked_at)
+        if deleted or restored:
+            update_auth_version(conn)
+    if deleted or restored:
         notify_auth_updated()
-    return deleted
+    return deleted + released
+
+
+def _resolve_pending_bindings(
+    conn: sqlite3.Connection,
+    group_id: str,
+    pending: dict[str, tuple[str, int]],
+    members: Set[str],
+    checked_at: int,
+) -> tuple[int, int]:
+    restored = released = 0
+    for qq_id, (name_key, revision) in pending.items():
+        saved = conn.execute(
+            """
+            SELECT binding_id, mc_name, bound_at, updated_at FROM server_bans
+            WHERE mc_name_key = ? AND group_id = ? AND qq_id = ?
+              AND state = 'PENDING_MEMBERSHIP_CHECK' AND revision = ?
+            """,
+            (name_key, group_id, qq_id, revision),
+        ).fetchone()
+        if not saved:
+            continue
+        if qq_id in members:
+            binding_id, name, bound_at, updated_at = saved
+            if conn.execute("SELECT 1 FROM offline_bindings WHERE id = ?", (binding_id,)).fetchone():
+                binding_id = None
+            # A delayed departure from before the verified roster cannot revoke the restored binding.
+            conn.execute(
+                """
+                INSERT INTO offline_bindings (id, group_id, qq_id, mc_name, mc_name_key, status, bound_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+                """,
+                (binding_id, group_id, qq_id, name, name_key, bound_at, max(updated_at, checked_at)),
+            )
+            restored += 1
+        else:
+            released += 1
+        conn.execute("DELETE FROM server_bans WHERE mc_name_key = ?", (name_key,))
+    return restored, released
 
 
 def _audit_version(conn: sqlite3.Connection) -> int:
@@ -188,15 +317,12 @@ def _audit_version(conn: sqlite3.Connection) -> int:
 
 
 def _delete_active_bindings(
-    conn: sqlite3.Connection, group_id: str, bindings: dict[str, int]
+    conn: sqlite3.Connection, group_id: str, bindings: dict[str, int],
 ) -> int:
-    result = conn.executemany(
+    return conn.executemany(
         """
         DELETE FROM offline_bindings
         WHERE group_id = ? AND qq_id = ? AND id = ? AND status = 'ACTIVE'
         """,
         ((group_id, qq_id, binding_id) for qq_id, binding_id in bindings.items()),
-    )
-    if result.rowcount:
-        update_auth_version(conn)
-    return result.rowcount
+    ).rowcount

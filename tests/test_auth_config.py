@@ -24,6 +24,7 @@ import app_config
 import binding_service
 import database
 import notify_client
+import runtime_status
 
 API_TOKEN = "test-only.api~token+="
 NOTIFY_TOKEN = "test-only.notify-token"
@@ -240,6 +241,44 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         del profiles[steve]
         self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
         self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED"})
+
+    async def test_known_uuid_is_enriched_in_place_without_an_unnamed_warning(self):
+        known = "00000000-0000-4000-8000-000000000001"
+        unknown = "00000000-0000-4000-8000-000000000002"
+        alex = "00000000-0000-4000-8000-000000000003"
+
+        def profile(uuid):
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return conn.execute(
+                    "SELECT id, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid = ?", (uuid,),
+                ).fetchone()
+
+        self.assertEqual((await self.upload_banlist(1, 1, {}, profiles={
+            known: {"name": "Steve", "expires_at": None},
+            alex: {"name": "Alex", "expires_at": None},
+        }))[0], 200)
+        row_id, name, expiration, state = profile(known)
+        self.assertEqual((name, expiration, state), ("steve", None, "BANNED"))
+
+        expires_at = database.MAX_AUTH_VERSION
+        profiles = {known: {"name": None, "expires_at": expires_at}}
+        with (patch.object(database, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual((await self.upload_banlist(1, 2, {"Alex": None}, profiles=profiles))[0], 200)
+            self.assertEqual(profile(known), (row_id, "steve", expires_at, "BANNED"))
+            self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("frozen", "Steve"))
+            self.assertEqual(runtime_status._binding_status(GROUP_ID)[2], 0)
+
+            profiles[unknown] = {"name": None, "expires_at": None}
+            self.assertEqual((await self.upload_banlist(1, 3, {}, profiles=profiles))[0], 200)
+            self.assertEqual(profile(unknown)[1:], (None, None, "BANNED"))
+            self.assertEqual(runtime_status._binding_status(GROUP_ID)[2], 1)
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(set(audit.pending), {"2"})
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"2"}, 2), 0)
+
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
 
     async def test_unmapped_offline_uuid_is_recorded_without_guessing_its_game_name(self):
         # UUID.nameUUIDFromBytes("OfflinePlayer:Steve".getBytes(UTF_8))

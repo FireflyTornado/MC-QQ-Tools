@@ -121,5 +121,6 @@ info:
     disk: "磁盘"
     auth_version: "Authorization version"
     bindings: "有效绑定"
+    bans: "封禁记录"
     last_reconcile: "Last member reconciliation"
     last_notice: "Last authorization notice"

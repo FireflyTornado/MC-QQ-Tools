@@ -115,6 +115,7 @@ class RuntimeStatus:
     last_notice: str = "No attempts yet"
     minecraft: MinecraftStatus | None = None
     unnamed_bans: int | None = None
+    active_bans: int | None = None
 
 
 def _probe(check: Callable[[], T]) -> T | None:
@@ -142,7 +143,7 @@ def check_minecraft() -> MinecraftStatus | None:
     return MinecraftStatus(True)
 
 
-def _binding_status(group_id: str) -> tuple[int, int, int]:
+def _binding_status(group_id: str) -> tuple[int, int, int, int]:
     uri = database.DB_PATH.resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=1)) as connection, connection:
         connection.execute("BEGIN")
@@ -153,14 +154,14 @@ def _binding_status(group_id: str) -> tuple[int, int, int]:
             "SELECT COUNT(*) FROM offline_bindings WHERE group_id = ? AND status = 'ACTIVE'",
             (group_id,),
         ).fetchone()
-        (unnamed,) = connection.execute(
+        bans, unnamed = connection.execute(
             """
-            SELECT COUNT(*) FROM server_bans WHERE profile_uuid IS NOT NULL AND mc_name_key IS NULL
-              AND state = 'BANNED' AND (expires_at IS NULL OR expires_at > ?)
+            SELECT COUNT(*), COUNT(CASE WHEN profile_uuid IS NOT NULL AND mc_name_key IS NULL THEN 1 END)
+            FROM server_bans WHERE state = 'BANNED' AND (expires_at IS NULL OR expires_at > ?)
             """,
             (time.time_ns() // 1_000_000,),
         ).fetchone()
-        return version[0], count, unnamed
+        return version[0], count, unnamed, bans
 
 
 def _system_name() -> str:
@@ -203,7 +204,7 @@ def collect_status(group_id: str, *, connected: bool, connected_for: float | Non
     api = _probe(lambda: check_fastapi(include_connections=True))
     minecraft = _probe(check_minecraft)
     binding_status = _probe(lambda: _binding_status(group_id))
-    version, count, unnamed = binding_status if binding_status is not None else (None, None, None)
+    version, count, unnamed, bans = binding_status if binding_status is not None else (None, None, None, None)
     with _outcome_lock:
         reconciliation = _format_outcome(_outcomes.get("reconcile"))
         notification = _format_outcome(_outcomes.get("notify"))
@@ -226,5 +227,6 @@ def collect_status(group_id: str, *, connected: bool, connected_for: float | Non
         last_notice=notification,
         minecraft=minecraft,
         unnamed_bans=unnamed,
+        active_bans=bans,
         checked_at=datetime.now(UTC),
     )

@@ -84,6 +84,7 @@ DEFAULTS = MappingProxyType({
     "info.labels.disk": "磁盘",
     "info.labels.auth_version": "Authorization version",
     "info.labels.bindings": "有效绑定",
+    "info.labels.bans": "封禁记录",
     "info.labels.last_reconcile": "Last member reconciliation",
     "info.labels.last_notice": "Last authorization notice",
 })

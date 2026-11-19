@@ -6,6 +6,10 @@
       <stop stop-color="#183c3a"/>
       <stop offset="1" stop-color="#1a2935"/>
     </linearGradient>
+    <linearGradient id="ban-fill" x2="1" y2="1">
+      <stop stop-color="#482730"/>
+      <stop offset="1" stop-color="#2b202b"/>
+    </linearGradient>
   </defs>
   <rect width="720" height="640" fill="#101923"/>
   <rect x="24" y="22" width="38" height="38" rx="10" fill="#203a3b" stroke="#35514f"/>
@@ -33,9 +37,14 @@
   </g>
 
   <g id="bindings">
-    <rect x="24" y="214" width="362" height="90" rx="16" fill="url(#binding-fill)" stroke="#35514f"/>
-    <text id="bindings-label" x="44" y="266" font-size="19" fill="#d1e8e5">$bindings_label</text>
-    <text id="bindings-count" x="366" y="280" text-anchor="end" font-size="$bindings_size" font-weight="700" fill="#7ae7c2">$bindings_count</text>
+    <rect x="24" y="214" width="175" height="90" rx="16" fill="url(#binding-fill)" stroke="#35514f"/>
+    <text id="bindings-label" x="40" y="240" font-size="19" fill="#d1e8e5">$bindings_label</text>
+    <text id="bindings-count" x="183" y="290" text-anchor="end" font-size="$bindings_size" font-weight="700" fill="#7ae7c2">$bindings_count</text>
+  </g>
+  <g id="bans">
+    <rect x="211" y="214" width="175" height="90" rx="16" fill="url(#ban-fill)" stroke="#673742"/>
+    <text id="bans-label" x="227" y="240" font-size="19" fill="#f0d7db">$bans_label</text>
+    <text id="bans-count" x="370" y="290" text-anchor="end" font-size="$bans_size" font-weight="700" fill="#ff8c91">$bans_count</text>
   </g>
 
   <g id="resources">
@@ -86,6 +95,8 @@
       <path d="M558 419H579" stroke-width="2" stroke-dasharray="$sqlite_dash"/>
       <rect x="579" y="404" width="95" height="30" rx="7" fill="#182833"/>
       <text id="sqlite-name" x="626.5" y="424" text-anchor="middle" font-size="13" stroke="none">$sqlite_name</text>
+      <text id="unnamed-bans-warning" x="674" y="459" text-anchor="end" font-size="14" fill="#f5ce79"
+            stroke="none" display="$unnamed_bans_display">$unnamed_bans_warning</text>
     </g>
     <g text-anchor="middle">
       <rect x="432" y="169" width="126" height="52" rx="9" fill="#20323e" stroke="#3a505d"/>

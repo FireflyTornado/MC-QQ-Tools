@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from threading import Barrier
 from types import ModuleType
 from unittest.mock import Mock, patch
 
@@ -80,12 +81,12 @@ class DatabaseTests(unittest.TestCase):
 
     def test_initialize_new_database_and_repeat_after_binding(self):
         database.init_database()
-        self.assertEqual(self.schema_version(), 1)
+        self.assertEqual(self.schema_version(), 2)
         self.assertEqual(self.auth_version(), 0)
         self.assertEqual(self.rows("SELECT * FROM offline_bindings"), [])
         self.assertEqual(
             self.rows("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"),
-            [("auth_state",), ("offline_bindings",)],
+            [("auth_state",), ("banlist_state",), ("frozen_bindings",), ("offline_bindings",), ("server_bans",)],
         )
         self.assertEqual(binding_service.bind_player("group", "qq", "MiXeD"), ("success", "MiXeD"))
         version = self.auth_version()
@@ -119,7 +120,7 @@ class DatabaseTests(unittest.TestCase):
         database.init_database()
         database.init_database()
 
-        self.assertEqual(self.schema_version(), 1)
+        self.assertEqual(self.schema_version(), 2)
         self.assertEqual(self.auth_version(), 0)
         self.assertEqual(self.rows("SELECT * FROM bindings"), bound)
         self.assertEqual(self.rows("SELECT * FROM pending_bindings"), pending)
@@ -174,7 +175,7 @@ class DatabaseTests(unittest.TestCase):
         self.fixture(AUTH_TABLE + "INSERT INTO auth_state VALUES (1, 42);")
         database.init_database()
         self.assertEqual(self.auth_version(), 42)
-        self.assertEqual(self.schema_version(), 1)
+        self.assertEqual(self.schema_version(), 2)
 
     def test_compatible_unversioned_table_without_indexes_can_be_upgraded(self):
         self.fixture(AUTH_TABLE + OFFLINE_TABLE + "INSERT INTO auth_state VALUES (1, 10);")
@@ -230,7 +231,7 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(database.MigrationError, "unique index"):
             database.init_database()
         self.assertEqual(len(self.rows("PRAGMA index_list(offline_bindings)")), 1)
-        self.assertEqual(self.schema_version(), 1)
+        self.assertEqual(self.schema_version(), 2)
 
     def test_offline_table_without_auth_state_does_not_seed_a_version(self):
         self.fixture(OFFLINE_TABLE)
@@ -259,10 +260,10 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.schema_version(), 0)
 
     def test_unsupported_version_is_not_changed(self):
-        self.fixture("PRAGMA user_version = 2;")
-        with self.assertRaisesRegex(database.MigrationError, "Unsupported SQLite schema version 2"):
+        self.fixture("PRAGMA user_version = 3;")
+        with self.assertRaisesRegex(database.MigrationError, "Unsupported SQLite schema version 3"):
             database.init_database()
-        self.assertEqual(self.schema_version(), 2)
+        self.assertEqual(self.schema_version(), 3)
         self.assertEqual(self.rows("SELECT name FROM sqlite_schema"), [])
 
     def test_bind_and_unbind_are_monotonic_and_notify_after_commit(self):
@@ -315,15 +316,189 @@ class DatabaseTests(unittest.TestCase):
             second = pool.submit(binding_service.bind_player, "group", "qq2", "MYNAME")
             self.assertCountEqual([first.result()[0], second.result()[0]], ["success", "name_taken"])
 
-        self.assertEqual(self.schema_version(), 1)
+        self.assertEqual(self.schema_version(), 2)
         self.assertEqual(self.rows("SELECT mc_name_key FROM offline_bindings"), [("myname",)])
         self.notify.assert_called_once()
 
     def test_cli_explicit_path_and_nonzero_exit_for_invalid_version(self):
         command = [sys.executable, "-B", str(BOT_DIR / "migrate.py"), "--db", str(self.path)]
         result = subprocess.run(command, capture_output=True, text=True, check=True)
-        self.assertIn("schema 1", result.stdout)
-        self.fixture("PRAGMA user_version = 2;")
+        self.assertIn("schema 2", result.stdout)
+        self.fixture("PRAGMA user_version = 3;")
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Unsupported SQLite schema version 2", result.stderr)
+        self.assertIn("Unsupported SQLite schema version 3", result.stderr)
+
+    def test_upgrade_version_one_preserves_bindings_and_initializes_banlist_state(self):
+        initial_sql = (database.MIGRATIONS / "001_offline_auth.sql").read_text(encoding="utf-8")
+        self.fixture(initial_sql + "INSERT INTO auth_state VALUES (1, 42); PRAGMA user_version = 1;")
+        self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
+        before = self.rows("SELECT * FROM offline_bindings")
+        database.init_database()
+        self.assertEqual(self.schema_version(), 2)
+        self.assertEqual(self.rows("SELECT * FROM offline_bindings"), before)
+        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42)])
+        self.assertEqual(self.rows("SELECT * FROM banlist_state"), [(1, 0, "", 0, "")])
+        self.assertEqual(self.rows("SELECT * FROM server_bans"), [])
+        self.assertEqual(self.rows("SELECT * FROM frozen_bindings"), [])
+        self.assertEqual(self.rows("PRAGMA integrity_check"), [("ok",)])
+        self.notify.assert_not_called()
+
+    def test_reopening_version_two_preserves_bans_frozen_bindings_and_upload_state(self):
+        database.init_database()
+        state = (2, "a" * 32, 3, "b" * 64)
+        self.rows("UPDATE auth_state SET version = 42 WHERE id = 1")
+        self.rows(
+            "UPDATE banlist_state SET generation = ?, client_id = ?, sequence = ?, digest = ? WHERE id = 1",
+            state,
+        )
+        self.rows("""
+            INSERT INTO server_bans (mc_name_key, profile_uuid, state) VALUES
+                ('steve', NULL, 'BANNED'),
+                ('steve', '5627dd98-e6be-3c21-b8a8-e92344183641', 'KNOWN_PROFILE'),
+                (NULL, '00000000-0000-4000-8000-000000000002', 'BANNED')
+        """)
+        self.rows("""
+            INSERT INTO frozen_bindings (binding_id, group_id, qq_id, mc_name, mc_name_key, bound_at, updated_at, state)
+            VALUES (1, 'group', 'qq', 'Steve', 'steve', 100, 100, 'FROZEN')
+        """)
+        bans = self.rows("SELECT * FROM server_bans")
+        frozen = self.rows("SELECT * FROM frozen_bindings")
+
+        database.init_database()
+
+        self.assertEqual(self.schema_version(), 2)
+        self.assertEqual(self.rows("SELECT * FROM server_bans"), bans)
+        self.assertEqual(self.rows("SELECT * FROM frozen_bindings"), frozen)
+        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42)])
+        self.assertEqual(self.rows("SELECT * FROM banlist_state"), [(1, *state)])
+
+    def test_ban_snapshot_moves_binding_and_blocks_name_and_qq(self):
+        database.init_database()
+        self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
+        original = self.rows("SELECT id, group_id, qq_id, mc_name, bound_at, updated_at FROM offline_bindings")[0]
+
+        def observe_commit():
+            self.assertGreater(self.auth_version(), 0)
+            self.assertEqual(self.rows("SELECT * FROM offline_bindings"), [])
+            self.assertEqual(self.rows(
+                "SELECT binding_id, group_id, qq_id, mc_name, bound_at, updated_at "
+                "FROM frozen_bindings WHERE mc_name_key = 'myname'",
+            ), [original])
+
+        self.notify.side_effect = observe_commit
+        self.assertEqual(binding_service.apply_ban_snapshot({"MYNAME": 1_000, "Unbound": None}), 1)
+        self.notify.assert_called_once_with()
+        self.assertEqual(binding_service.query_binding("group", "qq"), ("frozen", "MyName"))
+        self.assertIsNone(binding_service.get_binding("group", "qq"))
+        self.assertEqual(binding_service.bind_player("group", "qq", "Other"), ("frozen", "MyName"))
+        self.assertEqual(binding_service.bind_player("group", "new", "myname"), ("banned_name", None))
+        self.assertEqual(binding_service.bind_player("group", "new", "UNBOUND"), ("banned_name", None))
+        self.assertEqual(self.rows("SELECT mc_name_key FROM frozen_bindings"), [("myname",)])
+        self.assertEqual(binding_service.request_unbind("group", "qq"), ("frozen", "MyName"))
+        self.assertIsNone(binding_service.unbind_player("group", "qq", left_at=101))
+
+        version = self.auth_version()
+        self.assertEqual(binding_service.apply_ban_snapshot({"myname": 1_000, "UNBOUND": None}), 0)
+        self.assertEqual(binding_service.apply_ban_snapshot({"myname": 2_000, "MyName": None}), 0)
+        self.assertEqual(self.rows("SELECT mc_name_key, expires_at FROM server_bans"), [("myname", None)])
+        self.assertEqual(self.rows("SELECT mc_name_key, state, revision FROM frozen_bindings"), [("myname", "FROZEN", 1)])
+        self.assertEqual(self.auth_version(), version)
+        self.notify.assert_called_once_with()
+
+    def test_missing_ban_snapshot_entry_stays_reserved_and_reban_invalidates_the_old_check(self):
+        database.init_database()
+        self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
+        binding_service.apply_ban_snapshot({"MyName": None})
+        self.notify.reset_mock()
+        version = self.auth_version()
+
+        binding_service.apply_ban_snapshot({})
+        old_check = binding_service.membership_audit_snapshot("group")
+        self.assertEqual(self.rows("SELECT * FROM server_bans"), [])
+        self.assertEqual(binding_service.query_binding("group", "qq"), ("pending", "MyName"))
+        self.assertEqual(binding_service.bind_player("group", "qq", "Other"), ("pending", "MyName"))
+        self.assertEqual(binding_service.bind_player("group", "new", "MYNAME"), ("name_taken", None))
+        self.assertEqual(binding_service.request_unbind("group", "qq"), ("pending", "MyName"))
+        binding_service.apply_ban_snapshot({})
+        self.assertEqual(binding_service.membership_audit_snapshot("group"), old_check)
+
+        binding_service.apply_ban_snapshot({"MyName": None})
+        self.assertEqual(binding_service.reconcile_checked_bindings("group", old_check, {"qq"}, 200), 0)
+        binding_service.apply_ban_snapshot({})
+        self.assertEqual(binding_service.reconcile_checked_bindings("group", old_check, {"qq"}, 200), 0)
+        self.assertEqual(self.auth_version(), version)
+        self.notify.assert_not_called()
+
+        latest_check = binding_service.membership_audit_snapshot("group")
+        self.assertEqual(binding_service.reconcile_checked_bindings("group", latest_check, {"qq"}, 200), 0)
+        self.assertEqual(self.rows("SELECT id, mc_name, bound_at, updated_at FROM offline_bindings"), [
+            (1, "MyName", 100, 200),
+        ])
+        self.assertEqual(self.rows("SELECT * FROM frozen_bindings"), [])
+        self.assertGreater(self.auth_version(), version)
+        self.notify.assert_called_once_with()
+        self.assertIsNone(binding_service.unbind_player("group", "qq", left_at=199))
+        self.assertEqual(binding_service.request_unbind("group", "qq", left_at=200), ("verify_membership", "MyName"))
+        self.assertEqual(binding_service.get_binding("group", "qq"), "MyName")
+        check = binding_service.handle_departure("group", "qq", 200)
+        self.assertIsInstance(check, binding_service.DepartureCheck)
+        self.assertEqual(binding_service.revoke_checked_bindings("group", check.version, {"qq": check.binding_id}), 1)
+        self.assertIsNone(binding_service.get_binding("group", "qq"))
+
+    def test_snapshot_and_concurrent_unbind_follow_transaction_order(self):
+        database.init_database()
+        self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
+        start = Barrier(2, timeout=5)
+
+        def apply():
+            start.wait()
+            return binding_service.apply_ban_snapshot({"MyName": None})
+
+        def unbind():
+            start.wait()
+            return binding_service.request_unbind("group", "qq")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            snapshot = pool.submit(apply)
+            unbind_request = pool.submit(unbind)
+            frozen = snapshot.result()
+            status, name = unbind_request.result()
+
+        self.assertEqual((frozen, status), (1, "frozen") if frozen else (0, "success"))
+        self.assertEqual(name, "MyName")
+        self.assertEqual(self.rows("SELECT * FROM offline_bindings"), [])
+        self.assertEqual(self.rows("SELECT mc_name_key FROM server_bans"), [("myname",)])
+        self.assertEqual(self.rows("SELECT qq_id FROM frozen_bindings"), [("qq",)] if frozen else [])
+        self.notify.assert_called_once_with()
+
+    def test_restore_handles_legacy_row_id_reuse(self):
+        self.fixture(AUTH_TABLE + OFFLINE_TABLE.replace(" AUTOINCREMENT", "")
+                     + ACTIVE_INDEXES + "INSERT INTO auth_state VALUES (1, 42); PRAGMA user_version = 1;")
+        self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
+        database.init_database()
+        binding_service.apply_ban_snapshot({"MyName": None})
+        binding_service.bind_player("group", "other", "Other")
+        self.assertEqual(self.rows("SELECT id FROM offline_bindings"), [(1,)])
+
+        binding_service.apply_ban_snapshot({})
+        audit = binding_service.membership_audit_snapshot("group", only_pending=True)
+        self.assertEqual(binding_service.reconcile_checked_bindings("group", audit, {"qq"}, 200), 0)
+        self.assertEqual(self.rows("SELECT id, mc_name FROM offline_bindings ORDER BY id"), [
+            (1, "Other"), (2, "MyName"),
+        ])
+
+    def test_invalid_or_uncommittable_snapshot_preserves_bindings_and_existing_bans(self):
+        database.init_database()
+        self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
+        binding_service.apply_ban_snapshot({"Existing": None})
+        for entries in ({"Bad Name": None}, {"MyName": True}, {"MyName": database.MAX_AUTH_VERSION + 1}):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                binding_service.apply_ban_snapshot(entries)
+        self.rows("DELETE FROM auth_state")
+        with self.assertRaises(sqlite3.IntegrityError):
+            binding_service.apply_ban_snapshot({"MyName": None})
+        self.assertEqual(self.rows("SELECT mc_name FROM offline_bindings"), [("MyName",)])
+        self.assertEqual(self.rows("SELECT mc_name_key FROM server_bans"), [("existing",)])
+        self.assertEqual(self.rows("SELECT * FROM frozen_bindings"), [])
+        self.notify.assert_not_called()

@@ -36,11 +36,13 @@ cp -n bot/.env.example bot/.env
 
 群成员对账在 OneBot 连接成功后自动执行。在 Bot 运行配置中填写 NoneBot 的 `SUPERUSERS` JSON 数组后，配置的超级用户可在目标群使用 `/授权对账` 或 `/reconcile` 触发对账，并用 `/信息` 或 `/info` 查看状态图。群详情交叉校验依赖当前 Compose 固定的 NapCat 所提供的 `get_group_detail_info`。名单请求失败、为空、两次名单不一致或人数校验失败时，对账跳过撤权。
 
-`/认证测试` 和 `/ping` 访问本机 `127.0.0.1:18765/internal/health`，返回状态码与耗时。超级用户触发 `/info` 后，状态图左列显示 Bot 的完整 QQ 号、昵称、头像、采集时间、有效绑定数和系统资源，右列显示服务链路。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
+`/认证测试` 和 `/ping` 访问本机 `127.0.0.1:18765/internal/health`，返回状态码与耗时。超级用户触发 `/info` 后，状态图左列显示 Bot 的完整 QQ 号、昵称、头像、采集时间、有效绑定数、封禁记录数和系统资源，右列显示服务链路。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
+
+封禁记录数包括所有仍有效的游戏服封禁。存在无名 UUID 封禁时，SQLite 节点下方会显示其数量。服务器优先使用具名封禁，使 Bot 能按游戏名同步绑定状态。封禁同步所需的数据库结构在 v1 升至 v2 时一次迁移完成。Minecraft 插件在启动时上报完整封禁快照。
 
 可在 `bot/.env` 设置 `MC_STATUS_ADDRESS=play.example.org:25565`，使用 Minecraft Java 服务器列表探测游戏服，并显示服务器返回的在线人数。地址留空时显示灰色「未探测」，配置读取失败时显示黄色「配置读取失败」。服务状态图上的 WSS 来自本机 API 的授权连接数，可独立显示授权通道是否连接。
 
-昵称来自 OneBot 的当前登录信息。Bot 通过 HTTPS 从 `q1.qlogo.cn` 按自身 QQ 号获取头像，成功缓存 30 分钟，失败缓存 1 分钟。下载不可用时使用内置机器人图标。SQLite 状态和有效绑定数来自同一次只读授权查询。FastAPI 返回 HTTP 200 时亮绿灯，非 200 响应和超时亮黄灯，连接失败亮红灯。
+昵称来自 OneBot 的当前登录信息。Bot 通过 HTTPS 从 `q1.qlogo.cn` 按自身 QQ 号获取头像，成功缓存 30 分钟，失败缓存 1 分钟。下载不可用时使用内置机器人图标。SQLite 状态、有效绑定数和封禁数来自同一次只读事务。FastAPI 返回 HTTP 200 时亮绿灯，非 200 响应和超时亮黄灯，连接失败亮红灯。
 
 ### 机器人文案与群通知
 
@@ -74,6 +76,7 @@ info:
   title: "社区授权状态"
   labels:
     bindings: "有效绑定"
+    bans: "封禁记录"
 ```
 
 三个开关分别控制入群、主动退群和被移出群的消息，默认均为 `false`。现有配置显式设置为 `true` 的通知继续开启。关闭任意开关后，成员事件记录、退群撤权和授权同步照常执行。离群通知会按撤权结果选择 `revoked`、`no_binding` 或 `failed`。
@@ -310,9 +313,28 @@ Compose 将 WebUI 映射到本机 `6099`，将容器内的 OneBot WebSocket `300
 
 ## HTTPS/WSS 反向代理边界
 
-FastAPI 按上面的命令监听回环地址。异地游戏主机接入时，只转发所需的 `/internal/mc/snapshot` 和 `/internal/mc/ws`，启用 TLS，并尽可能限制到受信来源。向上游保留 Authorization 头，避免将其写入代理日志。WebSocket 转发需支持 HTTP/1.1 Upgrade 并设置合适的空闲超时，快照应遵循 `Cache-Control: no-store`。
+FastAPI 按上面的命令监听回环地址。授权快照 `/internal/mc/snapshot` 和封禁名单 `/internal/mc/banlist` 共用现有 HTTPS 域名、证书和 FastAPI 上游。Nginx 可在现有 HTTPS `server` 块内引入 [共用 HTTP 规则](../deploy/nginx/mc-qq-api-http.conf)，替换原来的 `/internal/mc/snapshot` 单路径规则。如果已经为 `/internal/mc/banlist` 建了单独规则，一并替换。原规则上的来源限制应应用到共用规则。封禁上报需要允许 `GET` 和 `PUT`。
+
+```nginx
+include /opt/mc-qq-auth/deploy/nginx/mc-qq-api-http.conf;
+```
+
+共用规则仅匹配上述两个完整路径，保留请求路径和 `Authorization` 头，关闭代理缓存，并允许最多 2 MiB 的请求体。代理应转发 FastAPI 的 HTTP 409 和 `X-MCQQ-Banlist-Conflict` 响应头，供插件区分首次会话竞争。避免在代理日志中记录 `Authorization`。`/internal/mc/ws` 继续使用该域名下的 WebSocket 规则。WebSocket 转发需支持 HTTP/1.1 Upgrade 并设置合适的空闲超时。
 
 `/internal/mc/notify` 应从公网路由中排除，`/internal/health` 留给本机或受信探活。WebUI 和 OneBot 端口同样保留在回环地址。完整协议见 [API 文档](api.md)。
+
+### 玩家封禁名单联动
+
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。从旧版本升级时，运行 `python bot/migrate.py` 将数据库从 v1 迁移到 v2，然后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
+
+```yaml
+banlist-watch:
+  enabled: true
+  upload-url: "https://auth.example.org/internal/mc/banlist"
+  token: "REPLACE_WITH_MC_BANLIST_TOKEN"
+```
+
+填入与后端相同的 Token，换上插件 JAR 并重启 Minecraft。首次上报成功时，控制台会记录「封禁名单快照已获 API 确认」。测试服可用一个已绑定账号执行 `/ban`，检查 `/我的绑定` 和 `/解绑`，再执行 `/pardon`，等待 Bot 核实群成员状态。上报地址和 Token 均留空时，插件只记录本地监听日志。
 
 ### QQ群管理指令
 
@@ -389,7 +411,7 @@ cd minecraft-plugin
 mvn -B -ntp clean verify
 ```
 
-部署产物为 `minecraft-plugin/target/MCQQAuth-0.5.2.jar`。Spigot API 1.20.1 以 `provided` 作用域参与编译，由兼容的服务端提供。JAR 内置并隔离 Jetty、Gson 及所需的日志依赖。Maven 测试通过本机回环地址运行模拟 HTTPS/WSS 服务并生成临时证书，也会模拟 Bukkit 登录、入服、公告界面和踢出调度。
+部署产物为 `minecraft-plugin/target/MCQQAuth-0.6.0.jar`。Spigot API 1.20.1 以 `provided` 作用域参与编译，由兼容的服务端提供。JAR 内置并隔离 Jetty、Gson 及所需的日志依赖。Maven 测试通过本机回环地址运行模拟 HTTPS/WSS 服务并生成临时证书，也会模拟 Bukkit 登录、入服、公告界面和踢出调度。
 
 游戏名现支持 1–16 位，授权匹配忽略大小写。从要求游戏名为 3–16 位的版本升级时，先替换游戏服上的插件 JAR 并重启，再更新 Bot，避免旧插件收到短名后拒绝整份授权名单。若已有超过 16 位的绑定，升级前先处理这些记录。数据库校验会拒绝含有超长记录的库，插件也会拒绝含有超长名字的整份授权名单。无需迁移表结构。
 
@@ -470,7 +492,7 @@ Bukkit 只能在玩家成功进入游戏后打开背包界面。名单未就绪�
 ### Mohist 面板服维护窗口
 
 1. 使用 Java 17 和 Mohist 1.20.1 的独立测试服，配置隔离的 HTTPS/WSS 模拟授权端点、测试 Token 和测试游戏名。构建 JAR，备份待升级服的旧插件与配置。
-2. 停服后将 `plugins/` 中的旧版替换为 `MCQQAuth-0.5.2.jar`，只保留一个 MCQQAuth JAR。保留已有 API 地址、Token 和文件访问权限。首次安装可从 JAR 提取默认配置，填写两条授权端点和 Token。
+2. 停服后将 `plugins/` 中的旧版替换为 `MCQQAuth-0.6.0.jar`，只保留一个 MCQQAuth JAR。保留已有 API 地址、Token 和文件访问权限。首次安装可从 JAR 提取默认配置，填写两条授权端点和 Token。
 3. **阶段 A · 观察**。显式配置 `mode: OBSERVE` 与 `observe.notice.enabled: true`，填写 QQ 群号并启动游戏服。用 `/mcqqauth` 确认模式和同步状态。用已授权、未授权、同步暂不可用三种测试状态入服，核对公告、日志及同步恢复后的表现。检查原版客户端的中文文案、Esc、确认按钮、背包操作和其他插件的登录菜单。
 4. **阶段 B · 强制**。保留已授权和未授权的测试玩家在线，执行 `/mcqqauth mode enforce`。验证新登录、在线豁免、退出重连和撤权。用隔离的测试名单演练显式清理，核对踢出人数和日志。在 WSS 断开时核对清理被拒、新登录被拒及重连后的恢复。确认切换本身未产生新连接，再重启测试服核对模式保存结果。
-5. 生产环境先按观察阶段核对同步和公告，再用指令切换。修改公告等其他配置后，在维护窗口完整停止并重新启动 Mohist。完整回滚时停服，移出 `MCQQAuth-0.5.2.jar`，恢复同一次备份的旧 JAR 与配置，再启动并核对 `/mcqqauth`。
+5. 生产环境先按观察阶段核对同步和公告，再用指令切换。修改公告等其他配置后，在维护窗口完整停止并重新启动 Mohist。完整回滚时停服，移出 `MCQQAuth-0.6.0.jar`，恢复同一次备份的旧 JAR 与配置，再启动并核对 `/mcqqauth`。

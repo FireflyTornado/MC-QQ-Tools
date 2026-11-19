@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
+import time
 from collections import OrderedDict
+from contextlib import suppress
 from typing import Literal
 
 from nonebot import get_driver, logger, on_command, on_type
@@ -16,7 +18,9 @@ from nonebot.adapters.onebot.v11.exception import OneBotV11AdapterException
 from nonebot.permission import SUPERUSER
 
 import message_config
-from binding_service import binding_audit_snapshot, revoke_checked_bindings, unbind_player
+from binding_service import (
+    DepartureCheck, handle_departure, membership_audit_snapshot, reconcile_checked_bindings, revoke_checked_bindings,
+)
 from qq_group import TARGET_GROUP_ID, group_rule
 from runtime_status import record_outcome
 
@@ -26,8 +30,12 @@ MEMBER_CHECK_TIMEOUT = 20
 MEMBER_CHECK_RETRY_DELAY = 5
 RECENT_DEPARTURE_LIMIT = 1024
 reconcile_lock = asyncio.Lock()
+membership_write_lock = asyncio.Lock()
 membership_generation = 0
-recent_departures: OrderedDict[tuple[int, int, int, str], Literal["handled", "failed"]] = OrderedDict()
+pending_checks_task: asyncio.Task[None] | None = None
+DepartureKey = tuple[int, int, int, str]
+recent_departures: OrderedDict[DepartureKey, Literal["processing", "handled", "failed"]] = OrderedDict()
+pending_departures: OrderedDict[DepartureKey, GroupDecreaseNoticeEvent] = OrderedDict()
 bots_outside_group: set[str] = set()
 
 
@@ -94,32 +102,51 @@ async def handle_member_leave(
     if event.sub_type not in {"leave", "kick"}:
         return
 
+    await process_departure(bot, event)
+
+
+async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry: bool = False) -> None:
+    global membership_generation
     key = (event.user_id, event.time, event.operator_id, event.sub_type)
+    if not retry:
+        membership_generation += 1
     previous = recent_departures.get(key)
-    if previous == "handled":
+    if previous == "processing":
         return
-    recent_departures[key] = "handled"
+    recent_departures[key] = "processing"
     recent_departures.move_to_end(key)
     if len(recent_departures) > RECENT_DEPARTURE_LIMIT:
         recent_departures.popitem(last=False)
-    membership_generation += 1
     reason = "成员主动退群" if event.sub_type == "leave" else "成员被管理员移出群"
+    qq_id = str(event.user_id)
+    handling: Literal["handled", "failed"] = "failed"
     try:
-        name = await asyncio.to_thread(
-            unbind_player, GROUP_ID, str(event.user_id), left_at=event.time,
-        )
-    except sqlite3.Error as exc:
-        if key in recent_departures:
-            recent_departures[key] = "failed"
-        logger.error("[MC-QQ-AUTH] {}后的撤权事务失败（{}）", reason, type(exc).__name__)
+        async with membership_write_lock:
+            result = await asyncio.to_thread(
+                handle_departure, GROUP_ID, qq_id, event.time,
+                only_same_second=previous == "handled" or key in pending_departures,
+            )
+        if isinstance(result, DepartureCheck):
+            pending_departures[key] = event
+            pending_departures.move_to_end(key)
+            if len(pending_departures) > RECENT_DEPARTURE_LIMIT:
+                pending_departures.popitem(last=False)
+            outcome = await verify_same_second_departure(bot, qq_id, result)
+        else:
+            outcome = "revoked" if result is not None else "no_binding"
+        pending_departures.pop(key, None)
+    except (sqlite3.Error, UnverifiedMembers, TimeoutError, OneBotV11AdapterException) as exc:
+        logger.error("[MC-QQ-AUTH] {}后的撤权暂未确认（{}）", reason, type(exc).__name__)
         outcome = "failed"
     else:
-        outcome = "no_binding"
-        if name is not None:
+        handling = "handled"
+        if outcome == "revoked":
             logger.info("[MC-QQ-AUTH] {}，已撤销绑定", reason)
-            outcome = "revoked"
-    # Keep retrying failed transactions, while suppressing repeated failure messages.
-    if message_config.MESSAGES.enabled(event.sub_type) and (previous, outcome) != ("failed", "failed"):
+    finally:
+        if recent_departures.get(key) == "processing":
+            recent_departures[key] = handling
+    if (outcome != "present" and (previous != "handled" or outcome == "revoked")
+            and (previous, outcome) != ("failed", "failed") and message_config.MESSAGES.enabled(event.sub_type)):
         await send_member_notice(bot, message_config.MESSAGES.render(f"events.{event.sub_type}.{outcome}"))
 
 
@@ -144,36 +171,66 @@ def member_ids(rows: object, self_id: str) -> set[str]:
     return members
 
 
-async def reconcile_members(bot: Bot) -> int | None:
+def can_verify_members(bot: Bot) -> bool:
+    return driver.bots.get(bot.self_id) is bot and bot.self_id not in bots_outside_group
+
+
+async def verified_group_members(bot: Bot) -> set[str]:
+    # NapCat may serve a cached list while refreshing it. Verify two reads
+    # against the independent group details before treating absence as evidence.
+    async with asyncio.timeout(MEMBER_CHECK_TIMEOUT):
+        first = member_ids(
+            await bot.get_group_member_list(group_id=TARGET_GROUP_ID, no_cache=True), bot.self_id,
+        )
+        detail = await bot.call_api("get_group_detail_info", group_id=TARGET_GROUP_ID)
+        second = member_ids(
+            await bot.get_group_member_list(group_id=TARGET_GROUP_ID, no_cache=True), bot.self_id,
+        )
+    count = detail.get("member_count") if isinstance(detail, dict) else None
+    if (type(count) is not int or count != len(second) or first != second
+            or type(detail.get("group_id")) is not int or detail["group_id"] != TARGET_GROUP_ID):
+        raise UnverifiedMembers
+    return second
+
+
+async def verify_same_second_departure(bot: Bot, qq_id: str, check: DepartureCheck) -> str:
     async with reconcile_lock:
-        if driver.bots.get(bot.self_id) is not bot or bot.self_id in bots_outside_group:
+        if not can_verify_members(bot):
+            raise UnverifiedMembers
+        generation = membership_generation
+        members = await verified_group_members(bot)
+        async with membership_write_lock:
+            if membership_generation != generation or not can_verify_members(bot):
+                raise UnverifiedMembers
+            if qq_id in members:
+                return "present"
+            deleted = await asyncio.to_thread(revoke_checked_bindings, GROUP_ID, check.version, {qq_id: check.binding_id})
+            if deleted is None:
+                raise UnverifiedMembers
+            return "revoked" if deleted else "no_binding"
+
+
+async def reconcile_members(bot: Bot, *, only_pending: bool = False) -> int | None:
+    async with reconcile_lock:
+        if not can_verify_members(bot):
             return None
         generation = membership_generation
-        outcome = "Unavailable"
+        outcome = None
         try:
-            version, bindings = await asyncio.to_thread(binding_audit_snapshot, GROUP_ID)
-            if not bindings:
-                outcome = "OK, 0 revoked"
+            audit = await asyncio.to_thread(membership_audit_snapshot, GROUP_ID, only_pending=only_pending)
+            if not audit.bindings and not audit.pending:
+                if not only_pending:
+                    outcome = "OK, 0 revoked"
                 return 0
 
-            # NapCat may serve a cached list while refreshing it. Verify two reads
-            # against the independent group details before treating absence as evidence.
-            async with asyncio.timeout(MEMBER_CHECK_TIMEOUT):
-                first = member_ids(
-                    await bot.get_group_member_list(group_id=TARGET_GROUP_ID, no_cache=True), bot.self_id,
-                )
-                detail = await bot.call_api("get_group_detail_info", group_id=TARGET_GROUP_ID)
-                second = member_ids(
-                    await bot.get_group_member_list(group_id=TARGET_GROUP_ID, no_cache=True), bot.self_id,
-                )
-            count = detail.get("member_count") if isinstance(detail, dict) else None
-            if (type(count) is not int or count != len(second) or first != second
-                    or type(detail.get("group_id")) is not int or detail["group_id"] != TARGET_GROUP_ID
-                    or membership_generation != generation or driver.bots.get(bot.self_id) is not bot):
-                raise UnverifiedMembers
+            checked_at = int(time.time())
+            members = await verified_group_members(bot)
 
-            missing = {qq_id: bindings[qq_id] for qq_id in bindings.keys() - second}
-            deleted = await asyncio.to_thread(revoke_checked_bindings, GROUP_ID, version, missing)
+            # A departure received during the commit must be processed after any restored binding.
+            async with membership_write_lock:
+                if membership_generation != generation or not can_verify_members(bot):
+                    raise UnverifiedMembers
+                deleted = await asyncio.to_thread(reconcile_checked_bindings, GROUP_ID, audit, members, checked_at)
             if deleted is None:
                 outcome = "Version changed"
                 logger.warning("[MC-QQ-AUTH] 对账期间授权版本已变化，本次对账已跳过")
@@ -187,8 +244,42 @@ async def reconcile_members(bot: Bot) -> int | None:
             outcome = "Database error"
             logger.error("[MC-QQ-AUTH] 授权对账数据库操作失败（{}）", type(exc).__name__)
         finally:
-            record_outcome("reconcile", outcome)
+            if outcome is not None:
+                record_outcome("reconcile", outcome)
         return None
+
+
+async def check_pending_bindings() -> None:
+    while True:
+        await asyncio.sleep(MEMBER_CHECK_RETRY_DELAY)
+        bot = next(
+            (bot for bot in driver.bots.values() if isinstance(bot, Bot) and bot.self_id not in bots_outside_group),
+            None,
+        )
+        if bot is not None:
+            await reconcile_members(bot, only_pending=True)
+            departure = next(
+                (event for key, event in pending_departures.items() if recent_departures.get(key) != "processing"),
+                None,
+            )
+            if departure is not None:
+                await process_departure(bot, departure, retry=True)
+
+
+@driver.on_startup
+async def start_pending_binding_checks() -> None:
+    global pending_checks_task
+    pending_checks_task = asyncio.create_task(check_pending_bindings())
+
+
+@driver.on_shutdown
+async def stop_pending_binding_checks() -> None:
+    global pending_checks_task
+    if pending_checks_task is not None:
+        pending_checks_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending_checks_task
+        pending_checks_task = None
 
 
 @driver.on_bot_connect
@@ -196,7 +287,7 @@ async def reconcile_on_connect(bot: Bot):
     if not isinstance(bot, Bot):
         return
     count = await reconcile_members(bot)
-    if count is None and driver.bots.get(bot.self_id) is bot and bot.self_id not in bots_outside_group:
+    if count is None and can_verify_members(bot):
         await asyncio.sleep(MEMBER_CHECK_RETRY_DELAY)
         count = await reconcile_members(bot)
     if count is not None:

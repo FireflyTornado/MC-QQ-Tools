@@ -23,7 +23,7 @@ final class PluginSettings {
                    int connectTimeoutMs, int requestTimeoutMs, int reconnectMinMs, int reconnectMaxMs) {
         this.snapshotUrl = secureUrl(snapshotUrl, "https", "api.snapshot-url");
         this.websocketUrl = secureUrl(websocketUrl, "wss", "api.websocket-url");
-        if (token == null || token.length() > 4096 || !TOKEN.matcher(token).matches()
+        if (!validToken(token)
                 || token.equals("REPLACE_WITH_MC_API_TOKEN")) {
             throw new IllegalArgumentException("api.token 需要填写有效的 MC_API_TOKEN");
         }
@@ -65,7 +65,11 @@ final class PluginSettings {
         throw new IllegalArgumentException("mode 必须为 OBSERVE 或 ENFORCE");
     }
 
-    private static URI parseUrl(ConfigurationSection config, String key) {
+    static boolean validToken(String value) {
+        return value != null && value.length() <= 4096 && TOKEN.matcher(value).matches();
+    }
+
+    static URI parseUrl(ConfigurationSection config, String key) {
         try {
             return URI.create(config.getString(key, ""));
         } catch (IllegalArgumentException e) {
@@ -73,7 +77,7 @@ final class PluginSettings {
         }
     }
 
-    private static URI secureUrl(URI url, String scheme, String key) {
+    static URI secureUrl(URI url, String scheme, String key) {
         if (!scheme.equalsIgnoreCase(url.getScheme()) || url.getHost() == null || url.getUserInfo() != null
                 || url.getPort() == 0 || url.getPort() > 65535
                 || url.getRawQuery() != null || url.getRawFragment() != null || url.getRawPath().isEmpty()) {
@@ -82,7 +86,7 @@ final class PluginSettings {
         return url;
     }
 
-    private static int positive(int value, String key) {
+    static int positive(int value, String key) {
         if (value <= 0 || value > 300_000) {
             throw new IllegalArgumentException(key + " 必须在 1 到 300000 毫秒之间");
         }

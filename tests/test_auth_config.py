@@ -24,9 +24,11 @@ import app_config
 import binding_service
 import database
 import notify_client
+import runtime_status
 
 API_TOKEN = "test-only.api~token+="
 NOTIFY_TOKEN = "test-only.notify-token"
+BANLIST_TOKEN = "test-only.banlist-token"
 GROUP_ID = "12345"
 VERSION = 1_800_000_000_001
 ENV = {
@@ -37,6 +39,7 @@ ENV = {
 SNAPSHOT_PATH = "/internal/mc/snapshot"
 NOTIFY_PATH = "/internal/mc/notify"
 WS_PATH = "/internal/mc/ws"
+BANLIST_PATH = "/internal/mc/banlist"
 
 
 def bearer(token):
@@ -83,17 +86,19 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         env_file = root / ".env"
         env_file.write_text("TARGET_GROUP_ID=00" + GROUP_ID + "\n", encoding="utf-8")
         with patch.object(app_config, "ENV_FILE", env_file), patch.dict(
-            os.environ, {"MC_API_TOKEN": API_TOKEN, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN}, clear=True
+            os.environ, {
+                "MC_API_TOKEN": API_TOKEN, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN, "MC_BANLIST_TOKEN": BANLIST_TOKEN,
+            }, clear=True
         ):
             self.api = importlib.import_module("mc_api")
         self.addCleanup(sys.modules.pop, "mc_api", None)
         self.api.DB_PATH = db_path
 
-    async def request(self, path, authorization=(), method="GET"):
+    async def request(self, path, authorization=(), method="GET", body=b""):
         sent = []
 
         async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": False}
 
         async def send(message):
             sent.append(message)
@@ -112,6 +117,281 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(headers[b"cache-control"], b"no-store")
                 self.assertEqual(payload, {"version": VERSION, "active_names": ["alex", "steve"]})
                 self.assertIsInstance(payload["version"], int)
+
+    async def upload_banlist(self, generation, sequence, entries, client_id="a" * 32, *, profiles=None):
+        payload = {"generation": generation, "client_id": client_id, "sequence": sequence, "entries": entries}
+        if profiles is not None:
+            payload["profiles"] = profiles
+        return await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", json.dumps(payload).encode())
+
+    async def test_banlist_upload_freezes_broadcasts_and_only_restores_after_membership_check(self):
+        status, headers, cursor = await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)])
+        self.assertEqual((status, headers[b"cache-control"], cursor), (200, b"no-store", {"generation": 0}))
+
+        async with self.websocket() as (updates, _):
+            status, _, reply = await self.upload_banlist(1, 1, {"Steve": None})
+            self.assertEqual((status, reply), (200, {"generation": 1, "sequence": 1}))
+            _, _, frozen = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(frozen["active_names"], ["alex"])
+            self.assertGreater(frozen["version"], VERSION)
+            update = json.loads((await asyncio.wait_for(updates.get(), 2))["text"])
+            self.assertEqual(update, {"type": "auth_updated", "version": frozen["version"]})
+
+            self.assertEqual((await self.upload_banlist(1, 1, {"STEVE": None}))[0], 200)
+            self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 409)
+            self.assertEqual((await self.upload_banlist(1, 3, {}))[0], 409)
+            self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 200)
+            self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2], frozen)
+            self.assertTrue(updates.empty())
+
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual(binding_service.request_unbind(GROUP_ID, "1"), ("pending", "Steve"))
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1"}, 2)
+        restored = (await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]
+        self.assertEqual(restored["active_names"], ["alex", "steve"])
+        self.assertGreater(restored["version"], frozen["version"])
+
+    async def test_new_banlist_session_fences_old_writers_and_cursor_survives_api_restart(self):
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 0})
+        self.assertEqual((await self.upload_banlist(1, 1, {"Steve": None}))[0], 200)
+        status, headers, _ = await self.upload_banlist(1, 1, {}, client_id="b" * 32)
+        self.assertEqual(status, 409)
+        self.assertEqual(headers[b"x-mcqq-banlist-conflict"], b"generation-claimed")
+        status, headers, _ = await self.upload_banlist(1, 2, {}, client_id="b" * 32)
+        self.assertEqual(status, 409)
+        self.assertNotIn(b"x-mcqq-banlist-conflict", headers)
+        self.assertEqual((await self.upload_banlist(2, 1, {"Alex": None}, client_id="b" * 32))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
+        status, headers, _ = await self.upload_banlist(1, 1, {"Steve": None})
+        self.assertEqual(status, 409)
+        self.assertNotIn(b"x-mcqq-banlist-conflict", headers)
+        self.assertEqual((await self.upload_banlist(3, 1, {"Steve": None}, client_id="b" * 32))[0], 409)
+        db_path = self.api.DB_PATH
+        database.init_database(db_path)
+        with patch.object(app_config, "load_config", return_value={**ENV, "MC_BANLIST_TOKEN": BANLIST_TOKEN}):
+            self.api = importlib.reload(self.api)
+        self.api.DB_PATH = db_path
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 2})
+        self.assertEqual((await self.upload_banlist(2, 1, {"alex": None}, client_id="b" * 32))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
+
+    async def test_expired_upload_is_acknowledged_without_freezing_and_retains_its_original_digest(self):
+        now = 1_850_000_000_000
+        alex = "00000000-0000-4000-8000-000000000002"
+        unnamed = "00000000-0000-4000-8000-000000000003"
+        entries = {"Steve": now - 1}
+        profiles = {
+            alex: {"name": "Alex", "expires_at": now},
+            unnamed: {"name": None, "expires_at": now},
+        }
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = now * 1_000_000
+            status, _, reply = await self.upload_banlist(1, 1, entries, profiles=profiles)
+            self.assertEqual((status, reply), (200, {"generation": 1, "sequence": 1}))
+            clock.time_ns.return_value += 10_000_000
+            self.assertEqual((await self.upload_banlist(1, 1, entries, profiles=profiles))[0], 200)
+            self.assertEqual((await self.upload_banlist(1, 1, {}, profiles={}))[0], 409)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2], {
+            "version": VERSION, "active_names": ["alex", "steve"],
+        })
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM server_bans").fetchone()[0], 0)
+
+    async def test_uuid_only_bans_preserve_known_names_without_blocking_other_bans_and_pardons(self):
+        steve = "00000000-0000-4000-8000-000000000001"
+        unknown = "00000000-0000-4000-8000-000000000003"
+        other = "00000000-0000-4000-8000-000000000004"
+        entries = {"Alex": None, "Legacy": None}
+        self.assertEqual((await self.upload_banlist(1, 1, entries))[0], 200)
+        initial = {
+            steve: {"name": "Steve", "expires_at": None},
+        }
+        self.assertEqual((await self.upload_banlist(1, 2, entries, profiles=initial))[0], 200)
+        mixed = {other: {"name": "Other", "expires_at": None}}
+        self.assertEqual((await self.upload_banlist(1, 3, {**entries, "STEVE": None}, profiles=mixed))[0], 200)
+        database.init_database(self.api.DB_PATH)
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            saved = conn.execute(
+                "SELECT mc_name_key, state FROM server_bans WHERE profile_uuid = ?", (steve,),
+            ).fetchone()
+            self.assertEqual(saved, ("steve", "KNOWN_PROFILE"))
+
+        def states():
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return dict(conn.execute("SELECT mc_name_key, state FROM frozen_bindings"))
+
+        profiles = {
+            steve: {"name": None, "expires_at": None},
+            unknown: {"name": None, "expires_at": None},
+            other: {"name": "Other", "expires_at": None},
+        }
+        replacement = "b" * 32
+        self.assertEqual((await self.upload_banlist(2, 1, {}, replacement, profiles=profiles))[0], 200)
+        self.assertEqual(states(), {
+            "steve": "FROZEN", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "FROZEN",
+        })
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            self.assertEqual(set(conn.execute("SELECT profile_uuid, mc_name_key, state FROM server_bans")), {
+                (steve, "steve", "BANNED"), (unknown, None, "BANNED"), (other, "other", "BANNED"),
+            })
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"2"}, 2), 0)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
+
+        del profiles[steve]
+        self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
+        self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "FROZEN"})
+
+    async def test_known_uuid_is_enriched_in_place_without_an_unnamed_warning(self):
+        known = "00000000-0000-4000-8000-000000000001"
+        unknown = "00000000-0000-4000-8000-000000000002"
+        alex = "00000000-0000-4000-8000-000000000003"
+
+        def profile(uuid):
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return conn.execute(
+                    "SELECT id, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid = ?", (uuid,),
+                ).fetchone()
+
+        self.assertEqual((await self.upload_banlist(1, 1, {}, profiles={
+            known: {"name": "Steve", "expires_at": None},
+            alex: {"name": "Alex", "expires_at": None},
+        }))[0], 200)
+        row_id, name, expiration, state = profile(known)
+        self.assertEqual((name, expiration, state), ("steve", None, "BANNED"))
+
+        expires_at = database.MAX_AUTH_VERSION
+        profiles = {known: {"name": None, "expires_at": expires_at}}
+        with (patch.object(database, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual((await self.upload_banlist(1, 2, {"Alex": None}, profiles=profiles))[0], 200)
+            self.assertEqual(profile(known), (row_id, "steve", expires_at, "BANNED"))
+            self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("frozen", "Steve"))
+            self.assertEqual(runtime_status._binding_status(GROUP_ID)[2], 0)
+
+            profiles[unknown] = {"name": None, "expires_at": None}
+            self.assertEqual((await self.upload_banlist(1, 3, {}, profiles=profiles))[0], 200)
+            self.assertEqual(profile(unknown)[1:], (None, None, "BANNED"))
+            self.assertEqual(runtime_status._binding_status(GROUP_ID)[2], 1)
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(set(audit.pending), {"2"})
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"2"}, 2), 0)
+
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
+
+    async def test_unmapped_offline_uuid_is_recorded_without_guessing_its_game_name(self):
+        # UUID.nameUUIDFromBytes("OfflinePlayer:Steve".getBytes(UTF_8))
+        steve = "5627dd98-e6be-3c21-b8a8-e92344183641"
+        unknown = "00000000-0000-4000-8000-000000000003"
+        self.assertEqual((await self.upload_banlist(1, 1, {"steve": None}))[0], 200)
+
+        expiration = 1_850_000_000_000
+        profiles = {
+            steve: {"name": None, "expires_at": expiration},
+            unknown: {"name": None, "expires_at": None},
+        }
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
+            self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=profiles))[0], 200)
+            self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=profiles))[0], 200)
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("pending", "Steve"))
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(set(audit.pending), {"1"})
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1"}, 2), 0)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
+
+        def stored_profiles():
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return {
+                    uuid: (name, expiration, state)
+                    for uuid, name, expiration, state in conn.execute(
+                        "SELECT profile_uuid, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid IS NOT NULL"
+                    )
+                }
+
+        database.init_database(self.api.DB_PATH)
+        self.assertEqual(stored_profiles(), {steve: (None, expiration, "BANNED"), unknown: (None, None, "BANNED")})
+        # An explicit server name associates the UUID and restores the usual ban behavior.
+        self.assertEqual((await self.upload_banlist(1, 3, {}, profiles={
+            steve: {"name": "Steve", "expires_at": None},
+        }))[0], 200)
+        self.assertEqual(stored_profiles(), {steve: ("steve", None, "BANNED")})
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
+
+    async def test_multiple_profile_bans_share_one_binding_reservation_until_the_last_expires(self):
+        first = "00000000-0000-4000-8000-000000000001"
+        second = "00000000-0000-4000-8000-000000000002"
+        expiration = 1_850_000_000_000
+
+        def reservations():
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return conn.execute("SELECT state, qq_id FROM frozen_bindings").fetchall()
+
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
+            self.assertEqual((await self.upload_banlist(1, 1, {}, profiles={
+                first: {"name": "Steve", "expires_at": expiration - 10_000},
+                second: {"name": "STEVE", "expires_at": expiration},
+            }))[0], 200)
+            self.assertEqual(reservations(), [("FROZEN", "1")])
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                self.assertEqual(set(conn.execute("SELECT profile_uuid, mc_name_key, expires_at FROM server_bans")), {
+                    (first, "steve", expiration - 10_000), (second, "steve", expiration),
+                })
+
+            remaining = {second: {"name": None, "expires_at": expiration}}
+            self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=remaining))[0], 200)
+            self.assertEqual(reservations(), [("FROZEN", "1")])
+
+            clock.time_ns.return_value = expiration * 1_000_000
+            self.assertEqual((await self.upload_banlist(1, 3, {}, profiles=remaining))[0], 200)
+        self.assertEqual(reservations(), [("PENDING_MEMBERSHIP_CHECK", "1")])
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM server_bans").fetchone(), (0,))
+
+    async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
+        for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):
+            self.assertEqual((await self.request(BANLIST_PATH, header, "PUT", b"{}"))[0], 401)
+        with patch.object(self.api, "BANLIST_TOKEN", None):
+            self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 404)
+        with patch.object(self.api, "MAX_BANLIST_BYTES", 4):
+            self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 413)
+        for entries in ({"Bad Name": None}, {"Steve": True}, {"Steve": "42"}):
+            self.assertEqual((await self.upload_banlist(1, 1, entries))[0], 422)
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", b'{"entries":'))[0], 422)
+        self.set_version(database.MAX_AUTH_VERSION)
+        with self.assertLogs("mc_qq_auth", "ERROR"):
+            self.assertEqual((await self.upload_banlist(1, 1, {"Steve": None}))[0], 503)
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 0})
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
+
+    async def test_snapshot_excludes_frozen_and_pending_bindings_until_membership_is_verified(self):
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated") as notify):
+            binding_service.apply_ban_snapshot({"STEVE": None})
+            status, _, frozen = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(status, 200)
+            self.assertEqual(frozen["active_names"], ["alex"])
+            self.assertGreater(frozen["version"], VERSION)
+
+            binding_service.apply_ban_snapshot({})
+            _, _, pending = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(pending, frozen)
+            notify.assert_called_once_with()
+
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1"}, 2)
+            _, _, restored = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
+            self.assertEqual(restored["active_names"], ["alex", "steve"])
+            self.assertGreater(restored["version"], frozen["version"])
+            self.assertEqual(notify.call_count, 2)
 
     async def test_http_rejects_invalid_bearer_input(self):
         cases = {
@@ -478,7 +758,7 @@ class ConfigTests(unittest.TestCase):
         project = self.root / "source"
         (project / "plugins").mkdir(parents=True)
         for rel in (
-            "app_config.py", "bot.py", "binding_service.py", "database.py", "mc_api.py",
+            "app_config.py", "banlist_sync.py", "bot.py", "binding_service.py", "database.py", "mc_api.py",
             "notify_client.py", "qq_avatar.py", "qq_group.py", "runtime_status.py", "status_image.py",
             "status_card.svg", "message_config.py", "sudo_api.py", "sudo_config.py",
             "plugins/qq_bindings.py", "plugins/qq_events.py", "plugins/status_commands.py", "plugins/qq_sudo.py",
@@ -518,6 +798,7 @@ assert {plugin.module_name for plugin in nonebot.get_loaded_plugins()} == {
     "plugins.qq_bindings", "plugins.qq_events", "plugins.status_commands", "plugins.qq_sudo",
 }
 assert mc_api.sudo_settings is None
+assert mc_api.BANLIST_TOKEN is None
 """
         env = {
             key: value for key, value in os.environ.items()
@@ -525,6 +806,7 @@ assert mc_api.sudo_settings is None
                 *ENV, "DRIVER", "LOG_LEVEL", "ENVIRONMENT", "ONEBOT_ACCESS_TOKEN",
                 "ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_WS_URLS", "ONEBOT_V11_WS_URLS",
                 "MC_SUDO_QQ_IDS", "MC_SUDO_BOT_TOKEN", "MC_SUDO_PLUGIN_TOKEN",
+                "MC_BANLIST_TOKEN",
             }
         }
         env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, PYTHONUTF8="1")

@@ -21,6 +21,7 @@ import notify_client
 import runtime_status
 import status_image
 from app_config import ConfigError
+from banlist_sync import store_upload
 from status_image import HEIGHT, WIDTH, render_status
 
 
@@ -91,6 +92,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(status.disk, runtime_status.ResourceUsage(50*gib, 100*gib, 50))
         self.assertEqual(status.auth_version, 1800000000001)
         self.assertEqual(status.active_bindings, 1)
+        self.assertEqual(status.active_bans, 0)
         self.assertTrue(status.last_reconcile.startswith("OK, 1 revoked"))
         self.assertTrue(status.last_notice.startswith("Accepted"))
         self.assertEqual(status.checked_at.tzinfo, UTC)
@@ -108,7 +110,7 @@ class RuntimeStatusTests(unittest.TestCase):
         ):
             status = runtime_status.collect_status("1", connected=False, connected_for=None)
         for field in ("api", "system_seconds", "memory", "cpu_percent", "connection_seconds",
-                      "auth_version", "active_bindings"):
+                      "auth_version", "active_bindings", "active_bans"):
             self.assertIsNone(getattr(status, field))
         self.assertFalse(status.connected)
         self.assertFalse(status.sqlite_readable)
@@ -118,7 +120,44 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
         nodes = self.rendered_svg(status)
         self.assertEqual(nodes["bindings-count"].text, "—")
+        self.assertEqual(nodes["bans-count"].text, "—")
         self.assertTrue(nodes["system-uptime"].text.endswith("—"))
+
+    def test_status_counts_active_bans_and_warns_under_sqlite_for_unnamed_bans(self):
+        database.init_database(self.path)
+        expiration = 1_850_000_000_000
+        unnamed = "00000000-0000-4000-8000-000000000001"
+        named = "00000000-0000-4000-8000-000000000002"
+        alias = "00000000-0000-4000-8000-000000000003"
+        profiles = {
+            unnamed: {"name": None, "expires_at": expiration},
+            named: {"name": "Alex", "expires_at": None},
+        }
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
+            store_upload(self.path, generation=1, client_id="a" * 32, sequence=1, entries={}, profiles={
+                **profiles, alias: {"name": "Legacy", "expires_at": None},
+            })
+            store_upload(self.path, generation=1, client_id="a" * 32, sequence=2,
+                         entries={"Legacy": None}, profiles=profiles)
+
+        cjk = status_image._font_source(False) is not None
+        warning = "无名 UUID 封禁：1 条" if cjk else "Unnamed UUID bans: 1"
+        for now, count in ((expiration - 1, 1), (expiration, 0)):
+            with (self.subTest(now=now), patch.object(runtime_status, "check_fastapi", return_value=None),
+                  patch.object(runtime_status.time, "time_ns", return_value=now * 1_000_000)):
+                status = runtime_status.collect_status("1", connected=True, connected_for=None)
+                self.assertTrue(status.sqlite_readable)
+                self.assertEqual(status.unnamed_bans, count)
+                self.assertEqual(status.active_bans, 2 + count)
+                nodes = self.rendered_svg(status)
+                self.assertEqual(nodes["bans-count"].text, str(2 + count))
+                node = nodes["unnamed-bans-warning"]
+                self.assertIn(node, nodes["sqlite-link"])
+                box = nodes["sqlite-link"][1]
+                self.assertGreater(int(node.get("y")), int(box.get("y")) + int(box.get("height")))
+                self.assertEqual(node.get("display"), "inline" if count else "none")
+                self.assertEqual(node.text, warning if count else None)
 
     def test_health_returns_http_status_and_targets_only_loopback(self):
         with patch.object(runtime_status, "HTTPConnection") as http:
@@ -315,15 +354,23 @@ class RuntimeStatusTests(unittest.TestCase):
                 nodes = self.rendered_svg(status)
                 self.assertEqual(nodes["system-uptime"].text, f"{expected} · 1m")
 
-    def test_english_dashboard_fits_three_digit_bindings_and_long_host_uptime(self):
+    def test_english_dashboard_fits_metric_cards_warning_and_long_host_uptime(self):
         status = runtime_status.RuntimeStatus(
-            datetime.now(UTC), active_bindings=117, system_seconds=(56 * 24 + 12) * 3600,
+            datetime.now(UTC), active_bindings=117, active_bans=804, unnamed_bans=7,
+            system_seconds=(56 * 24 + 12) * 3600,
         )
         with patch.object(status_image, "_font_source", return_value=None):
             nodes = self.rendered_svg(status)
 
         self.assertEqual(nodes["bindings-label"].text, "Active bindings")
         self.assertEqual(nodes["bindings-count"].text, "117")
+        self.assertEqual(nodes["bans-label"].text, "Ban records")
+        self.assertEqual(nodes["bans-count"].text, "804")
+        self.assertEqual(nodes["bans-label"].get("font-size"), nodes["bindings-label"].get("font-size"))
+        self.assertEqual(nodes["bans-count"].get("font-size"), nodes["bindings-count"].get("font-size"))
+        self.assertEqual(nodes["bans-count"].get("font-weight"), nodes["bindings-count"].get("font-weight"))
+        self.assertEqual(nodes["bans-count"].get("fill"), status_image.RED)
+        self.assertEqual(nodes["unnamed-bans-warning"].text, "Unnamed UUID bans: 7")
         self.assertEqual(nodes["resources-label"].text, "System")
         self.assertEqual(nodes["system-uptime"].text, "Uptime · 56d 12h")
         self.assertEqual(nodes["system-uptime"].get("y"), nodes["resources-label"].get("y"))

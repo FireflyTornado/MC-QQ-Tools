@@ -28,6 +28,12 @@ sync:
   reconnect-min-ms: 1000
   reconnect-max-ms: 30000
 
+banlist-watch:
+  # 启用后监听原版玩家封禁变更。上报地址和 Token 均留空时仅记录本地日志。
+  enabled: false
+  upload-url: ""
+  token: ""
+
 sudo:
   enabled: false
   websocket-url: ""

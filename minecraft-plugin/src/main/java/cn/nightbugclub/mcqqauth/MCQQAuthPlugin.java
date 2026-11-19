@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.Set;
 
 public final class MCQQAuthPlugin extends JavaPlugin {
@@ -29,6 +30,8 @@ public final class MCQQAuthPlugin extends JavaPlugin {
     private AuthorizationModeController modes;
     private AuthorizationListener listener;
     private ObserveNotice observeNotice;
+    private BanListMonitor banListMonitor;
+    private BanListReporter banListReporter;
     private boolean changingMode;
 
     @Override
@@ -68,6 +71,9 @@ public final class MCQQAuthPlugin extends JavaPlugin {
         if (!validMode) {
             return;
         }
+        if (config.getBoolean("banlist-watch.enabled")) {
+            startBanListMonitor(config);
+        }
         PluginSettings settings;
         try {
             settings = PluginSettings.read(config);
@@ -86,6 +92,29 @@ public final class MCQQAuthPlugin extends JavaPlugin {
                 }));
         authorization.start();
         startSudo(config, settings);
+    }
+
+    private void startBanListMonitor(YamlConfiguration config) {
+        try {
+            var settings = BanListReporter.Settings.read(config);
+            if (settings != null) {
+                banListReporter = new BanListReporter(settings, getLogger());
+            }
+        } catch (IllegalArgumentException e) {
+            getLogger().warning("封禁名单上报已关闭：" + e.getMessage());
+        }
+        BanListReporter reporter = banListReporter;
+        try {
+            banListMonitor = new BanListMonitor(this, Path.of("banned-players.json"), Clock.systemUTC(),
+                    reporter == null ? snapshot -> {} : reporter::submit);
+            banListMonitor.start();
+        } catch (IOException | SecurityException | UnsupportedOperationException e) {
+            if (reporter != null) {
+                reporter.close();
+                banListReporter = null;
+            }
+            getLogger().warning("无法监听 banned-players.json：" + e.getMessage());
+        }
     }
 
     private void startSudo(YamlConfiguration config, PluginSettings settings) {
@@ -142,6 +171,14 @@ public final class MCQQAuthPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        if (banListMonitor != null) {
+            banListMonitor.close();
+            banListMonitor = null;
+        }
+        if (banListReporter != null) {
+            banListReporter.close();
+            banListReporter = null;
+        }
         sudoCommands = null;
         if (sudoChannel != null) {
             sudoChannel.close();

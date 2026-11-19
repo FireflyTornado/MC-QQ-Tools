@@ -1,4 +1,3 @@
-import json
 import sqlite3
 import subprocess
 import sys
@@ -87,7 +86,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT * FROM offline_bindings"), [])
         self.assertEqual(
             self.rows("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"),
-            [("auth_state",), ("offline_bindings",), ("server_bans",)],
+            [("auth_state",), ("banlist_state",), ("offline_bindings",), ("server_bans",)],
         )
         self.assertEqual(binding_service.bind_player("group", "qq", "MiXeD"), ("success", "MiXeD"))
         version = self.auth_version()
@@ -338,29 +337,34 @@ class DatabaseTests(unittest.TestCase):
         database.init_database()
         self.assertEqual(self.schema_version(), 2)
         self.assertEqual(self.rows("SELECT * FROM offline_bindings"), before)
-        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42, 0, 0, "", "", "{}", "{}")])
+        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42)])
+        self.assertEqual(self.rows("SELECT * FROM banlist_state"), [(1, 0, "", 0, "")])
         self.assertEqual(self.rows("SELECT * FROM server_bans"), [])
         self.assertEqual(self.rows("PRAGMA integrity_check"), [("ok",)])
         self.notify.assert_not_called()
 
     def test_reopening_version_two_preserves_bans_and_upload_state(self):
         database.init_database()
-        named = {"5627dd98-e6be-3c21-b8a8-e92344183641": "steve"}
-        unnamed = {"00000000-0000-4000-8000-000000000002": None}
-        state = (42, 2, 3, "a" * 32, "b" * 64, json.dumps(named), json.dumps(unnamed))
+        state = (2, "a" * 32, 3, "b" * 64)
+        self.rows("UPDATE auth_state SET version = 42 WHERE id = 1")
         self.rows(
-            "UPDATE auth_state SET version = ?, ban_generation = ?, ban_sequence = ?, ban_client_id = ?, "
-            "ban_digest = ?, ban_profile_names = ?, ban_unnamed_profiles = ? WHERE id = 1",
+            "UPDATE banlist_state SET generation = ?, client_id = ?, sequence = ?, digest = ? WHERE id = 1",
             state,
         )
-        self.rows("INSERT INTO server_bans (mc_name_key, state) VALUES ('steve', 'BANNED')")
+        self.rows("""
+            INSERT INTO server_bans (mc_name_key, profile_uuid, state) VALUES
+                ('steve', NULL, 'BANNED'),
+                ('steve', '5627dd98-e6be-3c21-b8a8-e92344183641', 'KNOWN_PROFILE'),
+                (NULL, '00000000-0000-4000-8000-000000000002', 'BANNED')
+        """)
         bans = self.rows("SELECT * FROM server_bans")
 
         database.init_database()
 
         self.assertEqual(self.schema_version(), 2)
         self.assertEqual(self.rows("SELECT * FROM server_bans"), bans)
-        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, *state)])
+        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42)])
+        self.assertEqual(self.rows("SELECT * FROM banlist_state"), [(1, *state)])
 
     def test_ban_snapshot_moves_binding_and_blocks_name_and_qq(self):
         database.init_database()

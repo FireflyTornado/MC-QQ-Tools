@@ -37,7 +37,7 @@ def _reserved_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tu
     return conn.execute(
         """
         SELECT CASE state WHEN 'BANNED' THEN 'frozen' ELSE 'pending' END, mc_name
-        FROM server_bans WHERE group_id = ? AND qq_id = ?
+        FROM server_bans WHERE profile_uuid IS NULL AND group_id = ? AND qq_id = ?
         """,
         (group_id, qq_id),
     ).fetchone()
@@ -74,7 +74,9 @@ def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | Non
         if reserved:
             return reserved
 
-        ban = conn.execute("SELECT state FROM server_bans WHERE mc_name_key = ?", (name_key,)).fetchone()
+        ban = conn.execute(
+            "SELECT state FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", (name_key,),
+        ).fetchone()
         if ban:
             return ("banned_name" if ban[0] == "BANNED" else "name_taken"), None
         occupied = conn.execute(
@@ -161,7 +163,7 @@ def membership_audit_snapshot(group_id: str, *, only_pending: bool = False) -> M
             for qq_id, mc_name_key, revision in conn.execute(
                 """
                 SELECT qq_id, mc_name_key, revision FROM server_bans
-                WHERE group_id = ? AND state = 'PENDING_MEMBERSHIP_CHECK'
+                WHERE profile_uuid IS NULL AND group_id = ? AND state = 'PENDING_MEMBERSHIP_CHECK'
                 """,
                 (group_id,),
             )
@@ -224,7 +226,7 @@ def _resolve_pending_bindings(
         saved = conn.execute(
             """
             SELECT binding_id, mc_name, bound_at, updated_at FROM server_bans
-            WHERE mc_name_key = ? AND group_id = ? AND qq_id = ?
+            WHERE profile_uuid IS NULL AND mc_name_key = ? AND group_id = ? AND qq_id = ?
               AND state = 'PENDING_MEMBERSHIP_CHECK' AND revision = ?
             """,
             (name_key, group_id, qq_id, revision),
@@ -246,7 +248,7 @@ def _resolve_pending_bindings(
             restored += 1
         else:
             released += 1
-        conn.execute("DELETE FROM server_bans WHERE mc_name_key = ?", (name_key,))
+        conn.execute("DELETE FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", (name_key,))
     return restored, released
 
 

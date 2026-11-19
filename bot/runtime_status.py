@@ -146,17 +146,21 @@ def _binding_status(group_id: str) -> tuple[int, int, int]:
     uri = database.DB_PATH.resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=1)) as connection, connection:
         connection.execute("BEGIN")
-        row = connection.execute("SELECT version, ban_unnamed_profiles FROM auth_state WHERE id = 1").fetchone()
-        if row is None or type(row[0]) is not int or row[0] < 0:
+        version = connection.execute("SELECT version FROM auth_state WHERE id = 1").fetchone()
+        if version is None or type(version[0]) is not int or version[0] < 0:
             raise sqlite3.DatabaseError("Invalid authorization version")
         (count,) = connection.execute(
             "SELECT COUNT(*) FROM offline_bindings WHERE group_id = ? AND status = 'ACTIVE'",
             (group_id,),
         ).fetchone()
-        version, profiles = row
-        now = time.time_ns() // 1_000_000
-        unnamed = database.read_unnamed_ban_profiles(profiles)
-        return version, count, sum(expiration is None or expiration > now for expiration in unnamed.values())
+        (unnamed,) = connection.execute(
+            """
+            SELECT COUNT(*) FROM server_bans WHERE profile_uuid IS NOT NULL AND mc_name_key IS NULL
+              AND state = 'BANNED' AND (expires_at IS NULL OR expires_at > ?)
+            """,
+            (time.time_ns() // 1_000_000,),
+        ).fetchone()
+        return version[0], count, unnamed
 
 
 def _system_name() -> str:

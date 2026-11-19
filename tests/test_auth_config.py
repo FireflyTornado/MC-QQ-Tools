@@ -197,7 +197,6 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         })
         with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM server_bans").fetchone()[0], 0)
-            self.assertEqual(conn.execute("SELECT ban_unnamed_profiles FROM auth_state").fetchone()[0], "{}")
 
     async def test_uuid_only_bans_preserve_known_names_without_blocking_other_bans_and_pardons(self):
         steve = "00000000-0000-4000-8000-000000000001"
@@ -212,10 +211,15 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         mixed = {other: {"name": "Other", "expires_at": None}}
         self.assertEqual((await self.upload_banlist(1, 3, {**entries, "STEVE": None}, profiles=mixed))[0], 200)
         database.init_database(self.api.DB_PATH)
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            saved = conn.execute(
+                "SELECT mc_name_key, state FROM server_bans WHERE profile_uuid = ?", (steve,),
+            ).fetchone()
+            self.assertEqual(saved, ("steve", "KNOWN_PROFILE"))
 
         def states():
             with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
-                return dict(conn.execute("SELECT mc_name_key, state FROM server_bans"))
+                return dict(conn.execute("SELECT mc_name_key, state FROM server_bans WHERE profile_uuid IS NULL"))
 
         profiles = {
             steve: {"name": None, "expires_at": None},
@@ -262,17 +266,50 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
         def stored_profiles():
             with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
-                row = conn.execute("SELECT ban_profile_names, ban_unnamed_profiles FROM auth_state").fetchone()
-                return tuple(map(json.loads, row))
+                return {
+                    uuid: (name, expiration, state)
+                    for uuid, name, expiration, state in conn.execute(
+                        "SELECT profile_uuid, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid IS NOT NULL"
+                    )
+                }
 
         database.init_database(self.api.DB_PATH)
-        self.assertEqual(stored_profiles(), ({}, {steve: expiration, unknown: None}))
+        self.assertEqual(stored_profiles(), {steve: (None, expiration, "BANNED"), unknown: (None, None, "BANNED")})
         # An explicit server name associates the UUID and restores the usual ban behavior.
         self.assertEqual((await self.upload_banlist(1, 3, {}, profiles={
             steve: {"name": "Steve", "expires_at": None},
         }))[0], 200)
-        self.assertEqual(stored_profiles(), ({steve: "steve"}, {}))
+        self.assertEqual(stored_profiles(), {steve: ("steve", None, "BANNED")})
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
+
+    async def test_multiple_profile_bans_share_one_binding_reservation_until_the_last_expires(self):
+        first = "00000000-0000-4000-8000-000000000001"
+        second = "00000000-0000-4000-8000-000000000002"
+        expiration = 1_850_000_000_000
+
+        def reservations():
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return conn.execute(
+                    "SELECT state, expires_at, qq_id FROM server_bans WHERE profile_uuid IS NULL",
+                ).fetchall()
+
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
+            self.assertEqual((await self.upload_banlist(1, 1, {}, profiles={
+                first: {"name": "Steve", "expires_at": expiration - 10_000},
+                second: {"name": "STEVE", "expires_at": expiration},
+            }))[0], 200)
+            self.assertEqual(reservations(), [("BANNED", expiration, "1")])
+
+            remaining = {second: {"name": None, "expires_at": expiration}}
+            self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=remaining))[0], 200)
+            self.assertEqual(reservations(), [("BANNED", expiration, "1")])
+
+            clock.time_ns.return_value = expiration * 1_000_000
+            self.assertEqual((await self.upload_banlist(1, 3, {}, profiles=remaining))[0], 200)
+        self.assertEqual(reservations(), [("PENDING_MEMBERSHIP_CHECK", None, "1")])
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM server_bans WHERE profile_uuid IS NOT NULL").fetchone(), (0,))
 
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):

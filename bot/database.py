@@ -1,4 +1,3 @@
-import json
 import re
 import sqlite3
 import time
@@ -17,15 +16,13 @@ ACTIVE_INDEXES = {
     "idx_offline_active_name": ("mc_name_key",),
 }
 CURRENT_TABLES = {
-    "auth_state": {
+    "auth_state": {"id": "INTEGER", "version": "INTEGER"},
+    "banlist_state": {
         "id": "INTEGER",
-        "version": "INTEGER",
-        "ban_generation": "INTEGER",
-        "ban_sequence": "INTEGER",
-        "ban_client_id": "TEXT",
-        "ban_digest": "TEXT",
-        "ban_profile_names": "TEXT",
-        "ban_unnamed_profiles": "TEXT",
+        "generation": "INTEGER",
+        "client_id": "TEXT",
+        "sequence": "INTEGER",
+        "digest": "TEXT",
     },
     "offline_bindings": {
         "id": "INTEGER",
@@ -38,7 +35,9 @@ CURRENT_TABLES = {
         "updated_at": "INTEGER",
     },
     "server_bans": {
+        "id": "INTEGER",
         "mc_name_key": "TEXT",
+        "profile_uuid": "TEXT",
         "state": "TEXT",
         "expires_at": "INTEGER",
         "binding_id": "INTEGER",
@@ -50,7 +49,9 @@ CURRENT_TABLES = {
         "revision": "INTEGER",
     },
 }
-OPTIONAL_BAN_COLUMNS = {"expires_at", "binding_id", "group_id", "qq_id", "mc_name", "bound_at", "updated_at"}
+OPTIONAL_BAN_COLUMNS = {
+    "mc_name_key", "profile_uuid", "expires_at", "binding_id", "group_id", "qq_id", "mc_name", "bound_at", "updated_at",
+}
 LEGACY_TABLES = {"bindings", "pending_bindings"}
 
 
@@ -80,34 +81,6 @@ def valid_mc_name(name: str) -> bool:
     return bool(NAME_PATTERN.fullmatch(name))
 
 
-def read_ban_profile_names(encoded: str) -> dict[str, str]:
-    try:
-        names = json.loads(encoded)
-    except (ValueError, TypeError) as exc:
-        raise MigrationError("Invalid banlist profile names in auth_state") from exc
-    if not isinstance(names, dict) or any(
-        not PROFILE_UUID_PATTERN.fullmatch(uuid) or not isinstance(name, str)
-        or not valid_mc_name(name) or name != name.lower()
-        for uuid, name in names.items()
-    ):
-        raise MigrationError("Invalid banlist profile names in auth_state")
-    return names
-
-
-def read_unnamed_ban_profiles(encoded: str) -> dict[str, int | None]:
-    try:
-        profiles = json.loads(encoded)
-    except (ValueError, TypeError) as exc:
-        raise MigrationError("Invalid unnamed ban profiles in auth_state") from exc
-    if not isinstance(profiles, dict) or any(
-        not PROFILE_UUID_PATTERN.fullmatch(uuid)
-        or (expiration is not None and (type(expiration) is not int or not 0 <= expiration <= MAX_AUTH_VERSION))
-        for uuid, expiration in profiles.items()
-    ):
-        raise MigrationError("Invalid unnamed ban profiles in auth_state")
-    return profiles
-
-
 def _apply_migration(conn: sqlite3.Connection, filename: str) -> None:
     # executescript() can commit the open transaction before applying DDL.
     statement = ""
@@ -123,18 +96,17 @@ def _apply_migration(conn: sqlite3.Connection, filename: str) -> None:
 def _validate_table(conn: sqlite3.Connection, table: str) -> None:
     columns = conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
     types = {name.lower(): kind.upper() for _, name, kind, *_ in columns}
-    primary_key = "mc_name_key" if table == "server_bans" else "id"
     optional = OPTIONAL_BAN_COLUMNS if table == "server_bans" else set()
     if types != CURRENT_TABLES[table] or any(
-        hidden or pk != (name.lower() == primary_key)
-        or ((not pk or table == "server_bans") and bool(required) != (name.lower() not in optional))
+        hidden or pk != (name.lower() == "id")
+        or (not pk and bool(required) != (name.lower() not in optional))
         for _, name, _, required, _, pk, hidden in columns
     ):
         raise MigrationError(f"Incompatible columns or primary key in {table}")
 
     # An INTEGER PRIMARY KEY must alias the rowid, since inserts omit the ID.
     indexes = conn.execute(f"PRAGMA index_list({table})").fetchall()
-    if table != "server_bans" and any(origin == "pk" for _, _, _, origin, _ in indexes):
+    if any(origin == "pk" for _, _, _, origin, _ in indexes):
         raise MigrationError(f"{table}.id must be an INTEGER PRIMARY KEY that aliases rowid")
 
     trigger = conn.execute(
@@ -148,17 +120,27 @@ def _validate_table(conn: sqlite3.Connection, table: str) -> None:
 def _validate_server_bans(conn: sqlite3.Connection) -> None:
     unique_keys = set()
     for _, name, unique, _, partial in conn.execute("PRAGMA index_list(server_bans)"):
-        if unique and not partial:
-            unique_keys.add(tuple(conn.execute(
-                "SELECT name, coll FROM pragma_index_xinfo(?) WHERE key ORDER BY seqno", (name,)
-            )))
-    if unique_keys != {(("mc_name_key", "BINARY"),), (("group_id", "BINARY"), ("qq_id", "BINARY"))}:
-        raise MigrationError("server_bans must uniquely reserve the game name and the bound QQ")
+        if not unique:
+            continue
+        columns = tuple(conn.execute("SELECT name, coll FROM pragma_index_xinfo(?) WHERE key ORDER BY seqno", (name,)))
+        if partial:
+            sql = conn.execute("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?", (name,)).fetchone()
+            predicate = re.search(r"\bwhere\s+profile_uuid\s+is\s+null\s*$", sql[0] or "", re.IGNORECASE) if sql else None
+            if predicate is None:
+                raise MigrationError("Incompatible server_bans partial unique index")
+        unique_keys.add((bool(partial), columns))
+    if unique_keys != {
+        (True, (("mc_name_key", "BINARY"),)),
+        (False, (("profile_uuid", "BINARY"),)),
+        (False, (("group_id", "BINARY"), ("qq_id", "BINARY"))),
+    }:
+        raise MigrationError("server_bans must uniquely reserve the game name, UUID and bound QQ")
 
     overlap = conn.execute("""
         SELECT 1 FROM offline_bindings AS binding
-        JOIN server_bans AS ban ON ban.mc_name_key = binding.mc_name_key
-            OR (ban.group_id = binding.group_id AND ban.qq_id = binding.qq_id)
+        JOIN server_bans AS ban ON ban.profile_uuid IS NULL
+            AND (ban.mc_name_key = binding.mc_name_key
+                OR (ban.group_id = binding.group_id AND ban.qq_id = binding.qq_id))
         WHERE binding.status = 'ACTIVE' LIMIT 1
         """).fetchone()
     if overlap:
@@ -166,22 +148,22 @@ def _validate_server_bans(conn: sqlite3.Connection) -> None:
 
 
 def _validate_auth_state(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        "SELECT id, version, ban_generation, ban_sequence, ban_client_id, ban_digest, "
-        "ban_profile_names, ban_unnamed_profiles "
-        "FROM auth_state LIMIT 2"
-    ).fetchall()
+    rows = conn.execute("SELECT id, version FROM auth_state LIMIT 2").fetchall()
     if len(rows) != 1 or rows[0][0] != 1:
         raise MigrationError("auth_state must contain exactly one row with id = 1")
     version = rows[0][1]
     if not isinstance(version, int) or not 0 <= version < MAX_AUTH_VERSION:
         raise MigrationError("auth_state.version must be a nonnegative integer with room to increment")
-    generation, sequence, client_id, digest, profile_names, unnamed_profiles = rows[0][2:]
-    known_names = read_ban_profile_names(profile_names)
-    unnamed = read_unnamed_ban_profiles(unnamed_profiles)
-    if known_names.keys() & unnamed.keys():
-        raise MigrationError("A ban profile cannot be both named and unnamed")
-    if (generation, sequence, client_id, digest) == (0, 0, "", "") and not known_names and not unnamed:
+
+
+def _validate_banlist_state(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT id, generation, sequence, client_id, digest FROM banlist_state LIMIT 2").fetchall()
+    if len(rows) != 1 or rows[0][0] != 1:
+        raise MigrationError("banlist_state must contain exactly one row with id = 1")
+    _, generation, sequence, client_id, digest = rows[0]
+    if (generation, sequence, client_id, digest) == (0, 0, "", ""):
+        if conn.execute("SELECT 1 FROM server_bans WHERE profile_uuid IS NOT NULL LIMIT 1").fetchone():
+            raise MigrationError("Ban profiles exist without an upload cursor")
         return
     if (type(generation) is not int or not 0 < generation <= MAX_AUTH_VERSION
             or type(sequence) is not int or not 0 < sequence <= MAX_AUTH_VERSION
@@ -279,6 +261,7 @@ def init_database(db_path: Path | None = None) -> None:
         for table in CURRENT_TABLES:
             _validate_table(conn, table)
         _validate_auth_state(conn)
+        _validate_banlist_state(conn)
         _validate_offline_bindings(conn)
         _validate_server_bans(conn)
 

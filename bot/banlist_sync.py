@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import TypedDict
 
-from database import MAX_AUTH_VERSION, PROFILE_UUID_PATTERN, read_ban_profile_names, update_auth_version, valid_mc_name
+from database import MAX_AUTH_VERSION, PROFILE_UUID_PATTERN, update_auth_version, valid_mc_name
 
 
 class UploadConflict(Exception):
@@ -21,6 +21,9 @@ class GenerationClaimed(UploadConflict):
 class ReportedProfile(TypedDict):
     name: str | None
     expires_at: int | None
+
+
+ProfileRow = tuple[str | None, int | None, str]
 
 
 def read_generation(path: Path) -> int:
@@ -38,7 +41,7 @@ def store_upload(
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
     with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True, timeout=5)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
-        old_generation, old_client_id, old_sequence, previous_digest, old_names = _read_cursor(conn)
+        old_generation, old_client_id, old_sequence, previous_digest = _read_cursor(conn)
         if generation == old_generation:
             if client_id != old_client_id:
                 if sequence == 1:
@@ -51,27 +54,29 @@ def store_upload(
         elif generation != old_generation + 1 or sequence != 1 or client_id == old_client_id:
             raise UploadConflict
 
-        active, names, unnamed = _effective_report(bans, normalized_profiles, read_ban_profile_names(old_names))
+        old_profiles = {
+            uuid: (name, expiration, state)
+            for uuid, name, expiration, state in conn.execute(
+                "SELECT profile_uuid, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid IS NOT NULL"
+            )
+        }
+        old_names = {uuid: name for uuid, (name, _, _) in old_profiles.items() if name is not None}
+        active, profile_rows = _effective_report(bans, normalized_profiles, old_names)
         frozen = apply_normalized_bans(conn, active)
+        _store_profiles(conn, old_profiles, profile_rows)
         conn.execute(
-            """
-            UPDATE auth_state SET ban_generation = ?, ban_client_id = ?, ban_sequence = ?, ban_digest = ?,
-                ban_profile_names = ?, ban_unnamed_profiles = ?
-            WHERE id = 1
-            """,
-            (generation, client_id, sequence, digest,
-             json.dumps(names, sort_keys=True), json.dumps(unnamed, sort_keys=True)),
+            "UPDATE banlist_state SET generation = ?, client_id = ?, sequence = ?, digest = ? WHERE id = 1",
+            (generation, client_id, sequence, digest),
         )
         return frozen
 
 
-def _read_cursor(conn: sqlite3.Connection) -> tuple[int, str, int, str, str]:
+def _read_cursor(conn: sqlite3.Connection) -> tuple[int, str, int, str]:
     row = conn.execute(
-        "SELECT ban_generation, ban_client_id, ban_sequence, ban_digest, ban_profile_names "
-        "FROM auth_state WHERE id = 1"
+        "SELECT generation, client_id, sequence, digest FROM banlist_state WHERE id = 1"
     ).fetchone()
     if row is None:
-        raise sqlite3.IntegrityError("Missing authorization state")
+        raise sqlite3.IntegrityError("Missing banlist state")
     return row
 
 
@@ -115,22 +120,36 @@ def _effective_report(
     entries: dict[str, int | None],
     profiles: dict[str, tuple[str | None, int | None]] | None,
     old_names: dict[str, str],
-) -> tuple[dict[str, int | None], dict[str, str], dict[str, int | None]]:
+) -> tuple[dict[str, int | None], dict[str, ProfileRow]]:
     # Sample after acquiring the SQLite write lock. The digest still describes the unfiltered report.
     now = time.time_ns() // 1_000_000
     active = {name: expiration for name, expiration in entries.items() if expiration is None or expiration > now}
-    names = {uuid: name for uuid, name in old_names.items() if name in active}
-    unnamed: dict[str, int | None] = {}
+    profile_rows: dict[str, ProfileRow] = {
+        uuid: (name, None, "KNOWN_PROFILE") for uuid, name in old_names.items() if name in active
+    }
     for uuid, (reported_name, expiration) in (profiles or {}).items():
         if expiration is not None and expiration <= now:
             continue
         name = reported_name if reported_name is not None else old_names.get(uuid)
-        if name is None:
-            unnamed[uuid] = expiration
-            continue
-        names[uuid] = name
-        _merge_ban(active, name, expiration)
-    return active, names, unnamed
+        profile_rows[uuid] = (name, expiration, "BANNED")
+        if name is not None:
+            _merge_ban(active, name, expiration)
+    return active, profile_rows
+
+
+def _store_profiles(
+    conn: sqlite3.Connection, old_profiles: dict[str, ProfileRow], profiles: dict[str, ProfileRow],
+) -> None:
+    removed = old_profiles.keys() - profiles.keys()
+    conn.executemany("DELETE FROM server_bans WHERE profile_uuid = ?", ((uuid,) for uuid in removed))
+    conn.executemany(
+        """
+        INSERT INTO server_bans (profile_uuid, mc_name_key, expires_at, state) VALUES (?, ?, ?, ?)
+        ON CONFLICT(profile_uuid) DO UPDATE SET mc_name_key = excluded.mc_name_key,
+            expires_at = excluded.expires_at, state = excluded.state
+        """,
+        ((uuid, *profile) for uuid, profile in profiles.items() if old_profiles.get(uuid) != profile),
+    )
 
 
 def apply_normalized_bans(conn: sqlite3.Connection, bans: dict[str, int | None]) -> int:
@@ -139,7 +158,7 @@ def apply_normalized_bans(conn: sqlite3.Connection, bans: dict[str, int | None])
     existing = {
         name: (state, expiration, binding_id)
         for name, state, expiration, binding_id in conn.execute(
-            "SELECT mc_name_key, state, expires_at, binding_id FROM server_bans"
+            "SELECT mc_name_key, state, expires_at, binding_id FROM server_bans WHERE profile_uuid IS NULL"
         )
     }
     for name, expiration in bans.items():
@@ -162,7 +181,7 @@ def apply_normalized_bans(conn: sqlite3.Connection, bans: dict[str, int | None])
             conn.execute(
                 """
                 UPDATE server_bans SET revision = revision + (state != 'BANNED'),
-                    state = 'BANNED', expires_at = ? WHERE mc_name_key = ?
+                    state = 'BANNED', expires_at = ? WHERE profile_uuid IS NULL AND mc_name_key = ?
                 """,
                 (expiration, name),
             )
@@ -171,12 +190,12 @@ def apply_normalized_bans(conn: sqlite3.Connection, bans: dict[str, int | None])
         if state != "BANNED":
             continue
         if binding_id is None:
-            conn.execute("DELETE FROM server_bans WHERE mc_name_key = ?", (name,))
+            conn.execute("DELETE FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", (name,))
         else:
             conn.execute(
                 """
                 UPDATE server_bans SET state = 'PENDING_MEMBERSHIP_CHECK', expires_at = NULL,
-                    revision = revision + 1 WHERE mc_name_key = ?
+                    revision = revision + 1 WHERE profile_uuid IS NULL AND mc_name_key = ?
                 """,
                 (name,),
             )

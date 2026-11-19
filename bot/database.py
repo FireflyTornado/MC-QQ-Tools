@@ -40,18 +40,21 @@ CURRENT_TABLES = {
         "profile_uuid": "TEXT",
         "state": "TEXT",
         "expires_at": "INTEGER",
+    },
+    "frozen_bindings": {
+        "id": "INTEGER",
         "binding_id": "INTEGER",
         "group_id": "TEXT",
         "qq_id": "TEXT",
         "mc_name": "TEXT",
+        "mc_name_key": "TEXT",
         "bound_at": "INTEGER",
         "updated_at": "INTEGER",
+        "state": "TEXT",
         "revision": "INTEGER",
     },
 }
-OPTIONAL_BAN_COLUMNS = {
-    "mc_name_key", "profile_uuid", "expires_at", "binding_id", "group_id", "qq_id", "mc_name", "bound_at", "updated_at",
-}
+OPTIONAL_BAN_COLUMNS = {"mc_name_key", "profile_uuid", "expires_at"}
 LEGACY_TABLES = {"bindings", "pending_bindings"}
 
 
@@ -117,34 +120,41 @@ def _validate_table(conn: sqlite3.Connection, table: str) -> None:
         raise MigrationError(f"Unexpected trigger on {table}")
 
 
-def _validate_server_bans(conn: sqlite3.Connection) -> None:
+def _ban_unique_keys(conn: sqlite3.Connection, table: str) -> set[tuple[bool, tuple[tuple[str, str], ...]]]:
     unique_keys = set()
-    for _, name, unique, _, partial in conn.execute("PRAGMA index_list(server_bans)"):
-        if not unique:
-            continue
+    for name, partial in conn.execute('SELECT name, partial FROM pragma_index_list(?) WHERE "unique"', (table,)):
         columns = tuple(conn.execute("SELECT name, coll FROM pragma_index_xinfo(?) WHERE key ORDER BY seqno", (name,)))
         if partial:
             sql = conn.execute("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?", (name,)).fetchone()
             predicate = re.search(r"\bwhere\s+profile_uuid\s+is\s+null\s*$", sql[0] or "", re.IGNORECASE) if sql else None
             if predicate is None:
-                raise MigrationError("Incompatible server_bans partial unique index")
+                raise MigrationError(f"Incompatible {table} partial unique index")
         unique_keys.add((bool(partial), columns))
-    if unique_keys != {
+    return unique_keys
+
+
+def _validate_ban_tables(conn: sqlite3.Connection) -> None:
+    if _ban_unique_keys(conn, "server_bans") != {
         (True, (("mc_name_key", "BINARY"),)),
         (False, (("profile_uuid", "BINARY"),)),
+    }:
+        raise MigrationError("server_bans must uniquely identify name-only bans and UUID bans")
+    if _ban_unique_keys(conn, "frozen_bindings") != {
+        (False, (("mc_name_key", "BINARY"),)),
         (False, (("group_id", "BINARY"), ("qq_id", "BINARY"))),
     }:
-        raise MigrationError("server_bans must uniquely reserve the game name, UUID and bound QQ")
+        raise MigrationError("frozen_bindings must uniquely reserve the game name and bound QQ")
 
     overlap = conn.execute("""
         SELECT 1 FROM offline_bindings AS binding
-        JOIN server_bans AS ban ON ban.profile_uuid IS NULL
-            AND (ban.mc_name_key = binding.mc_name_key
-                OR (ban.group_id = binding.group_id AND ban.qq_id = binding.qq_id))
-        WHERE binding.status = 'ACTIVE' LIMIT 1
+        WHERE binding.status = 'ACTIVE' AND (
+            EXISTS (SELECT 1 FROM frozen_bindings AS frozen WHERE frozen.mc_name_key = binding.mc_name_key
+                OR (frozen.group_id = binding.group_id AND frozen.qq_id = binding.qq_id))
+            OR EXISTS (SELECT 1 FROM server_bans AS ban WHERE ban.state = 'BANNED' AND ban.mc_name_key = binding.mc_name_key)
+        ) LIMIT 1
         """).fetchone()
     if overlap:
-        raise MigrationError("An active binding overlaps a server_bans reservation")
+        raise MigrationError("An active binding overlaps a ban or a frozen binding")
 
 
 def _validate_auth_state(conn: sqlite3.Connection) -> None:
@@ -169,7 +179,7 @@ def _validate_banlist_state(conn: sqlite3.Connection) -> None:
             or type(sequence) is not int or not 0 < sequence <= MAX_AUTH_VERSION
             or not isinstance(client_id, str) or not re.fullmatch(r"[0-9a-f]{32}", client_id)
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
-        raise MigrationError("Invalid banlist upload cursor in auth_state")
+        raise MigrationError("Invalid banlist upload cursor in banlist_state")
 
 
 def _validate_offline_bindings(conn: sqlite3.Connection) -> None:
@@ -263,7 +273,7 @@ def init_database(db_path: Path | None = None) -> None:
         _validate_auth_state(conn)
         _validate_banlist_state(conn)
         _validate_offline_bindings(conn)
-        _validate_server_bans(conn)
+        _validate_ban_tables(conn)
 
         if version < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

@@ -23,31 +23,30 @@ CREATE TABLE server_bans (
         AND replace(profile_uuid, '-', '') NOT GLOB '*[^0-9a-f]*'
         AND instr(profile_uuid, char(0)) = 0
     )),
-    state TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('BANNED', 'KNOWN_PROFILE')),
     expires_at INTEGER CHECK (expires_at IS NULL OR (typeof(expires_at) = 'integer' AND expires_at >= 0)),
-    binding_id INTEGER,
-    group_id TEXT,
-    qq_id TEXT,
-    mc_name TEXT,
-    bound_at INTEGER,
-    updated_at INTEGER,
-    revision INTEGER NOT NULL DEFAULT 1 CHECK (typeof(revision) = 'integer' AND revision > 0),
-    UNIQUE (group_id, qq_id),
-    CHECK (
-        (profile_uuid IS NULL AND mc_name_key IS NOT NULL AND (
-            state = 'BANNED' OR (state = 'PENDING_MEMBERSHIP_CHECK' AND binding_id IS NOT NULL AND expires_at IS NULL)
-        ))
-        OR (profile_uuid IS NOT NULL AND binding_id IS NULL AND (
-            state = 'BANNED' OR (state = 'KNOWN_PROFILE' AND mc_name_key IS NOT NULL AND expires_at IS NULL)
-        ))
-    ),
-    CHECK (
-        (binding_id IS NULL AND group_id IS NULL AND qq_id IS NULL
-            AND mc_name IS NULL AND bound_at IS NULL AND updated_at IS NULL)
-        OR (typeof(binding_id) = 'integer' AND typeof(group_id) = 'text' AND typeof(qq_id) = 'text'
-            AND typeof(mc_name) = 'text' AND lower(mc_name) = mc_name_key AND instr(mc_name, char(0)) = 0
-            AND typeof(bound_at) = 'integer' AND typeof(updated_at) = 'integer')
-    )
+    CHECK (profile_uuid IS NOT NULL OR mc_name_key IS NOT NULL),
+    CHECK (state = 'BANNED' OR (profile_uuid IS NOT NULL AND mc_name_key IS NOT NULL AND expires_at IS NULL))
 );
 
 CREATE UNIQUE INDEX idx_server_bans_name ON server_bans(mc_name_key) WHERE profile_uuid IS NULL;
+CREATE INDEX idx_server_bans_active_name ON server_bans(mc_name_key) WHERE state = 'BANNED';
+
+CREATE TABLE frozen_bindings (
+    id INTEGER PRIMARY KEY,
+    binding_id INTEGER NOT NULL CHECK (typeof(binding_id) = 'integer'),
+    group_id TEXT NOT NULL,
+    qq_id TEXT NOT NULL,
+    mc_name TEXT NOT NULL,
+    mc_name_key TEXT NOT NULL UNIQUE CHECK (
+        length(mc_name_key) BETWEEN 1 AND 16
+        AND mc_name_key NOT GLOB '*[^a-z0-9_]*'
+        AND instr(mc_name_key, char(0)) = 0
+        AND lower(mc_name) = mc_name_key
+    ),
+    bound_at INTEGER NOT NULL CHECK (typeof(bound_at) = 'integer'),
+    updated_at INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer'),
+    state TEXT NOT NULL CHECK (state IN ('FROZEN', 'PENDING_MEMBERSHIP_CHECK')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (typeof(revision) = 'integer' AND revision > 0),
+    UNIQUE (group_id, qq_id)
+);

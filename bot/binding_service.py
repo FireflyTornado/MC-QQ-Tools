@@ -36,8 +36,8 @@ def _active_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tupl
 def _reserved_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[str, str] | None:
     return conn.execute(
         """
-        SELECT CASE state WHEN 'BANNED' THEN 'frozen' ELSE 'pending' END, mc_name
-        FROM server_bans WHERE profile_uuid IS NULL AND group_id = ? AND qq_id = ?
+        SELECT CASE state WHEN 'FROZEN' THEN 'frozen' ELSE 'pending' END, mc_name
+        FROM frozen_bindings WHERE group_id = ? AND qq_id = ?
         """,
         (group_id, qq_id),
     ).fetchone()
@@ -75,12 +75,16 @@ def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | Non
             return reserved
 
         ban = conn.execute(
-            "SELECT state FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", (name_key,),
+            "SELECT 1 FROM server_bans WHERE state = 'BANNED' AND mc_name_key = ? LIMIT 1", (name_key,),
         ).fetchone()
         if ban:
-            return ("banned_name" if ban[0] == "BANNED" else "name_taken"), None
+            return "banned_name", None
         occupied = conn.execute(
-            "SELECT 1 FROM offline_bindings WHERE mc_name_key = ? AND status = 'ACTIVE'", (name_key,),
+            """
+            SELECT 1 FROM offline_bindings WHERE mc_name_key = ? AND status = 'ACTIVE'
+            UNION ALL SELECT 1 FROM frozen_bindings WHERE mc_name_key = ? LIMIT 1
+            """,
+            (name_key, name_key),
         ).fetchone()
         if occupied:
             return "name_taken", None
@@ -162,8 +166,8 @@ def membership_audit_snapshot(group_id: str, *, only_pending: bool = False) -> M
             qq_id: (mc_name_key, revision)
             for qq_id, mc_name_key, revision in conn.execute(
                 """
-                SELECT qq_id, mc_name_key, revision FROM server_bans
-                WHERE profile_uuid IS NULL AND group_id = ? AND state = 'PENDING_MEMBERSHIP_CHECK'
+                SELECT qq_id, mc_name_key, revision FROM frozen_bindings
+                WHERE group_id = ? AND state = 'PENDING_MEMBERSHIP_CHECK'
                 """,
                 (group_id,),
             )
@@ -225,8 +229,8 @@ def _resolve_pending_bindings(
     for qq_id, (name_key, revision) in pending.items():
         saved = conn.execute(
             """
-            SELECT binding_id, mc_name, bound_at, updated_at FROM server_bans
-            WHERE profile_uuid IS NULL AND mc_name_key = ? AND group_id = ? AND qq_id = ?
+            SELECT binding_id, mc_name, bound_at, updated_at FROM frozen_bindings
+            WHERE mc_name_key = ? AND group_id = ? AND qq_id = ?
               AND state = 'PENDING_MEMBERSHIP_CHECK' AND revision = ?
             """,
             (name_key, group_id, qq_id, revision),
@@ -248,7 +252,7 @@ def _resolve_pending_bindings(
             restored += 1
         else:
             released += 1
-        conn.execute("DELETE FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", (name_key,))
+        conn.execute("DELETE FROM frozen_bindings WHERE mc_name_key = ?", (name_key,))
     return restored, released
 
 

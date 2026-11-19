@@ -220,7 +220,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
         def states():
             with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
-                return dict(conn.execute("SELECT mc_name_key, state FROM server_bans WHERE profile_uuid IS NULL"))
+                return dict(conn.execute("SELECT mc_name_key, state FROM frozen_bindings"))
 
         profiles = {
             steve: {"name": None, "expires_at": None},
@@ -230,8 +230,12 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         replacement = "b" * 32
         self.assertEqual((await self.upload_banlist(2, 1, {}, replacement, profiles=profiles))[0], 200)
         self.assertEqual(states(), {
-            "steve": "BANNED", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED",
+            "steve": "FROZEN", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "FROZEN",
         })
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            self.assertEqual(set(conn.execute("SELECT profile_uuid, mc_name_key, state FROM server_bans")), {
+                (steve, "steve", "BANNED"), (unknown, None, "BANNED"), (other, "other", "BANNED"),
+            })
         with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
               patch.object(binding_service, "notify_auth_updated")):
             audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
@@ -240,7 +244,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
         del profiles[steve]
         self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
-        self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED"})
+        self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "FROZEN"})
 
     async def test_known_uuid_is_enriched_in_place_without_an_unnamed_warning(self):
         known = "00000000-0000-4000-8000-000000000001"
@@ -328,9 +332,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
         def reservations():
             with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
-                return conn.execute(
-                    "SELECT state, expires_at, qq_id FROM server_bans WHERE profile_uuid IS NULL",
-                ).fetchall()
+                return conn.execute("SELECT state, qq_id FROM frozen_bindings").fetchall()
 
         with patch("banlist_sync.time") as clock:
             clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
@@ -338,17 +340,21 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 first: {"name": "Steve", "expires_at": expiration - 10_000},
                 second: {"name": "STEVE", "expires_at": expiration},
             }))[0], 200)
-            self.assertEqual(reservations(), [("BANNED", expiration, "1")])
+            self.assertEqual(reservations(), [("FROZEN", "1")])
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                self.assertEqual(set(conn.execute("SELECT profile_uuid, mc_name_key, expires_at FROM server_bans")), {
+                    (first, "steve", expiration - 10_000), (second, "steve", expiration),
+                })
 
             remaining = {second: {"name": None, "expires_at": expiration}}
             self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=remaining))[0], 200)
-            self.assertEqual(reservations(), [("BANNED", expiration, "1")])
+            self.assertEqual(reservations(), [("FROZEN", "1")])
 
             clock.time_ns.return_value = expiration * 1_000_000
             self.assertEqual((await self.upload_banlist(1, 3, {}, profiles=remaining))[0], 200)
-        self.assertEqual(reservations(), [("PENDING_MEMBERSHIP_CHECK", None, "1")])
+        self.assertEqual(reservations(), [("PENDING_MEMBERSHIP_CHECK", "1")])
         with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM server_bans WHERE profile_uuid IS NOT NULL").fetchone(), (0,))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM server_bans").fetchone(), (0,))
 
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):

@@ -54,16 +54,14 @@ def store_upload(
         elif generation != old_generation + 1 or sequence != 1 or client_id == old_client_id:
             raise UploadConflict
 
-        old_profiles = {
-            uuid: (name, expiration, state)
-            for uuid, name, expiration, state in conn.execute(
-                "SELECT profile_uuid, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid IS NOT NULL"
-            )
+        # Filter under the write lock. The digest still describes the unfiltered report.
+        now = time.time_ns() // 1_000_000
+        active_entries = {name: expiration for name, expiration in bans.items() if expiration is None or expiration > now}
+        active_profiles = {
+            uuid: (name, expiration) for uuid, (name, expiration) in (normalized_profiles or {}).items()
+            if expiration is None or expiration > now
         }
-        old_names = {uuid: name for uuid, (name, _, _) in old_profiles.items() if name is not None}
-        active, profile_rows = _effective_report(bans, normalized_profiles, old_names)
-        frozen = apply_normalized_bans(conn, active)
-        _store_profiles(conn, old_profiles, profile_rows)
+        frozen = apply_normalized_bans(conn, active_entries, active_profiles)
         conn.execute(
             "UPDATE banlist_state SET generation = ?, client_id = ?, sequence = ?, digest = ? WHERE id = 1",
             (generation, client_id, sequence, digest),
@@ -116,25 +114,31 @@ def _merge_ban(bans: dict[str, int | None], name: str, expiration: int | None) -
     bans[name] = expiration
 
 
-def _effective_report(
+def _resolve_profiles(
     entries: dict[str, int | None],
     profiles: dict[str, tuple[str | None, int | None]] | None,
     old_names: dict[str, str],
-) -> tuple[dict[str, int | None], dict[str, ProfileRow]]:
-    # Sample after acquiring the SQLite write lock. The digest still describes the unfiltered report.
-    now = time.time_ns() // 1_000_000
-    active = {name: expiration for name, expiration in entries.items() if expiration is None or expiration > now}
+) -> dict[str, ProfileRow]:
     profile_rows: dict[str, ProfileRow] = {
-        uuid: (name, None, "KNOWN_PROFILE") for uuid, name in old_names.items() if name in active
+        uuid: (name, None, "KNOWN_PROFILE") for uuid, name in old_names.items() if name in entries
     }
     for uuid, (reported_name, expiration) in (profiles or {}).items():
-        if expiration is not None and expiration <= now:
-            continue
         name = reported_name if reported_name is not None else old_names.get(uuid)
         profile_rows[uuid] = (name, expiration, "BANNED")
-        if name is not None:
-            _merge_ban(active, name, expiration)
-    return active, profile_rows
+    return profile_rows
+
+
+def _store_name_bans(conn: sqlite3.Connection, entries: dict[str, int | None]) -> None:
+    old_entries = dict(conn.execute("SELECT mc_name_key, expires_at FROM server_bans WHERE profile_uuid IS NULL"))
+    removed = old_entries.keys() - entries.keys()
+    conn.executemany("DELETE FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", ((name,) for name in removed))
+    conn.executemany(
+        """
+        INSERT INTO server_bans (mc_name_key, expires_at, state) VALUES (?, ?, 'BANNED')
+        ON CONFLICT(mc_name_key) WHERE profile_uuid IS NULL DO UPDATE SET expires_at = excluded.expires_at
+        """,
+        ((name, expiration) for name, expiration in entries.items() if name not in old_entries or old_entries[name] != expiration),
+    )
 
 
 def _store_profiles(
@@ -152,53 +156,52 @@ def _store_profiles(
     )
 
 
-def apply_normalized_bans(conn: sqlite3.Connection, bans: dict[str, int | None]) -> int:
-    """Apply a normalized banlist inside the caller's SQLite write transaction."""
-    frozen_count = 0
-    existing = {
-        name: (state, expiration, binding_id)
-        for name, state, expiration, binding_id in conn.execute(
-            "SELECT mc_name_key, state, expires_at, binding_id FROM server_bans WHERE profile_uuid IS NULL"
+def apply_normalized_bans(
+    conn: sqlite3.Connection, entries: dict[str, int | None],
+    profiles: dict[str, tuple[str | None, int | None]] | None = None,
+) -> int:
+    """Apply an effective snapshot and its binding changes in the caller's write transaction."""
+    old_profiles = {
+        uuid: (name, expiration, state)
+        for uuid, name, expiration, state in conn.execute(
+            "SELECT profile_uuid, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid IS NOT NULL"
         )
     }
-    for name, expiration in bans.items():
-        old = existing.get(name)
-        if old is None:
-            conn.execute(
-                """
-                INSERT INTO server_bans (mc_name_key, state, expires_at,
-                    binding_id, group_id, qq_id, mc_name, bound_at, updated_at)
-                SELECT ?, 'BANNED', ?, id, group_id, qq_id, mc_name, bound_at, updated_at
-                FROM (SELECT 1)
-                LEFT JOIN offline_bindings ON mc_name_key = ? AND status = 'ACTIVE'
-                """,
-                (name, expiration, name),
-            )
-            frozen_count += conn.execute(
-                "DELETE FROM offline_bindings WHERE mc_name_key = ? AND status = 'ACTIVE'", (name,),
-            ).rowcount
-        elif old[:2] != ("BANNED", expiration):
-            conn.execute(
-                """
-                UPDATE server_bans SET revision = revision + (state != 'BANNED'),
-                    state = 'BANNED', expires_at = ? WHERE profile_uuid IS NULL AND mc_name_key = ?
-                """,
-                (expiration, name),
-            )
-    for name in existing.keys() - bans.keys():
-        state, _, binding_id = existing[name]
-        if state != "BANNED":
-            continue
-        if binding_id is None:
-            conn.execute("DELETE FROM server_bans WHERE profile_uuid IS NULL AND mc_name_key = ?", (name,))
-        else:
-            conn.execute(
-                """
-                UPDATE server_bans SET state = 'PENDING_MEMBERSHIP_CHECK', expires_at = NULL,
-                    revision = revision + 1 WHERE profile_uuid IS NULL AND mc_name_key = ?
-                """,
-                (name,),
-            )
+    old_names = {uuid: name for uuid, (name, _, _) in old_profiles.items() if name is not None}
+    profile_rows = _resolve_profiles(entries, profiles, old_names)
+    _store_name_bans(conn, entries)
+    _store_profiles(conn, old_profiles, profile_rows)
+    return _sync_frozen_bindings(conn)
+
+
+def _sync_frozen_bindings(conn: sqlite3.Connection) -> int:
+    frozen_count = conn.execute("""
+        INSERT INTO frozen_bindings (binding_id, group_id, qq_id, mc_name, mc_name_key, bound_at, updated_at, state)
+        SELECT id, group_id, qq_id, mc_name, mc_name_key, bound_at, updated_at, 'FROZEN'
+        FROM offline_bindings AS binding
+        WHERE binding.status = 'ACTIVE' AND EXISTS (
+            SELECT 1 FROM server_bans AS ban WHERE ban.state = 'BANNED' AND ban.mc_name_key = binding.mc_name_key
+        )
+    """).rowcount
     if frozen_count:
+        conn.execute("""
+            DELETE FROM offline_bindings AS binding
+            WHERE binding.status = 'ACTIVE' AND EXISTS (
+                SELECT 1 FROM server_bans AS ban WHERE ban.state = 'BANNED' AND ban.mc_name_key = binding.mc_name_key
+            )
+        """)
         update_auth_version(conn)
+
+    conn.execute("""
+        UPDATE frozen_bindings AS binding SET state = 'FROZEN', revision = revision + 1
+        WHERE binding.state = 'PENDING_MEMBERSHIP_CHECK' AND EXISTS (
+            SELECT 1 FROM server_bans AS ban WHERE ban.state = 'BANNED' AND ban.mc_name_key = binding.mc_name_key
+        )
+    """)
+    conn.execute("""
+        UPDATE frozen_bindings AS binding SET state = 'PENDING_MEMBERSHIP_CHECK', revision = revision + 1
+        WHERE binding.state = 'FROZEN' AND NOT EXISTS (
+            SELECT 1 FROM server_bans AS ban WHERE ban.state = 'BANNED' AND ban.mc_name_key = binding.mc_name_key
+        )
+    """)
     return frozen_count

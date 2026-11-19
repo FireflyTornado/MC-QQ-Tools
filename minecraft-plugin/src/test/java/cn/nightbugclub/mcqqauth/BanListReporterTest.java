@@ -31,9 +31,11 @@ class BanListReporterTest {
     void sendsBaselineAndRetriesIdenticalReportBeforePublishingLatestChange() throws Exception {
         Logger log = mock(Logger.class);
         try (LocalApi api = new LocalApi(); var reporter = new BanListReporter(api.settings(), log)) {
-            var steve = ban("Steve", null);
+            var steve = new BanListMonitor.PlayerBan(null, "Steve", null);
             var alex = ban("Alex", Instant.ofEpochMilli(5_000));
-            reporter.submit(Set.of(steve, alex, ban("STEVE", Instant.ofEpochMilli(6_000))));
+            var unknown = ban(null, null);
+            reporter.submit(Set.of(steve, alex, unknown,
+                    new BanListMonitor.PlayerBan(null, "STEVE", Instant.ofEpochMilli(6_000))));
             Exchange generation = api.next();
             assertEquals("GET", generation.method());
             generation.reply(200, "{\"generation\":5}");
@@ -45,7 +47,10 @@ class BanListReporterTest {
             assertEquals(1, initial.get("sequence").getAsLong());
             assertTrue(initial.get("client_id").getAsString().matches("[0-9a-f]{32}"));
             assertTrue(initial.getAsJsonObject("entries").get("steve").isJsonNull());
-            assertEquals(5_000L, initial.getAsJsonObject("entries").get("alex").getAsLong());
+            var profiles = initial.getAsJsonObject("profiles");
+            assertEquals(5_000L, profiles.getAsJsonObject(alex.uuid().toString()).get("expires_at").getAsLong());
+            assertEquals("alex", profiles.getAsJsonObject(alex.uuid().toString()).get("name").getAsString());
+            assertTrue(profiles.getAsJsonObject(unknown.uuid().toString()).get("name").isJsonNull());
 
             reporter.submit(Set.of(alex));
             reporter.submit(Set.of());
@@ -61,8 +66,40 @@ class BanListReporterTest {
             assertEquals(2, changed.json().get("sequence").getAsLong());
             assertEquals(initial.get("client_id"), changed.json().get("client_id"));
             assertTrue(changed.json().getAsJsonObject("entries").isEmpty());
+            assertTrue(changed.json().getAsJsonObject("profiles").isEmpty());
             changed.reply(200, "{\"generation\":6,\"sequence\":2}");
             reporter.submit(Set.of());
+            assertNull(api.requests.poll(300, MILLISECONDS));
+        }
+    }
+
+    @Test
+    void retriesLosingTheFirstGenerationButDoesNotReclaimAfterAnAcknowledgment() throws Exception {
+        Logger log = mock(Logger.class);
+        try (LocalApi api = new LocalApi(); var reporter = new BanListReporter(api.settings(), log)) {
+            reporter.submit(Set.of(ban("Steve", null)));
+            api.next().reply(200, "{\"generation\":5}");
+            Exchange conflict = api.next();
+            assertEquals(6, conflict.json().get("generation").getAsLong());
+            assertEquals(1, conflict.json().get("sequence").getAsLong());
+            reporter.submit(Set.of());
+            conflict.generationClaimed();
+
+            Exchange readAgain = api.next();
+            assertEquals("GET", readAgain.method());
+            readAgain.reply(200, "{\"generation\":6}");
+            Exchange nextCandidate = api.next();
+            assertEquals(7, nextCandidate.json().get("generation").getAsLong());
+            assertEquals(1, nextCandidate.json().get("sequence").getAsLong());
+            assertEquals(conflict.json().get("client_id"), nextCandidate.json().get("client_id"));
+            assertTrue(nextCandidate.json().getAsJsonObject("profiles").isEmpty());
+            nextCandidate.reply(200, "{\"generation\":7,\"sequence\":1}");
+
+            reporter.submit(Set.of(ban("Alex", null)));
+            Exchange superseded = api.next();
+            assertEquals(2, superseded.json().get("sequence").getAsLong());
+            superseded.reply(409, "{}");
+            verify(log, timeout(2000)).warning(contains("上报已停止"));
             assertNull(api.requests.poll(300, MILLISECONDS));
         }
     }
@@ -104,11 +141,15 @@ class BanListReporterTest {
         return new BanListMonitor.PlayerBan(UUID.randomUUID(), player, expiration);
     }
 
-    private record Reply(int status, String body) {}
+    private record Reply(int status, String body, String conflict) {}
 
     private record Exchange(String method, String token, String body, CompletableFuture<Reply> response) {
         void reply(int status, String body) {
-            response.complete(new Reply(status, body));
+            response.complete(new Reply(status, body, null));
+        }
+
+        void generationClaimed() {
+            response.complete(new Reply(409, "{}", "generation-claimed"));
         }
 
         JsonObject json() {
@@ -144,6 +185,9 @@ class BanListReporterTest {
                         new String(request.getRequestBody().readAllBytes(), UTF_8), new CompletableFuture<>());
                 requests.add(exchange);
                 Reply reply = exchange.response().orTimeout(5, SECONDS).join();
+                if (reply.conflict() != null) {
+                    request.getResponseHeaders().set("X-MCQQ-Banlist-Conflict", reply.conflict());
+                }
                 byte[] body = reply.body().getBytes(UTF_8);
                 request.sendResponseHeaders(reply.status(), body.length);
                 request.getResponseBody().write(body);

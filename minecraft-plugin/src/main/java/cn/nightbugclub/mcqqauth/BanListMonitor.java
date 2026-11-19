@@ -144,14 +144,29 @@ final class BanListMonitor implements AutoCloseable {
             Instant expiration = date == null ? null : date.toInstant();
             if (expiration == null || expiration.isAfter(now)) {
                 var profile = entry.getBanTarget();
+                UUID uuid = profile.getUniqueId();
                 String name = profile.getName();
                 if (!AuthProtocol.validPlayerName(name)) {
-                    throw new IllegalStateException("封禁记录缺少可用的游戏名");
+                    if (uuid == null) {
+                        throw new IllegalStateException("封禁记录缺少 UUID 和可用的游戏名");
+                    }
+                    name = knownPlayerName(uuid);
                 }
-                active.add(new PlayerBan(profile.getUniqueId(), name, expiration));
+                active.add(new PlayerBan(uuid, name, expiration));
             }
         }
         return active;
+    }
+
+    private String knownPlayerName(UUID uuid) {
+        try {
+            var player = plugin.getServer().getOfflinePlayer(uuid);
+            String name = player == null ? null : player.getName();
+            return AuthProtocol.validPlayerName(name) ? name : null;
+        } catch (RuntimeException unavailable) {
+            // Report the UUID even when Bukkit cannot resolve its local player record.
+            return null;
+        }
     }
 
     private void scheduleExpiration(Instant now) {

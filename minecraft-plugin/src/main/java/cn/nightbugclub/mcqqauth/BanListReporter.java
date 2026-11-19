@@ -28,6 +28,7 @@ final class BanListReporter implements AutoCloseable {
     private static final Gson JSON = new GsonBuilder().serializeNulls()
             .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES).create();
     private static final int MAX_ACK_LENGTH = 4096;
+    private static final String CONFLICT_HEADER = "X-MCQQ-Banlist-Conflict";
 
     record Settings(URI url, String token, int connectTimeoutMs, int requestTimeoutMs, int retryMinMs, int retryMaxMs) {
         static Settings read(ConfigurationSection config) {
@@ -58,7 +59,16 @@ final class BanListReporter implements AutoCloseable {
         }
     }
 
-    private record Upload(long generation, String clientId, long sequence, Map<String, Long> entries) {}
+    private record Profile(String name, Long expiresAt) {}
+
+    private record Snapshot(Map<String, Long> entries, Map<String, Profile> profiles) {
+        int size() {
+            return entries.size() + profiles.size();
+        }
+    }
+
+    private record Upload(long generation, String clientId, long sequence, Map<String, Long> entries,
+                          Map<String, Profile> profiles) {}
 
     private final String clientId = UUID.randomUUID().toString().replace("-", "");
     private final Settings settings;
@@ -72,16 +82,17 @@ final class BanListReporter implements AutoCloseable {
     });
 
     // Guard the handoff between the Bukkit thread and the reporting worker.
-    private Map<String, Long> latest;
-    private Map<String, Long> acknowledged;
+    private Snapshot latest;
+    private Snapshot acknowledged;
     private boolean scheduled;
     private volatile boolean closed;
 
     // Only the reporting worker changes an in-flight snapshot or its cursor.
-    private Map<String, Long> inFlight;
+    private Snapshot inFlight;
     private long generation;
     private long sequence;
     private boolean retrying;
+    private boolean retriedStartupConflict;
 
     BanListReporter(Settings settings, Logger logger) {
         this(settings, logger, HttpClient.newBuilder()
@@ -101,15 +112,20 @@ final class BanListReporter implements AutoCloseable {
             return;
         }
         Map<String, Long> entries = new TreeMap<>();
+        Map<String, Profile> profiles = new TreeMap<>();
         for (var ban : snapshot) {
-            String name = ban.name().toLowerCase(Locale.ROOT);
+            String name = ban.name() == null ? null : ban.name().toLowerCase(Locale.ROOT);
             Long next = ban.expiration() == null ? null : ban.expiration().toEpochMilli();
+            if (ban.uuid() != null) {
+                profiles.put(ban.uuid().toString(), new Profile(name, next));
+                continue;
+            }
             Long previous = entries.get(name);
             if (!entries.containsKey(name) || previous != null && (next == null || next > previous)) {
                 entries.put(name, next);
             }
         }
-        latest = Collections.unmodifiableMap(entries);
+        latest = new Snapshot(Collections.unmodifiableMap(entries), Collections.unmodifiableMap(profiles));
         scheduleIfChanged();
     }
 
@@ -141,7 +157,7 @@ final class BanListReporter implements AutoCloseable {
                 throw new RejectedUpload("上报序号已达上限");
             }
             long next = sequence + 1;
-            var upload = new Upload(generation, clientId, next, inFlight);
+            var upload = new Upload(generation, clientId, next, inFlight.entries(), inFlight.profiles());
             var reply = cursor(request().header("Content-Type", "application/json")
                     .PUT(HttpRequest.BodyPublishers.ofString(JSON.toJson(upload))).build());
             if (reply.generation() != generation || reply.sequence() != next) {
@@ -149,6 +165,14 @@ final class BanListReporter implements AutoCloseable {
             }
             sequence = next;
         } catch (RejectedUpload e) {
+            // The server only marks a first report for a generation won by a different client.
+            if (e.generationClaimed && sequence == 0 && generation != 0 && !retriedStartupConflict) {
+                retriedStartupConflict = true;
+                generation = 0;
+                inFlight = null;
+                retry(e);
+                return;
+            }
             if (!closed) {
                 logger.warning("封禁名单上报已停止：" + e.getMessage() + "。请检查配置或上报实例后重启插件。");
                 close();
@@ -190,7 +214,9 @@ final class BanListReporter implements AutoCloseable {
             throw new IOException("HTTP " + status);
         }
         if (status != 200) {
-            throw new RejectedUpload("HTTP " + status);
+            boolean generationClaimed = status == 409
+                    && response.headers().firstValue(CONFLICT_HEADER).filter("generation-claimed"::equals).isPresent();
+            throw new RejectedUpload("HTTP " + status, generationClaimed);
         }
         if (response.body().length() > MAX_ACK_LENGTH) {
             throw new IOException("封禁快照确认超过大小上限");
@@ -216,8 +242,15 @@ final class BanListReporter implements AutoCloseable {
     }
 
     private static final class RejectedUpload extends IOException {
+        private final boolean generationClaimed;
+
         RejectedUpload(String message) {
+            this(message, false);
+        }
+
+        RejectedUpload(String message, boolean generationClaimed) {
             super(message);
+            this.generationClaimed = generationClaimed;
         }
     }
 }

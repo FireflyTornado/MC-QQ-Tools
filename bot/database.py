@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 import time
@@ -5,9 +6,10 @@ from contextlib import closing
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "auth.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_AUTH_VERSION = (1 << 63) - 1
 NAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,16}")
+PROFILE_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 MIGRATIONS = Path(__file__).with_name("migrations")
 ACTIVE_INDEXES = {
@@ -22,6 +24,7 @@ CURRENT_TABLES = {
         "ban_sequence": "INTEGER",
         "ban_client_id": "TEXT",
         "ban_digest": "TEXT",
+        "ban_profile_names": "TEXT",
     },
     "offline_bindings": {
         "id": "INTEGER",
@@ -74,6 +77,20 @@ def update_auth_version(conn: sqlite3.Connection) -> None:
 
 def valid_mc_name(name: str) -> bool:
     return bool(NAME_PATTERN.fullmatch(name))
+
+
+def read_ban_profile_names(encoded: str) -> dict[str, str]:
+    try:
+        names = json.loads(encoded)
+    except (ValueError, TypeError) as exc:
+        raise MigrationError("Invalid banlist profile names in auth_state") from exc
+    if not isinstance(names, dict) or any(
+        not PROFILE_UUID_PATTERN.fullmatch(uuid) or not isinstance(name, str)
+        or not valid_mc_name(name) or name != name.lower()
+        for uuid, name in names.items()
+    ):
+        raise MigrationError("Invalid banlist profile names in auth_state")
+    return names
 
 
 def _apply_migration(conn: sqlite3.Connection, filename: str) -> None:
@@ -135,15 +152,17 @@ def _validate_server_bans(conn: sqlite3.Connection) -> None:
 
 def _validate_auth_state(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT id, version, ban_generation, ban_sequence, ban_client_id, ban_digest FROM auth_state LIMIT 2"
+        "SELECT id, version, ban_generation, ban_sequence, ban_client_id, ban_digest, ban_profile_names "
+        "FROM auth_state LIMIT 2"
     ).fetchall()
     if len(rows) != 1 or rows[0][0] != 1:
         raise MigrationError("auth_state must contain exactly one row with id = 1")
     version = rows[0][1]
     if not isinstance(version, int) or not 0 <= version < MAX_AUTH_VERSION:
         raise MigrationError("auth_state.version must be a nonnegative integer with room to increment")
-    generation, sequence, client_id, digest = rows[0][2:]
-    if (generation, sequence, client_id, digest) == (0, 0, "", ""):
+    generation, sequence, client_id, digest, profile_names = rows[0][2:]
+    known_names = read_ban_profile_names(profile_names)
+    if (generation, sequence, client_id, digest) == (0, 0, "", "") and not known_names:
         return
     if (type(generation) is not int or not 0 < generation <= MAX_AUTH_VERSION
             or type(sequence) is not int or not 0 < sequence <= MAX_AUTH_VERSION
@@ -239,6 +258,8 @@ def init_database(db_path: Path | None = None) -> None:
             _apply_migration(conn, "002_server_bans.sql")
         if version < 3:
             _apply_migration(conn, "003_banlist_upload.sql")
+        if version < 4:
+            _apply_migration(conn, "004_banlist_profile_names.sql")
 
         for table in CURRENT_TABLES:
             _validate_table(conn, table)

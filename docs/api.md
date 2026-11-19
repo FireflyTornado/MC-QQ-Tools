@@ -45,13 +45,18 @@ curl --fail http://127.0.0.1:18765/internal/mc/snapshot \
   "generation": 1,
   "client_id": "34f4ba1441d84d6697da8356a2d837aa5",
   "sequence": 1,
-  "entries": {"steve": null, "alex": 1794141600123}
+  "entries": {"steve": null},
+  "profiles": {
+    "cf67ce55-dcd8-4d0e-acee-7bd6a47b1512": {"name": "alex", "expires_at": 1794141600123}
+  }
 }
 ```
 
-`entries` 是完整的有效玩家封禁快照，键为游戏名，值为 Unix 毫秒到期时间。永久封禁用 `null`。成功读取的空名单用 `{}`。`PUT` 在 SQLite 提交后返回 HTTP 200 和 `{"generation":1,"sequence":1}`。同一会话的上报按序号递增。重复发送最近已确认的同一快照会收到相同确认。旧会话、跳号或同号但内容不同的快照返回 HTTP 409。上报会话和最近确认位置随数据库持久化，后端重启后可继续重试。
+`profiles` 按 UUID 上报封禁，`name` 可为 `null`。`entries` 用于没有 UUID 的具名记录。省略 `profiles` 时，`entries` 仍代表旧格式的完整具名名单。到期时间使用 Unix 毫秒，永久封禁用 `null`。数据库记住仍在封禁名单里、曾有可用游戏名的 UUID。仍无法识别的 UUID 会保留尚无法核对归属的旧格式封禁，已能按 UUID 核对的其他封禁照常更新。
 
-错误凭据返回 HTTP 401。请求超过 2 MiB 返回 HTTP 413，无效快照返回 HTTP 422，SQLite 暂时不可用返回 HTTP 503。插件对网络失败、HTTP 408、429 和 5xx 退避重试。遇到 HTTP 409 会停止上报，检查只部署了一个上报实例后重启插件。
+`PUT` 在 SQLite 提交后返回 HTTP 200 和 `{"generation":1,"sequence":1}`。应用时忽略已经到期的条目，重试使用过滤前的规范化快照进行幂等确认。旧会话、跳号或同号但内容不同的快照返回 HTTP 409。上报会话和最近确认位置随数据库持久化，后端重启后可继续重试。
+
+错误凭据返回 HTTP 401。请求超过 2 MiB 返回 HTTP 413，无效快照返回 HTTP 422，SQLite 暂时不可用返回 HTTP 503。插件对网络失败、HTTP 408、429 和 5xx 退避重试。首个快照遇到明确标记为 `X-MCQQ-Banlist-Conflict: generation-claimed` 的 409 时，插件重新读取游标并重试一次。其他游标冲突会停止上报，检查只部署了一个上报实例后重启插件。
 
 ## POST /internal/mc/notify
 

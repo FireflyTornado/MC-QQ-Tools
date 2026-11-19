@@ -316,13 +316,13 @@ FastAPI 按上面的命令监听回环地址。授权快照 `/internal/mc/snapsh
 include /opt/mc-qq-auth/deploy/nginx/mc-qq-api-http.conf;
 ```
 
-共用规则仅匹配上述两个完整路径，保留请求路径及 `Authorization` 头，关闭代理缓存，并允许最多 2 MiB 的请求体。避免在代理日志中记录 `Authorization`。`/internal/mc/ws` 继续使用该域名下的 WebSocket 规则。WebSocket 转发需支持 HTTP/1.1 Upgrade 并设置合适的空闲超时。
+共用规则仅匹配上述两个完整路径，保留请求路径和 `Authorization` 头，关闭代理缓存，并允许最多 2 MiB 的请求体。代理应转发 FastAPI 的 HTTP 409 和 `X-MCQQ-Banlist-Conflict` 响应头，供插件区分首次会话竞争。避免在代理日志中记录 `Authorization`。`/internal/mc/ws` 继续使用该域名下的 WebSocket 规则。WebSocket 转发需支持 HTTP/1.1 Upgrade 并设置合适的空闲超时。
 
 `/internal/mc/notify` 应从公网路由中排除，`/internal/health` 留给本机或受信探活。WebUI 和 OneBot 端口同样保留在回环地址。完整协议见 [API 文档](api.md)。
 
 ### 玩家封禁名单联动
 
-在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。升级数据库到版本 3 后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。每个授权数据库只启用一个上报实例。
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。升级数据库到版本 4 后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
 
 ```yaml
 banlist-watch:

@@ -20,7 +20,7 @@ from app_config import (
     require_token as config_token,
     target_group_id,
 )
-from banlist_sync import UploadConflict, read_generation, store_upload
+from banlist_sync import GenerationClaimed, UploadConflict, read_generation, store_upload
 from database import DB_PATH, MAX_AUTH_VERSION
 from sudo_api import sudo_router
 from sudo_config import read_sudo_settings
@@ -62,6 +62,13 @@ UploadNumber = Annotated[int, Field(strict=True, ge=1, le=MAX_AUTH_VERSION)]
 Expiration = Annotated[int, Field(strict=True, ge=0, le=MAX_AUTH_VERSION)]
 
 
+class BanlistProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None
+    expires_at: Expiration | None
+
+
 class BanlistUpload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -69,6 +76,7 @@ class BanlistUpload(BaseModel):
     client_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
     sequence: UploadNumber
     entries: dict[str, Expiration | None]
+    profiles: dict[str, BanlistProfile] | None = None
 
 
 # 不对外暴露自动生成的 API 文档
@@ -270,6 +278,11 @@ async def upload_banlist(request: Request, background: BackgroundTasks, response
         frozen = await asyncio.to_thread(store_upload, DB_PATH, **upload.model_dump())
     except (ValueError, ClientDisconnect):
         raise HTTPException(status_code=422, detail="Invalid banlist snapshot") from None
+    except GenerationClaimed:
+        raise HTTPException(
+            status_code=409, detail="Banlist upload cursor conflict",
+            headers={"X-MCQQ-Banlist-Conflict": "generation-claimed"},
+        ) from None
     except UploadConflict:
         raise HTTPException(status_code=409, detail="Banlist upload cursor conflict") from None
     except sqlite3.Error:

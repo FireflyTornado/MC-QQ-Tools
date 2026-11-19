@@ -117,8 +117,10 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload, {"version": VERSION, "active_names": ["alex", "steve"]})
                 self.assertIsInstance(payload["version"], int)
 
-    async def upload_banlist(self, generation, sequence, entries, client_id="a" * 32):
+    async def upload_banlist(self, generation, sequence, entries, client_id="a" * 32, *, profiles=None):
         payload = {"generation": generation, "client_id": client_id, "sequence": sequence, "entries": entries}
+        if profiles is not None:
+            payload["profiles"] = profiles
         return await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", json.dumps(payload).encode())
 
     async def test_banlist_upload_freezes_broadcasts_and_only_restores_after_membership_check(self):
@@ -151,10 +153,19 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(restored["version"], frozen["version"])
 
     async def test_new_banlist_session_fences_old_writers_and_cursor_survives_api_restart(self):
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 0})
         self.assertEqual((await self.upload_banlist(1, 1, {"Steve": None}))[0], 200)
-        self.assertEqual((await self.upload_banlist(1, 1, {}, client_id="b" * 32))[0], 409)
+        status, headers, _ = await self.upload_banlist(1, 1, {}, client_id="b" * 32)
+        self.assertEqual(status, 409)
+        self.assertEqual(headers[b"x-mcqq-banlist-conflict"], b"generation-claimed")
+        status, headers, _ = await self.upload_banlist(1, 2, {}, client_id="b" * 32)
+        self.assertEqual(status, 409)
+        self.assertNotIn(b"x-mcqq-banlist-conflict", headers)
         self.assertEqual((await self.upload_banlist(2, 1, {"Alex": None}, client_id="b" * 32))[0], 200)
         self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
+        status, headers, _ = await self.upload_banlist(1, 1, {"Steve": None})
+        self.assertEqual(status, 409)
+        self.assertNotIn(b"x-mcqq-banlist-conflict", headers)
         self.assertEqual((await self.upload_banlist(3, 1, {"Steve": None}, client_id="b" * 32))[0], 409)
         db_path = self.api.DB_PATH
         database.init_database(db_path)
@@ -164,6 +175,59 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 2})
         self.assertEqual((await self.upload_banlist(2, 1, {"alex": None}, client_id="b" * 32))[0], 200)
         self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
+
+    async def test_expired_upload_is_acknowledged_without_freezing_and_retains_its_original_digest(self):
+        now = 1_850_000_000_000
+        alex = "00000000-0000-4000-8000-000000000002"
+        entries = {"Steve": now - 1}
+        profiles = {alex: {"name": "Alex", "expires_at": now}}
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = now * 1_000_000
+            status, _, reply = await self.upload_banlist(1, 1, entries, profiles=profiles)
+            self.assertEqual((status, reply), (200, {"generation": 1, "sequence": 1}))
+            clock.time_ns.return_value += 10_000_000
+            self.assertEqual((await self.upload_banlist(1, 1, entries, profiles=profiles))[0], 200)
+            self.assertEqual((await self.upload_banlist(1, 1, {}, profiles={}))[0], 409)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2], {
+            "version": VERSION, "active_names": ["alex", "steve"],
+        })
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM server_bans").fetchone()[0], 0)
+
+    async def test_uuid_only_bans_preserve_known_names_without_blocking_other_bans_and_pardons(self):
+        steve = "00000000-0000-4000-8000-000000000001"
+        alex = "00000000-0000-4000-8000-000000000002"
+        unknown = "00000000-0000-4000-8000-000000000003"
+        other = "00000000-0000-4000-8000-000000000004"
+        initial = {
+            steve: {"name": "Steve", "expires_at": None},
+            alex: {"name": "Alex", "expires_at": None},
+        }
+        self.assertEqual((await self.upload_banlist(1, 1, {"Legacy": None}, profiles=initial))[0], 200)
+        database.init_database(self.api.DB_PATH)
+
+        def states():
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                return dict(conn.execute("SELECT mc_name_key, state FROM server_bans"))
+
+        profiles = {
+            steve: {"name": None, "expires_at": None},
+            unknown: {"name": None, "expires_at": None},
+            other: {"name": "Other", "expires_at": None},
+        }
+        replacement = "b" * 32
+        self.assertEqual((await self.upload_banlist(2, 1, {}, replacement, profiles=profiles))[0], 200)
+        self.assertEqual(states(), {
+            "steve": "BANNED", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED", "legacy": "BANNED",
+        })
+
+        del profiles[steve]
+        self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
+        self.assertEqual(states()["steve"], "PENDING_MEMBERSHIP_CHECK")
+        self.assertEqual(states()["legacy"], "BANNED")
+        del profiles[unknown]
+        self.assertEqual((await self.upload_banlist(2, 3, {}, replacement, profiles=profiles))[0], 200)
+        self.assertNotIn("legacy", states())
 
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):

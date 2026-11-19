@@ -81,7 +81,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_initialize_new_database_and_repeat_after_binding(self):
         database.init_database()
-        self.assertEqual(self.schema_version(), 3)
+        self.assertEqual(self.schema_version(), 4)
         self.assertEqual(self.auth_version(), 0)
         self.assertEqual(self.rows("SELECT * FROM offline_bindings"), [])
         self.assertEqual(
@@ -120,7 +120,7 @@ class DatabaseTests(unittest.TestCase):
         database.init_database()
         database.init_database()
 
-        self.assertEqual(self.schema_version(), 3)
+        self.assertEqual(self.schema_version(), 4)
         self.assertEqual(self.auth_version(), 0)
         self.assertEqual(self.rows("SELECT * FROM bindings"), bound)
         self.assertEqual(self.rows("SELECT * FROM pending_bindings"), pending)
@@ -175,7 +175,7 @@ class DatabaseTests(unittest.TestCase):
         self.fixture(AUTH_TABLE + "INSERT INTO auth_state VALUES (1, 42);")
         database.init_database()
         self.assertEqual(self.auth_version(), 42)
-        self.assertEqual(self.schema_version(), 3)
+        self.assertEqual(self.schema_version(), 4)
 
     def test_compatible_unversioned_table_without_indexes_can_be_upgraded(self):
         self.fixture(AUTH_TABLE + OFFLINE_TABLE + "INSERT INTO auth_state VALUES (1, 10);")
@@ -231,7 +231,7 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(database.MigrationError, "unique index"):
             database.init_database()
         self.assertEqual(len(self.rows("PRAGMA index_list(offline_bindings)")), 1)
-        self.assertEqual(self.schema_version(), 3)
+        self.assertEqual(self.schema_version(), 4)
 
     def test_offline_table_without_auth_state_does_not_seed_a_version(self):
         self.fixture(OFFLINE_TABLE)
@@ -260,10 +260,10 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.schema_version(), 0)
 
     def test_unsupported_version_is_not_changed(self):
-        self.fixture("PRAGMA user_version = 4;")
-        with self.assertRaisesRegex(database.MigrationError, "Unsupported SQLite schema version 4"):
+        self.fixture("PRAGMA user_version = 5;")
+        with self.assertRaisesRegex(database.MigrationError, "Unsupported SQLite schema version 5"):
             database.init_database()
-        self.assertEqual(self.schema_version(), 4)
+        self.assertEqual(self.schema_version(), 5)
         self.assertEqual(self.rows("SELECT name FROM sqlite_schema"), [])
 
     def test_bind_and_unbind_are_monotonic_and_notify_after_commit(self):
@@ -316,18 +316,18 @@ class DatabaseTests(unittest.TestCase):
             second = pool.submit(binding_service.bind_player, "group", "qq2", "MYNAME")
             self.assertCountEqual([first.result()[0], second.result()[0]], ["success", "name_taken"])
 
-        self.assertEqual(self.schema_version(), 3)
+        self.assertEqual(self.schema_version(), 4)
         self.assertEqual(self.rows("SELECT mc_name_key FROM offline_bindings"), [("myname",)])
         self.notify.assert_called_once()
 
     def test_cli_explicit_path_and_nonzero_exit_for_invalid_version(self):
         command = [sys.executable, "-B", str(BOT_DIR / "migrate.py"), "--db", str(self.path)]
         result = subprocess.run(command, capture_output=True, text=True, check=True)
-        self.assertIn("schema 3", result.stdout)
-        self.fixture("PRAGMA user_version = 4;")
+        self.assertIn("schema 4", result.stdout)
+        self.fixture("PRAGMA user_version = 5;")
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Unsupported SQLite schema version 4", result.stderr)
+        self.assertIn("Unsupported SQLite schema version 5", result.stderr)
 
     def test_upgrade_version_one_preserves_bindings_and_authorization_version(self):
         self.fixture(AUTH_TABLE + OFFLINE_TABLE + ACTIVE_INDEXES
@@ -335,7 +335,7 @@ class DatabaseTests(unittest.TestCase):
         self.rows(BINDING_INSERT, ("group", "qq", "MyName", "myname", "ACTIVE"))
         before = self.rows("SELECT * FROM offline_bindings")
         database.init_database()
-        self.assertEqual(self.schema_version(), 3)
+        self.assertEqual(self.schema_version(), 4)
         self.assertEqual(self.rows("SELECT * FROM offline_bindings"), before)
         self.assertEqual(self.auth_version(), 42)
         self.assertEqual(self.rows("SELECT * FROM server_bans"), [])
@@ -349,9 +349,19 @@ class DatabaseTests(unittest.TestCase):
         )
         self.rows("INSERT INTO server_bans (mc_name_key, state) VALUES ('steve', 'BANNED')")
         database.init_database()
-        self.assertEqual(self.schema_version(), 3)
-        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42, 0, 0, "", "")])
+        self.assertEqual(self.schema_version(), 4)
+        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(1, 42, 0, 0, "", "", "{}")])
         self.assertEqual(self.rows("SELECT mc_name_key, state FROM server_bans"), [("steve", "BANNED")])
+
+    def test_upgrade_version_three_preserves_upload_cursor(self):
+        names = ["001_offline_auth.sql", "002_server_bans.sql", "003_banlist_upload.sql"]
+        self.fixture("\n".join((database.MIGRATIONS / name).read_text(encoding="utf-8") for name in names)
+                     + "PRAGMA user_version = 3;")
+        before = (1, 42, 2, 3, "a" * 32, "b" * 64)
+        self.rows("INSERT INTO auth_state VALUES (?, ?, ?, ?, ?, ?)", before)
+        database.init_database()
+        self.assertEqual(self.schema_version(), 4)
+        self.assertEqual(self.rows("SELECT * FROM auth_state"), [(*before, "{}")])
 
     def test_ban_snapshot_moves_binding_and_blocks_name_and_qq(self):
         database.init_database()

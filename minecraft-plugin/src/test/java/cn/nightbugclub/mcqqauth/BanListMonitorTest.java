@@ -2,6 +2,7 @@ package cn.nightbugclub.mcqqauth;
 
 import org.bukkit.BanEntry;
 import org.bukkit.BanList;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.Server;
 import org.bukkit.ban.ProfileBanList;
 import org.bukkit.plugin.Plugin;
@@ -30,6 +31,7 @@ import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
@@ -128,18 +130,45 @@ class BanListMonitorTest {
         }
     }
 
+    @Test
+    void uuidOnlyBansUseLocallyKnownNamesAndUnresolvedProfilesDoNotBlockTheSnapshot() throws Exception {
+        UUID missingName = UUID.randomUUID();
+        UUID cachedName = UUID.randomUUID();
+        var offline = mock(OfflinePlayer.class);
+        when(plugin.getServer().getOfflinePlayer(cachedName)).thenReturn(offline);
+        when(offline.getName()).thenReturn("Alex");
+        var unresolved = ban(missingName, null, null);
+        var cached = ban(cachedName, null, null);
+        var named = ban(null);
+        when(list.getEntries()).thenReturn(Set.of(unresolved, cached, named));
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock, reports::add)) {
+            monitor.start();
+            runQueuedRefresh();
+            assertEquals(3, reports.get(0).size());
+            var byId = reports.get(0).stream().collect(java.util.stream.Collectors.toMap(
+                    BanListMonitor.PlayerBan::uuid, player -> player));
+            assertNull(byId.get(missingName).name());
+            assertEquals("Alex", byId.get(cachedName).name());
+            assertTrue(reports.get(0).stream().anyMatch(player -> "Steve".equals(player.name())));
+        }
+    }
+
     private void runQueuedRefresh() throws InterruptedException {
         Runnable task = mainTasks.poll(5, TimeUnit.SECONDS);
         assertNotNull(task, "Expected a refresh on the Bukkit scheduler");
         task.run();
     }
 
-    @SuppressWarnings("unchecked")
     private static BanEntry<PlayerProfile> ban(Instant expiration) {
+        return ban(UUID.randomUUID(), "Steve", expiration);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static BanEntry<PlayerProfile> ban(UUID uuid, String name, Instant expiration) {
         BanEntry<PlayerProfile> entry = mock(BanEntry.class);
         PlayerProfile profile = mock(PlayerProfile.class);
-        when(profile.getUniqueId()).thenReturn(UUID.randomUUID());
-        when(profile.getName()).thenReturn("Steve");
+        when(profile.getUniqueId()).thenReturn(uuid);
+        when(profile.getName()).thenReturn(name);
         when(entry.getBanTarget()).thenReturn(profile);
         when(entry.getExpiration()).thenReturn(expiration == null ? null : Date.from(expiration));
         return entry;

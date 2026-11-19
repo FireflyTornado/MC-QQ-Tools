@@ -2,10 +2,11 @@ import hashlib
 import json
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import TypedDict
+from uuid import UUID
 
 from database import MAX_AUTH_VERSION, PROFILE_UUID_PATTERN, read_ban_profile_names, update_auth_version, valid_mc_name
 
@@ -51,7 +52,7 @@ def store_upload(
         elif generation != old_generation + 1 or sequence != 1 or client_id == old_client_id:
             raise UploadConflict
 
-        active, names = _effective_report(bans, normalized_profiles, read_ban_profile_names(old_names))
+        active, names = _effective_report(conn, bans, normalized_profiles, read_ban_profile_names(old_names))
         frozen = apply_normalized_bans(conn, active)
         conn.execute(
             """
@@ -111,6 +112,7 @@ def _merge_ban(bans: dict[str, int | None], name: str, expiration: int | None) -
 
 
 def _effective_report(
+    conn: sqlite3.Connection,
     entries: dict[str, int | None],
     profiles: dict[str, tuple[str | None, int | None]] | None,
     old_names: dict[str, str],
@@ -122,15 +124,44 @@ def _effective_report(
         return active, {uuid: name for uuid, name in old_names.items() if name in active}
 
     names = {}
+    unresolved_offline: dict[str, int | None] = {}
     for uuid, (reported_name, expiration) in profiles.items():
         if expiration is not None and expiration <= now:
             continue
         name = reported_name or old_names.get(uuid)
         if name is None:
+            if uuid[14] == "3" and uuid[19] in "89ab":
+                unresolved_offline[uuid] = expiration
             continue
         names[uuid] = name
         _merge_ban(active, name, expiration)
+
+    if unresolved_offline:
+        for uuid, name in _resolve_offline_profile_names(conn, unresolved_offline):
+            names[uuid] = name
+            _merge_ban(active, name, unresolved_offline[uuid])
     return active, names
+
+
+def _resolve_offline_profile_names(
+    conn: sqlite3.Connection, unresolved_ids: Iterable[str],
+) -> Iterator[tuple[str, str]]:
+    remaining = set(unresolved_ids)
+    known_players = conn.execute(
+        "SELECT mc_name_key, mc_name FROM server_bans "
+        "UNION ALL SELECT mc_name_key, mc_name FROM offline_bindings WHERE status = 'ACTIVE'",
+    )
+    for name_key, mc_name in known_players:
+        # The vanilla offline UUID uses the original spelling, while the binding key is lowercase.
+        spellings = (name_key, mc_name) if mc_name and mc_name != name_key else (name_key,)
+        for spelling in spellings:
+            digest = hashlib.md5(f"OfflinePlayer:{spelling}".encode("ascii"), usedforsecurity=False).digest()
+            uuid = str(UUID(bytes=digest, version=3))
+            if uuid in remaining:
+                remaining.remove(uuid)
+                yield uuid, name_key
+                if not remaining:
+                    return
 
 
 def apply_normalized_bans(conn: sqlite3.Connection, bans: dict[str, int | None]) -> int:

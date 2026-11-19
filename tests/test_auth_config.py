@@ -230,6 +230,34 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
         self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED"})
 
+    async def test_name_only_ban_stays_frozen_when_report_switches_to_its_offline_uuid(self):
+        # UUID.nameUUIDFromBytes("OfflinePlayer:Steve".getBytes(UTF_8))
+        steve = "5627dd98-e6be-3c21-b8a8-e92344183641"
+        unknown = "00000000-0000-4000-8000-000000000003"
+        self.assertEqual((await self.upload_banlist(1, 1, {"steve": None, "alex": None}))[0], 200)
+
+        profiles = {
+            steve: {"name": None, "expires_at": None},
+            unknown: {"name": None, "expires_at": None},
+        }
+        self.assertEqual((await self.upload_banlist(2, 1, {}, "b" * 32, profiles=profiles))[0], 200)
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("frozen", "Steve"))
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(set(audit.pending), {"2"})
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1", "2"}, 2), 0)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
+        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            saved = conn.execute("SELECT ban_profile_names FROM auth_state").fetchone()[0]
+            self.assertEqual(json.loads(saved), {steve: "steve"})
+
+        del profiles[steve]
+        self.assertEqual((await self.upload_banlist(2, 2, {}, "b" * 32, profiles=profiles))[0], 200)
+        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+              patch.object(binding_service, "notify_auth_updated")):
+            self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("pending", "Steve"))
+
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):
             self.assertEqual((await self.request(BANLIST_PATH, header, "PUT", b"{}"))[0], 401)

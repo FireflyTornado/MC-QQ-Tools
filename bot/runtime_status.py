@@ -114,6 +114,7 @@ class RuntimeStatus:
     last_reconcile: str = "No attempts yet"
     last_notice: str = "No attempts yet"
     minecraft: MinecraftStatus | None = None
+    unnamed_bans: int | None = None
 
 
 def _probe(check: Callable[[], T]) -> T | None:
@@ -141,18 +142,21 @@ def check_minecraft() -> MinecraftStatus | None:
     return MinecraftStatus(True)
 
 
-def _binding_status(group_id: str) -> tuple[int, int]:
+def _binding_status(group_id: str) -> tuple[int, int, int]:
     uri = database.DB_PATH.resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=1)) as connection, connection:
         connection.execute("BEGIN")
-        version = connection.execute("SELECT version FROM auth_state WHERE id = 1").fetchone()
-        if version is None or type(version[0]) is not int or version[0] < 0:
+        row = connection.execute("SELECT version, ban_unnamed_profiles FROM auth_state WHERE id = 1").fetchone()
+        if row is None or type(row[0]) is not int or row[0] < 0:
             raise sqlite3.DatabaseError("Invalid authorization version")
         (count,) = connection.execute(
             "SELECT COUNT(*) FROM offline_bindings WHERE group_id = ? AND status = 'ACTIVE'",
             (group_id,),
         ).fetchone()
-        return version[0], count
+        version, profiles = row
+        now = time.time_ns() // 1_000_000
+        unnamed = database.read_unnamed_ban_profiles(profiles)
+        return version, count, sum(expiration is None or expiration > now for expiration in unnamed.values())
 
 
 def _system_name() -> str:
@@ -195,7 +199,7 @@ def collect_status(group_id: str, *, connected: bool, connected_for: float | Non
     api = _probe(lambda: check_fastapi(include_connections=True))
     minecraft = _probe(check_minecraft)
     binding_status = _probe(lambda: _binding_status(group_id))
-    version, count = binding_status if binding_status is not None else (None, None)
+    version, count, unnamed = binding_status if binding_status is not None else (None, None, None)
     with _outcome_lock:
         reconciliation = _format_outcome(_outcomes.get("reconcile"))
         notification = _format_outcome(_outcomes.get("notify"))
@@ -217,5 +221,6 @@ def collect_status(group_id: str, *, connected: bool, connected_for: float | Non
         last_reconcile=reconciliation,
         last_notice=notification,
         minecraft=minecraft,
+        unnamed_bans=unnamed,
         checked_at=datetime.now(UTC),
     )

@@ -21,6 +21,7 @@ import notify_client
 import runtime_status
 import status_image
 from app_config import ConfigError
+from banlist_sync import store_upload
 from status_image import HEIGHT, WIDTH, render_status
 
 
@@ -119,6 +120,30 @@ class RuntimeStatusTests(unittest.TestCase):
         nodes = self.rendered_svg(status)
         self.assertEqual(nodes["bindings-count"].text, "—")
         self.assertTrue(nodes["system-uptime"].text.endswith("—"))
+
+    def test_status_warns_only_while_unnamed_bans_are_active(self):
+        database.init_database(self.path)
+        expiration = 1_850_000_000_000
+        unnamed = "00000000-0000-4000-8000-000000000001"
+        named = "00000000-0000-4000-8000-000000000002"
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
+            store_upload(self.path, generation=1, client_id="a" * 32, sequence=1, entries={}, profiles={
+                unnamed: {"name": None, "expires_at": expiration},
+                named: {"name": "Alex", "expires_at": None},
+            })
+
+        cjk = status_image._font_source(False) is not None
+        warning = "无名 UUID 封禁：1 条" if cjk else "Unnamed UUID bans: 1"
+        for now, count in ((expiration - 1, 1), (expiration, 0)):
+            with (self.subTest(now=now), patch.object(runtime_status, "check_fastapi", return_value=None),
+                  patch.object(runtime_status.time, "time_ns", return_value=now * 1_000_000)):
+                status = runtime_status.collect_status("1", connected=True, connected_for=None)
+                self.assertTrue(status.sqlite_readable)
+                self.assertEqual(status.unnamed_bans, count)
+                node = self.rendered_svg(status)["unnamed-bans-warning"]
+                self.assertEqual(node.get("display"), "inline" if count else "none")
+                self.assertEqual(node.text, warning if count else None)
 
     def test_health_returns_http_status_and_targets_only_loopback(self):
         with patch.object(runtime_status, "HTTPConnection") as http:

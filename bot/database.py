@@ -6,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "auth.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_AUTH_VERSION = (1 << 63) - 1
 NAME_PATTERN = re.compile(r"[A-Za-z0-9_]{1,16}")
 PROFILE_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -25,6 +25,7 @@ CURRENT_TABLES = {
         "ban_client_id": "TEXT",
         "ban_digest": "TEXT",
         "ban_profile_names": "TEXT",
+        "ban_unnamed_profiles": "TEXT",
     },
     "offline_bindings": {
         "id": "INTEGER",
@@ -93,6 +94,20 @@ def read_ban_profile_names(encoded: str) -> dict[str, str]:
     return names
 
 
+def read_unnamed_ban_profiles(encoded: str) -> dict[str, int | None]:
+    try:
+        profiles = json.loads(encoded)
+    except (ValueError, TypeError) as exc:
+        raise MigrationError("Invalid unnamed ban profiles in auth_state") from exc
+    if not isinstance(profiles, dict) or any(
+        not PROFILE_UUID_PATTERN.fullmatch(uuid)
+        or (expiration is not None and (type(expiration) is not int or not 0 <= expiration <= MAX_AUTH_VERSION))
+        for uuid, expiration in profiles.items()
+    ):
+        raise MigrationError("Invalid unnamed ban profiles in auth_state")
+    return profiles
+
+
 def _apply_migration(conn: sqlite3.Connection, filename: str) -> None:
     # executescript() can commit the open transaction before applying DDL.
     statement = ""
@@ -152,7 +167,8 @@ def _validate_server_bans(conn: sqlite3.Connection) -> None:
 
 def _validate_auth_state(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT id, version, ban_generation, ban_sequence, ban_client_id, ban_digest, ban_profile_names "
+        "SELECT id, version, ban_generation, ban_sequence, ban_client_id, ban_digest, "
+        "ban_profile_names, ban_unnamed_profiles "
         "FROM auth_state LIMIT 2"
     ).fetchall()
     if len(rows) != 1 or rows[0][0] != 1:
@@ -160,15 +176,29 @@ def _validate_auth_state(conn: sqlite3.Connection) -> None:
     version = rows[0][1]
     if not isinstance(version, int) or not 0 <= version < MAX_AUTH_VERSION:
         raise MigrationError("auth_state.version must be a nonnegative integer with room to increment")
-    generation, sequence, client_id, digest, profile_names = rows[0][2:]
+    generation, sequence, client_id, digest, profile_names, unnamed_profiles = rows[0][2:]
     known_names = read_ban_profile_names(profile_names)
-    if (generation, sequence, client_id, digest) == (0, 0, "", "") and not known_names:
+    unnamed = read_unnamed_ban_profiles(unnamed_profiles)
+    if known_names.keys() & unnamed.keys():
+        raise MigrationError("A ban profile cannot be both named and unnamed")
+    if (generation, sequence, client_id, digest) == (0, 0, "", "") and not known_names and not unnamed:
         return
     if (type(generation) is not int or not 0 < generation <= MAX_AUTH_VERSION
             or type(sequence) is not int or not 0 < sequence <= MAX_AUTH_VERSION
             or not isinstance(client_id, str) or not re.fullmatch(r"[0-9a-f]{32}", client_id)
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
         raise MigrationError("Invalid banlist upload cursor in auth_state")
+
+
+def _discard_possibly_inferred_profile_names(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT ban_profile_names FROM auth_state WHERE id = 1").fetchone()
+    if row is None:
+        return
+    names = read_ban_profile_names(row[0])
+    # Schema 4 stored inferred offline UUIDs alongside server-confirmed aliases without provenance.
+    confirmed = {uuid: name for uuid, name in names.items() if uuid[14] != "3" or uuid[19] not in "89ab"}
+    if confirmed != names:
+        conn.execute("UPDATE auth_state SET ban_profile_names = ? WHERE id = 1", (json.dumps(confirmed, sort_keys=True),))
 
 
 def _validate_offline_bindings(conn: sqlite3.Connection) -> None:
@@ -260,6 +290,10 @@ def init_database(db_path: Path | None = None) -> None:
             _apply_migration(conn, "003_banlist_upload.sql")
         if version < 4:
             _apply_migration(conn, "004_banlist_profile_names.sql")
+        if version < 5:
+            _apply_migration(conn, "005_unnamed_ban_profiles.sql")
+        if version == 4:
+            _discard_possibly_inferred_profile_names(conn)
 
         for table in CURRENT_TABLES:
             _validate_table(conn, table)

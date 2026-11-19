@@ -100,5 +100,7 @@
       <text x="495" y="$minecraft_title_y" font-size="16" font-weight="700">Minecraft</text>
       <text id="minecraft-detail" x="495" y="548" font-size="13" fill="#a8bbcb">$minecraft_detail</text>
     </g>
+    <text id="unnamed-bans-warning" x="422" y="589" font-size="14" fill="#f5ce79"
+          display="$unnamed_bans_display">$unnamed_bans_warning</text>
   </g>
 </svg>

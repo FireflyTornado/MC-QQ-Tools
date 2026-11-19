@@ -179,8 +179,12 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_upload_is_acknowledged_without_freezing_and_retains_its_original_digest(self):
         now = 1_850_000_000_000
         alex = "00000000-0000-4000-8000-000000000002"
+        unnamed = "00000000-0000-4000-8000-000000000003"
         entries = {"Steve": now - 1}
-        profiles = {alex: {"name": "Alex", "expires_at": now}}
+        profiles = {
+            alex: {"name": "Alex", "expires_at": now},
+            unnamed: {"name": None, "expires_at": now},
+        }
         with patch("banlist_sync.time") as clock:
             clock.time_ns.return_value = now * 1_000_000
             status, _, reply = await self.upload_banlist(1, 1, entries, profiles=profiles)
@@ -193,6 +197,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         })
         with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM server_bans").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT ban_unnamed_profiles FROM auth_state").fetchone()[0], "{}")
 
     async def test_uuid_only_bans_preserve_known_names_without_blocking_other_bans_and_pardons(self):
         steve = "00000000-0000-4000-8000-000000000001"
@@ -204,6 +209,8 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             steve: {"name": "Steve", "expires_at": None},
         }
         self.assertEqual((await self.upload_banlist(1, 2, entries, profiles=initial))[0], 200)
+        mixed = {other: {"name": "Other", "expires_at": None}}
+        self.assertEqual((await self.upload_banlist(1, 3, {**entries, "STEVE": None}, profiles=mixed))[0], 200)
         database.init_database(self.api.DB_PATH)
 
         def states():
@@ -230,33 +237,42 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.upload_banlist(2, 2, {}, replacement, profiles=profiles))[0], 200)
         self.assertEqual(states(), {"steve": "PENDING_MEMBERSHIP_CHECK", "other": "BANNED"})
 
-    async def test_name_only_ban_stays_frozen_when_report_switches_to_its_offline_uuid(self):
+    async def test_unmapped_offline_uuid_is_recorded_without_guessing_its_game_name(self):
         # UUID.nameUUIDFromBytes("OfflinePlayer:Steve".getBytes(UTF_8))
         steve = "5627dd98-e6be-3c21-b8a8-e92344183641"
         unknown = "00000000-0000-4000-8000-000000000003"
-        self.assertEqual((await self.upload_banlist(1, 1, {"steve": None, "alex": None}))[0], 200)
+        self.assertEqual((await self.upload_banlist(1, 1, {"steve": None}))[0], 200)
 
+        expiration = 1_850_000_000_000
         profiles = {
-            steve: {"name": None, "expires_at": None},
+            steve: {"name": None, "expires_at": expiration},
             unknown: {"name": None, "expires_at": None},
         }
-        self.assertEqual((await self.upload_banlist(2, 1, {}, "b" * 32, profiles=profiles))[0], 200)
-        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
-              patch.object(binding_service, "notify_auth_updated")):
-            self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("frozen", "Steve"))
-            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
-            self.assertEqual(set(audit.pending), {"2"})
-            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1", "2"}, 2), 0)
-        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
-        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
-            saved = conn.execute("SELECT ban_profile_names FROM auth_state").fetchone()[0]
-            self.assertEqual(json.loads(saved), {steve: "steve"})
-
-        del profiles[steve]
-        self.assertEqual((await self.upload_banlist(2, 2, {}, "b" * 32, profiles=profiles))[0], 200)
+        with patch("banlist_sync.time") as clock:
+            clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
+            self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=profiles))[0], 200)
+            self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=profiles))[0], 200)
         with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
               patch.object(binding_service, "notify_auth_updated")):
             self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("pending", "Steve"))
+            audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
+            self.assertEqual(set(audit.pending), {"1"})
+            self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"1"}, 2), 0)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
+
+        def stored_profiles():
+            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+                row = conn.execute("SELECT ban_profile_names, ban_unnamed_profiles FROM auth_state").fetchone()
+                return tuple(map(json.loads, row))
+
+        database.init_database(self.api.DB_PATH)
+        self.assertEqual(stored_profiles(), ({}, {steve: expiration, unknown: None}))
+        # An explicit server name associates the UUID and restores the usual ban behavior.
+        self.assertEqual((await self.upload_banlist(1, 3, {}, profiles={
+            steve: {"name": "Steve", "expires_at": None},
+        }))[0], 200)
+        self.assertEqual(stored_profiles(), ({steve: "steve"}, {}))
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex"])
 
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):

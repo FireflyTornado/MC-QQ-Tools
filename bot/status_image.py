@@ -206,6 +206,9 @@ def render_status(
     cores = status.cpu_cores if status.cpu_cores is not None else EMPTY
     local_time = status.checked_at.astimezone()
     offset = local_time.strftime("%z")
+    unnamed_bans = ""
+    if status.unnamed_bans:
+        unnamed_bans = f"无名 UUID 封禁：{status.unnamed_bans} 条" if cjk else f"Unnamed UUID bans: {status.unnamed_bans}"
 
     fields = {
         "font_family": family,
@@ -231,6 +234,8 @@ def render_status(
         "api_status": text(api_status, 14, 164),
         "minecraft_title_y": 528 if game_detail else 537,
         "minecraft_detail": text(game_detail, 13, 110),
+        "unnamed_bans_warning": text(unnamed_bans, 14, 252),
+        "unnamed_bans_display": "inline" if unnamed_bans else "none",
         "sqlite_name": text(label("database"), 13, 79, "SQLite"),
         "resources_label": resources_label,
         "system": text(f"{system} · {label('python')} {python}", 15, LEFT_CONTENT_WIDTH,

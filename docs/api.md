@@ -52,7 +52,7 @@ curl --fail http://127.0.0.1:18765/internal/mc/snapshot \
 }
 ```
 
-`profiles` 按 UUID 上报封禁，`name` 可为 `null`。`entries` 用于没有 UUID 的具名记录。省略 `profiles` 时，`entries` 仍代表旧格式的完整具名名单。到期时间使用 Unix 毫秒，永久封禁用 `null`。数据库记住仍在封禁名单里、曾有可用游戏名的 UUID。只有 UUID 的档案优先沿用同一 UUID 的已知名称，其次尝试与库内游戏名计算出的原版离线 UUID 做精确匹配。仍无法关联游戏名的封禁由 Minecraft 服务端按 UUID 执行，Bot 按快照中可确认的名称处理冻结和解封。
+`profiles` 按 UUID 上报封禁，`name` 可为 `null`。`entries` 用于没有 UUID 的具名记录。省略 `profiles` 时，`entries` 仍代表旧格式的完整具名名单。到期时间使用 Unix 毫秒，永久封禁用 `null`。只有 UUID 的档案沿用游戏服务端已确认的名称。只要 `entries` 仍含有效的同名封禁，就保留已有的 UUID 映射。仍无法关联名称的有效封禁会记录 UUID 和到期时间，由 Minecraft 服务端按 UUID 执行。Bot 按具名记录处理绑定、冻结和解封，`/info` 状态图显示仍有效的无名封禁数量。
 
 `PUT` 在 SQLite 提交后返回 HTTP 200 和 `{"generation":1,"sequence":1}`。应用时忽略已经到期的条目，重试使用过滤前的规范化快照进行幂等确认。旧会话、跳号或同号但内容不同的快照返回 HTTP 409。上报会话和最近确认位置随数据库持久化，后端重启后可继续重试。
 

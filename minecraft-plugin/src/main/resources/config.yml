@@ -28,6 +28,10 @@ sync:
   reconnect-min-ms: 1000
   reconnect-max-ms: 30000
 
+banlist-watch:
+  # 测试服启用后，在控制台记录原版玩家封禁名单的实际变化。
+  enabled: false
+
 sudo:
   enabled: false
   websocket-url: ""

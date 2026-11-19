@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.Set;
 
 public final class MCQQAuthPlugin extends JavaPlugin {
@@ -29,6 +30,7 @@ public final class MCQQAuthPlugin extends JavaPlugin {
     private AuthorizationModeController modes;
     private AuthorizationListener listener;
     private ObserveNotice observeNotice;
+    private BanListMonitor banListMonitor;
     private boolean changingMode;
 
     @Override
@@ -68,6 +70,9 @@ public final class MCQQAuthPlugin extends JavaPlugin {
         if (!validMode) {
             return;
         }
+        if (config.getBoolean("banlist-watch.enabled")) {
+            startBanListMonitor();
+        }
         PluginSettings settings;
         try {
             settings = PluginSettings.read(config);
@@ -86,6 +91,15 @@ public final class MCQQAuthPlugin extends JavaPlugin {
                 }));
         authorization.start();
         startSudo(config, settings);
+    }
+
+    private void startBanListMonitor() {
+        try {
+            banListMonitor = new BanListMonitor(this, Path.of("banned-players.json"), Clock.systemUTC());
+            banListMonitor.start();
+        } catch (IOException | SecurityException | UnsupportedOperationException e) {
+            getLogger().warning("无法监听 banned-players.json：" + e.getMessage());
+        }
     }
 
     private void startSudo(YamlConfiguration config, PluginSettings settings) {
@@ -142,6 +156,10 @@ public final class MCQQAuthPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        if (banListMonitor != null) {
+            banListMonitor.close();
+            banListMonitor = null;
+        }
         sudoCommands = null;
         if (sudoChannel != null) {
             sudoChannel.close();

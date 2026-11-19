@@ -13,12 +13,14 @@ events:
     # 关闭后仍会撤销离群成员的有效授权绑定。
     enabled: false
     revoked: "成员已退出群聊。Minecraft 授权已自动撤销。"
+    retained: "成员已退出群聊。Minecraft 绑定仍保留。"
     no_binding: "成员已退出群聊。"
     failed: "成员已退出群聊。Minecraft 授权撤销暂未确认。"
   kick:
     # 关闭后仍会撤销被移出成员的有效授权绑定。
     enabled: false
     revoked: "成员已被移出群聊。Minecraft 授权已自动撤销。"
+    retained: "成员已被移出群聊。Minecraft 绑定仍保留。"
     no_binding: "成员已被移出群聊。"
     failed: "成员已被移出群聊。Minecraft 授权撤销暂未确认。"
 
@@ -26,7 +28,7 @@ commands:
   # 中英文别名共用同一套文案。
   bind:
     usage: "用法：/绑定 Minecraft玩家名"
-    # success、already_bound、frozen 和 pending 支持 {mc_name}。
+    # success 和 already_bound 支持 {mc_name}。
     success: |-
       绑定成功！
       Minecraft ID：{mc_name}
@@ -39,8 +41,6 @@ commands:
       如需更换，请先使用 /解绑
     name_taken: "该游戏 ID 已经被绑定，无法重复绑定。"
     banned_name: "该游戏 ID 已被 Minecraft 服务器封禁，暂时无法绑定。"
-    frozen: "你绑定的 Minecraft ID {mc_name} 处于封禁冻结状态，暂时无法换绑。"
-    pending: "你绑定的 Minecraft ID {mc_name} 已解封，正在核实群成员身份，暂时无法换绑。"
     error: "绑定服务发生错误，请稍后重试"
   unbind:
     # success、frozen 和 pending 支持 {mc_name}。

@@ -133,7 +133,7 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
                 pending_departures.popitem(last=False)
             outcome = await verify_same_second_departure(bot, qq_id, result)
         else:
-            outcome = "revoked" if result is not None else "no_binding"
+            outcome = result
         pending_departures.pop(key, None)
     except (sqlite3.Error, UnverifiedMembers, TimeoutError, OneBotV11AdapterException) as exc:
         logger.error("[MC-QQ-AUTH] {}后的撤权暂未确认（{}）", reason, type(exc).__name__)

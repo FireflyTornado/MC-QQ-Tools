@@ -136,15 +136,19 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         return patch.object(self.bot, "call_api", AsyncMock(side_effect=api))
 
     async def test_ban_freezes_commands_and_leave_until_a_verified_roster_resolves_unlock(self):
+        self.enable_notices("leave", "kick")
         self.bind()
         self.bind(MEMBER, "Alex")
+        already_bound = "你已经绑定了游戏 ID：Steve\n如需更换，请先使用 /解绑"
+        self.assertEqual(str(await self.command_reply("/绑定 NewName")), already_bound)
         binding_service.apply_ban_snapshot({"steve": None, "Alex": None})
         self.notify.reset_mock()
         version = self.version()
         self.assertIn("封禁冻结", str(await self.command_reply("/我的绑定")))
-        self.assertIn("无法换绑", str(await self.command_reply("/绑定 NewName")))
+        self.assertEqual(str(await self.command_reply("/绑定 NewName")), already_bound)
         self.assertIn("无法解绑", str(await self.command_reply("/解绑")))
         await self.events.handle_member_leave(self.bot, departure())
+        self.assert_notice("成员已退出群聊。Minecraft 绑定仍保留。")
         self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("frozen", "Steve"))
         with patch.object(self.bot, "call_api", AsyncMock()) as api:
             self.assertEqual(await self.events.reconcile_members(self.bot), 0)
@@ -153,6 +157,10 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         binding_service.apply_ban_snapshot({})
         self.assertIn("正在核实", str(await self.command_reply("/我的绑定")))
         self.assertIn("正在核实", str(await self.command_reply("/解绑")))
+        self.assertEqual(str(await self.command_reply("/bind NewName")), already_bound)
+        self.send_group.reset_mock()
+        await self.events.handle_member_leave(self.bot, departure("kick"))
+        self.assert_notice("成员已被移出群聊。Minecraft 绑定仍保留。")
         self.assertEqual(self.version(), version)
         with self.mock_roster(member_rows(BOT, MEMBER), count=3):
             self.assertIsNone(await self.events.reconcile_members(self.bot, only_pending=True))

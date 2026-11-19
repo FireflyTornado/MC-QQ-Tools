@@ -324,7 +324,7 @@ include /opt/mc-qq-auth/deploy/nginx/mc-qq-api-http.conf;
 
 ### 玩家封禁名单联动
 
-在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。升级数据库到版本 4 后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。从旧版本升级时，运行 `python bot/migrate.py` 将数据库从 v1 迁移到 v2，然后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
 
 ```yaml
 banlist-watch:

@@ -93,6 +93,35 @@ commands:
     success: "授权对账完成，已撤销 {count} 条离群绑定。"
     failed: "授权对账未完成，请检查群成员名单和服务日志。"
     busy: "授权对账正在执行，请稍后重试。"
+  db:
+    usage: |-
+      /db add <QQ号> <游戏名> · 添加绑定
+      /db rm <QQ号或游戏名> · 删除有效绑定
+      /db get <QQ号或游戏名> · 查询绑定
+      纯数字有歧义时，用 qq: 或 mc: 指定类型。
+    add_usage: "用法：/db add <QQ号> <游戏名>"
+    rm_usage: "用法：/db rm <QQ号或游戏名>，可加 qq: 或 mc: 前缀。"
+    get_usage: "用法：/db get <QQ号或游戏名>，可加 qq: 或 mc: 前缀。"
+    invalid_qq: "QQ 号格式不正确，请输入 QQ 号的数字。"
+    invalid_name: "游戏名须由 1–16 位英文字母、数字或下划线组成。"
+    members_unverified: "暂时无法核实目标群成员，请稍后重试。"
+    # {qq_id} 是目标成员的 QQ 号，{mc_name} 是相关绑定的游戏 ID。
+    not_member: "QQ {qq_id} 当前不在目标群，无法添加绑定。"
+    success: "已添加绑定：{qq_id} ↔ {mc_name}〔有效〕"
+    already_same: "已绑定：{qq_id} ↔ {mc_name}"
+    already_bound: "QQ {qq_id} 已有绑定：{mc_name}。"
+    # name_taken 和 banned_name 的 {mc_name} 是申请绑定的游戏 ID。
+    name_taken: "游戏名 {mc_name} 已被其他绑定占用。"
+    banned_name: "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。"
+    active: "{qq_id} ↔ {mc_name}〔有效〕"
+    frozen: "{qq_id} ↔ {mc_name}〔封禁冻结〕"
+    pending: "{qq_id} ↔ {mc_name}〔待核实群成员〕"
+    removed: "已删除有效绑定：{qq_id} ↔ {mc_name}"
+    rm_frozen: "{qq_id} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。"
+    rm_pending: "{qq_id} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。"
+    ambiguous: "按 QQ 号和游戏名查到了两条不同绑定，请用 qq: 或 mc: 指定类型。"
+    not_bound: "未找到绑定。"
+    error: "绑定数据库操作失败，请稍后重试。"
   help:
     message: |-
       [MC-QQ-Auth] 指令帮助
@@ -104,6 +133,7 @@ commands:
       超级用户专用
       /信息 或 /info · 查看状态图片
       /授权对账 或 /reconcile · 核对群成员与授权
+      /db · 手动添加、删除或查询绑定
   info:
     busy: "状态图正在生成，请稍后重试。"
     error: "状态图暂不可用，请稍后重试。"

@@ -24,6 +24,14 @@ class DepartureCheck:
     version: int
 
 
+@dataclass(frozen=True)
+class BindingRecord:
+    id: int
+    qq_id: str
+    mc_name: str
+    state: str
+
+
 def _active_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[int, str, int] | None:
     return conn.execute(
         """
@@ -59,13 +67,15 @@ def get_binding(group_id: str, qq_id: str) -> str | None:
     return name if status == "success" else None
 
 
-def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | None]:
+def bind_player(
+    group_id: str, qq_id: str, mc_name: str, *, authorization_checked_at: int | None = None,
+) -> tuple[str, str | None]:
     """绑定玩家，返回操作状态和关联的游戏 ID。"""
     if not valid_mc_name(mc_name):
         return "invalid_name", None
 
     name_key = mc_name.lower()
-    now = int(time.time())
+    now = int(time.time()) if authorization_checked_at is None else authorization_checked_at
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
@@ -104,6 +114,41 @@ def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | Non
 
     notify_auth_updated()
     return "success", mc_name
+
+
+def resolve_binding(
+    group_id: str, *, qq_id: str | None, mc_name: str | None, remove: bool = False,
+) -> tuple[str, BindingRecord | None]:
+    """Resolve an admin lookup and optionally remove a unique active match in the same transaction."""
+    name_key = mc_name.lower() if mc_name is not None else None
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
+        if remove:
+            conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT id, qq_id, mc_name, 'active'
+            FROM offline_bindings
+            WHERE group_id = ? AND status = 'ACTIVE' AND (qq_id = ? OR mc_name_key = ?)
+            UNION ALL
+            SELECT id, qq_id, mc_name, CASE state WHEN 'FROZEN' THEN 'frozen' ELSE 'pending' END
+            FROM frozen_bindings
+            WHERE group_id = ? AND (qq_id = ? OR mc_name_key = ?)
+            LIMIT 2
+            """,
+            (group_id, qq_id, name_key, group_id, qq_id, name_key),
+        ).fetchall()
+        if not rows:
+            return "not_bound", None
+        if len(rows) > 1:
+            return "ambiguous", None
+        record = BindingRecord(*rows[0])
+        if not remove or record.state != "active":
+            return record.state, record
+        _delete_active_bindings(conn, group_id, {record.qq_id: record.id})
+        update_auth_version(conn)
+
+    notify_auth_updated()
+    return "removed", record
 
 
 def _request_unbind(

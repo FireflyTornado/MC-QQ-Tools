@@ -55,6 +55,33 @@ DEFAULTS = MappingProxyType({
     "commands.reconcile.success": "授权对账完成，已撤销 {count} 条离群绑定。",
     "commands.reconcile.failed": "授权对账未完成，请检查群成员名单和服务日志。",
     "commands.reconcile.busy": "授权对账正在执行，请稍后重试。",
+    "commands.db.usage": (
+        "/db add <QQ号> <游戏名> · 添加绑定\n"
+        "/db rm <QQ号或游戏名> · 删除有效绑定\n"
+        "/db get <QQ号或游戏名> · 查询绑定\n"
+        "纯数字有歧义时，用 qq: 或 mc: 指定类型。"
+    ),
+    "commands.db.add_usage": "用法：/db add <QQ号> <游戏名>",
+    "commands.db.rm_usage": "用法：/db rm <QQ号或游戏名>，可加 qq: 或 mc: 前缀。",
+    "commands.db.get_usage": "用法：/db get <QQ号或游戏名>，可加 qq: 或 mc: 前缀。",
+    "commands.db.invalid_qq": "QQ 号格式不正确，请输入 QQ 号的数字。",
+    "commands.db.invalid_name": "游戏名须由 1–16 位英文字母、数字或下划线组成。",
+    "commands.db.members_unverified": "暂时无法核实目标群成员，请稍后重试。",
+    "commands.db.not_member": "QQ {qq_id} 当前不在目标群，无法添加绑定。",
+    "commands.db.success": "已添加绑定：{qq_id} ↔ {mc_name}〔有效〕",
+    "commands.db.already_same": "已绑定：{qq_id} ↔ {mc_name}",
+    "commands.db.already_bound": "QQ {qq_id} 已有绑定：{mc_name}。",
+    "commands.db.name_taken": "游戏名 {mc_name} 已被其他绑定占用。",
+    "commands.db.banned_name": "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。",
+    "commands.db.active": "{qq_id} ↔ {mc_name}〔有效〕",
+    "commands.db.frozen": "{qq_id} ↔ {mc_name}〔封禁冻结〕",
+    "commands.db.pending": "{qq_id} ↔ {mc_name}〔待核实群成员〕",
+    "commands.db.removed": "已删除有效绑定：{qq_id} ↔ {mc_name}",
+    "commands.db.rm_frozen": "{qq_id} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。",
+    "commands.db.rm_pending": "{qq_id} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。",
+    "commands.db.ambiguous": "按 QQ 号和游戏名查到了两条不同绑定，请用 qq: 或 mc: 指定类型。",
+    "commands.db.not_bound": "未找到绑定。",
+    "commands.db.error": "绑定数据库操作失败，请稍后重试。",
     "commands.help.message": (
         "[MC-QQ-Auth] 指令帮助\n"
         "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID\n"
@@ -64,7 +91,8 @@ DEFAULTS = MappingProxyType({
         "/帮助 或 /help · 显示本帮助\n"
         "超级用户专用\n"
         "/信息 或 /info · 查看状态图片\n"
-        "/授权对账 或 /reconcile · 核对群成员与授权"
+        "/授权对账 或 /reconcile · 核对群成员与授权\n"
+        "/db · 手动添加、删除或查询绑定"
     ),
     "commands.info.busy": "状态图正在生成，请稍后重试。",
     "commands.info.error": "状态图暂不可用，请稍后重试。",
@@ -115,6 +143,16 @@ BUSINESS_FIELDS = {
     "commands.ping.connection_error": {"latency_ms"},
     "commands.ping.error": {"latency_ms"},
     "commands.reconcile.success": {"count"},
+    "commands.db.not_member": {"qq_id"},
+    "commands.db.name_taken": {"mc_name"},
+    "commands.db.banned_name": {"mc_name"},
+    **{
+        f"commands.db.{status}": {"qq_id", "mc_name"}
+        for status in (
+            "success", "already_same", "already_bound", "active", "frozen", "pending", "removed",
+            "rm_frozen", "rm_pending",
+        )
+    },
 }
 TOKENS = re.compile(r"(\{\{|\}\}|\{[a-z_]+\}|[{}])")
 UNSAFE_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")

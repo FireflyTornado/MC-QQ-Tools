@@ -19,7 +19,8 @@ from nonebot.permission import SUPERUSER
 
 import message_config
 from binding_service import (
-    DepartureCheck, handle_departure, membership_audit_snapshot, reconcile_checked_bindings, revoke_checked_bindings,
+    DepartureCheck, bind_player, handle_departure, membership_audit_snapshot, reconcile_checked_bindings,
+    revoke_checked_bindings,
 )
 from qq_group import TARGET_GROUP_ID, group_rule, message_variables
 from runtime_status import record_outcome
@@ -196,6 +197,26 @@ async def verified_group_members(bot: Bot) -> set[str]:
             or type(detail.get("group_id")) is not int or detail["group_id"] != TARGET_GROUP_ID):
         raise UnverifiedMembers
     return second
+
+
+async def bind_verified_member(bot: Bot, qq_id: str, mc_name: str) -> tuple[str, str | None]:
+    """Bind a target-group member, coordinating the write with member departures."""
+    if not can_verify_members(bot):
+        return "members_unverified", None
+    generation = membership_generation
+    # Leave events during the roster check or write must still be able to revoke the binding.
+    checked_at = int(time.time())
+    try:
+        members = await verified_group_members(bot)
+    except (UnverifiedMembers, TimeoutError, OneBotV11AdapterException):
+        return "members_unverified", None
+
+    async with membership_write_lock:
+        if membership_generation != generation or not can_verify_members(bot):
+            return "members_unverified", None
+        if qq_id not in members:
+            return "not_member", None
+        return await asyncio.to_thread(bind_player, GROUP_ID, qq_id, mc_name, authorization_checked_at=checked_at)
 
 
 async def verify_same_second_departure(

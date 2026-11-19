@@ -63,6 +63,7 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         cls.driver.register_adapter(Adapter)
         cls.events = importlib.import_module("plugins.qq_events")
         importlib.import_module("plugins.qq_bindings")
+        importlib.import_module("plugins.qq_db")
         cls.status = importlib.import_module("plugins.status_commands")
         cls.sudo = importlib.import_module("plugins.qq_sudo")
 
@@ -686,6 +687,112 @@ events:
         await self.bot.handle_event(self.group_message(text, **event_fields))
         self.reply.assert_awaited_once()
         return self.reply.call_args.kwargs["message"]
+
+    async def test_db_add_requires_superuser_in_target_group_and_verified_membership(self):
+        command = f"/db add {ABSENT} Steve"
+        await self.bot.handle_event(self.group_message(command, user=ABSENT))
+        await self.bot.handle_event(self.group_message(command, user=MEMBER, group=OTHER_GROUP))
+        self.reply.assert_not_awaited()
+
+        version = self.version()
+        with self.mock_roster(member_rows(BOT, MEMBER)):
+            self.assertIn("不在目标群", str(await self.command_reply(command, user=MEMBER)))
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=2):
+            self.assertIn("无法核实", str(await self.command_reply(command, user=MEMBER)))
+        self.assertIsNone(self.binding())
+        self.assertEqual(self.version(), version)
+        self.notify.assert_not_called()
+
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+            self.assertIn(f"已添加绑定：{ABSENT} ↔ Steve", str(await self.command_reply(command, user=MEMBER)))
+        self.assertEqual(self.binding(), "Steve")
+        self.assertGreater(self.version(), version)
+        self.notify.assert_called_once_with()
+
+        version = self.version()
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+            self.assertEqual(str(await self.command_reply(f"/db add {ABSENT} STEVE", user=MEMBER)),
+                             f"已绑定：{ABSENT} ↔ Steve")
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+            self.assertIn("已有绑定", str(await self.command_reply(f"/db add {ABSENT} Alex", user=MEMBER)))
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+            self.assertIn("已被其他绑定占用", str(await self.command_reply(f"/db add {MEMBER} steve", user=MEMBER)))
+        binding_service.apply_ban_snapshot({"Banned": None})
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+            self.assertIn("已被游戏服封禁", str(await self.command_reply(f"/db add {MEMBER} banned", user=MEMBER)))
+        self.assertEqual(self.version(), version)
+        self.notify.assert_called_once_with()
+
+    async def test_db_add_rejects_roster_changed_during_verification(self):
+        async def roster_with_departure(bot):
+            await self.events.handle_member_leave(bot, departure())
+            return {str(BOT), str(MEMBER), str(ABSENT)}
+
+        with patch.object(self.events, "verified_group_members", side_effect=roster_with_departure):
+            reply = await self.command_reply(f"/db add {ABSENT} Steve", user=MEMBER)
+        self.assertIn("无法核实", str(reply))
+        self.assertIsNone(self.binding())
+        self.notify.assert_not_called()
+
+    async def test_db_get_and_rm_resolve_numeric_ambiguity_and_scope_to_the_target_group(self):
+        self.bind(ABSENT, "Steve")
+        self.bind(MEMBER, str(ABSENT))
+        self.bind(ABSENT, "Other", group=OTHER_GROUP)
+        self.notify.reset_mock()
+        version = self.version()
+
+        self.assertIn("/db add", str(await self.command_reply("/db", user=MEMBER)))
+        self.assertIn("用法", str(await self.command_reply("/db get qq:Steve", user=MEMBER)))
+        self.assertEqual(str(await self.command_reply("/db get Other", user=MEMBER)), "未找到绑定。")
+        for action in ("get", "rm"):
+            with self.subTest(action=action):
+                reply = str(await self.command_reply(f"/db {action} {ABSENT}", user=MEMBER))
+                self.assertIn("两条不同绑定", reply)
+        self.assertEqual(str(await self.command_reply(f"/db get qq:{ABSENT}", user=MEMBER)),
+                         f"{ABSENT} ↔ Steve〔有效〕")
+        self.assertEqual(str(await self.command_reply(f"/db get mc:{ABSENT}", user=MEMBER)),
+                         f"{MEMBER} ↔ {ABSENT}〔有效〕")
+        self.assertEqual(self.version(), version)
+        self.notify.assert_not_called()
+
+        self.assertIn("已删除有效绑定", str(await self.command_reply("/db rm sTeVe", user=MEMBER)))
+        self.assertIsNone(self.binding())
+        self.assertEqual(self.binding(MEMBER), str(ABSENT))
+        self.assertEqual(self.binding(group=OTHER_GROUP), "Other")
+        self.assertGreater(self.version(), version)
+        self.notify.assert_called_once_with()
+
+        self.bind(ABSENT, "Alex")
+        self.assertIn("已删除有效绑定", str(await self.command_reply(f"/db rm mc:{ABSENT}", user=MEMBER)))
+        self.assertEqual(self.binding(), "Alex")
+        self.assertIsNone(self.binding(MEMBER))
+
+        self.bind(MEMBER, str(MEMBER))
+        self.assertEqual(str(await self.command_reply(f"/db get {MEMBER}", user=MEMBER)),
+                         f"{MEMBER} ↔ {MEMBER}〔有效〕")
+
+    async def test_db_rm_leaves_frozen_and_pending_bindings_available_for_restoration(self):
+        self.bind()
+        binding_service.apply_ban_snapshot({"Steve": None})
+        self.notify.reset_mock()
+        version = self.version()
+
+        self.assertIn("封禁冻结", str(await self.command_reply("/db get steve", user=MEMBER)))
+        self.assertIn("先在游戏服解封", str(await self.command_reply("/db rm Steve", user=MEMBER)))
+        self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("frozen", "Steve"))
+
+        binding_service.apply_ban_snapshot({})
+        self.assertIn("待核实群成员", str(await self.command_reply(f"/db get {ABSENT}", user=MEMBER)))
+        self.assertIn("/授权对账", str(await self.command_reply(f"/db rm {ABSENT}", user=MEMBER)))
+        self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), ("pending", "Steve"))
+        self.assertEqual(self.version(), version)
+        self.notify.assert_not_called()
+
+        with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+            self.assertEqual(await self.events.reconcile_members(self.bot, only_pending=True), 0)
+        self.assertEqual(self.binding(), "Steve")
+        self.assertIn("已删除有效绑定", str(await self.command_reply(f"/db rm {ABSENT}", user=MEMBER)))
+        self.assertIsNone(self.binding())
 
     async def test_sudo_requires_explicit_qq_in_target_group_and_holds_slot_until_reply(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(

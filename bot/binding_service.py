@@ -3,6 +3,7 @@ import time
 from collections.abc import Mapping, Set
 from contextlib import closing
 from dataclasses import dataclass
+from typing import Literal
 
 from banlist_sync import apply_normalized_bans, normalize_ban_snapshot
 from database import DB_PATH, update_auth_version, valid_mc_name
@@ -67,12 +68,15 @@ def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | Non
     now = int(time.time())
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
-        existing = _active_binding(conn, group_id, qq_id)
+        existing = conn.execute(
+            """
+            SELECT mc_name FROM offline_bindings WHERE group_id = ? AND qq_id = ? AND status = 'ACTIVE'
+            UNION ALL SELECT mc_name FROM frozen_bindings WHERE group_id = ? AND qq_id = ? LIMIT 1
+            """,
+            (group_id, qq_id, group_id, qq_id),
+        ).fetchone()
         if existing:
-            return "already_bound", existing[1]
-        reserved = _reserved_binding(conn, group_id, qq_id)
-        if reserved:
-            return reserved
+            return "already_bound", existing[0]
 
         ban = conn.execute(
             "SELECT 1 FROM server_bans WHERE state = 'BANNED' AND mc_name_key = ? LIMIT 1", (name_key,),
@@ -138,12 +142,16 @@ def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> s
 
 def handle_departure(
     group_id: str, qq_id: str, left_at: int, *, only_same_second: bool = False,
-) -> DepartureCheck | str | None:
+) -> DepartureCheck | tuple[Literal["revoked", "retained", "no_binding"], str | None]:
     result = _request_unbind(group_id, qq_id, left_at, only_same_second=only_same_second)
     if isinstance(result, DepartureCheck):
         return result
-    status, name = result
-    return name if status == "success" else None
+    status, mc_name = result
+    if status == "success":
+        return "revoked", mc_name
+    if status in {"frozen", "pending"}:
+        return "retained", mc_name
+    return "no_binding", None
 
 
 def apply_ban_snapshot(entries: Mapping[str, int | None]) -> int:

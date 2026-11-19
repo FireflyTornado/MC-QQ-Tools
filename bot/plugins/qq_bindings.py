@@ -3,6 +3,7 @@ import sqlite3
 
 from nonebot import logger, on_command
 from nonebot.adapters.onebot.v11 import (
+    Bot,
     GroupMessageEvent,
     Message,
 )
@@ -14,7 +15,7 @@ from binding_service import (
     request_unbind,
 )
 import message_config
-from qq_group import group_rule
+from qq_group import group_rule, message_variables
 
 
 # ========================================
@@ -32,13 +33,15 @@ bind = on_command(
 
 @bind.handle()
 async def handle_bind(
+    bot: Bot,
     event: GroupMessageEvent,
     args: Message = CommandArg(),
 ):
     mc_name = args.extract_plain_text().strip()
+    variables = message_variables(bot)
 
     if not mc_name:
-        await bind.finish(message_config.MESSAGES.render("commands.bind.usage"))
+        await bind.finish(message_config.MESSAGES.render("commands.bind.usage", **variables))
 
     group_id = str(event.group_id)
     qq_id = str(event.user_id)
@@ -52,9 +55,11 @@ async def handle_bind(
         )
     except sqlite3.Error:
         logger.exception("绑定数据库操作失败")
-        await bind.finish(message_config.MESSAGES.render("commands.bind.error"))
+        await bind.finish(message_config.MESSAGES.render("commands.bind.error", **variables))
 
-    await bind.finish(message_config.MESSAGES.render(f"commands.bind.{status}", mc_name=value))
+    await bind.finish(message_config.MESSAGES.render(
+        f"commands.bind.{status}", **variables, mc_name=value, requested_mc_name=mc_name,
+    ))
 
 
 # ========================================
@@ -71,7 +76,8 @@ query = on_command(
 
 
 @query.handle()
-async def handle_query(event: GroupMessageEvent):
+async def handle_query(bot: Bot, event: GroupMessageEvent):
+    variables = message_variables(bot)
     try:
         status, mc_name = await asyncio.to_thread(
             query_binding,
@@ -80,9 +86,9 @@ async def handle_query(event: GroupMessageEvent):
         )
     except sqlite3.Error:
         logger.exception("查询绑定数据库失败")
-        await query.finish(message_config.MESSAGES.render("commands.binding.error"))
+        await query.finish(message_config.MESSAGES.render("commands.binding.error", **variables))
 
-    await query.finish(message_config.MESSAGES.render(f"commands.binding.{status}", mc_name=mc_name))
+    await query.finish(message_config.MESSAGES.render(f"commands.binding.{status}", **variables, mc_name=mc_name))
 
 
 # ========================================
@@ -99,7 +105,8 @@ unbind = on_command(
 
 
 @unbind.handle()
-async def handle_unbind(event: GroupMessageEvent):
+async def handle_unbind(bot: Bot, event: GroupMessageEvent):
+    variables = message_variables(bot)
     try:
         status, mc_name = await asyncio.to_thread(
             request_unbind,
@@ -108,6 +115,6 @@ async def handle_unbind(event: GroupMessageEvent):
         )
     except sqlite3.Error:
         logger.exception("解绑数据库操作失败")
-        await unbind.finish(message_config.MESSAGES.render("commands.unbind.error"))
+        await unbind.finish(message_config.MESSAGES.render("commands.unbind.error", **variables))
 
-    await unbind.finish(message_config.MESSAGES.render(f"commands.unbind.{status}", mc_name=mc_name))
+    await unbind.finish(message_config.MESSAGES.render(f"commands.unbind.{status}", **variables, mc_name=mc_name))

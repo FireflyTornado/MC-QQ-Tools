@@ -129,13 +129,15 @@ def _avatar_uri(avatar: Image.Image | None) -> str:
 
 
 def render_status(
-    status: RuntimeStatus, *, qq_id: str = "", nickname: str | None = None, avatar: Image.Image | None = None,
+    status: RuntimeStatus, *, group_id: str | None = None, qq_id: str = "", nickname: str | None = None,
+    avatar: Image.Image | None = None,
 ) -> bytes:
     cjk = _font_source(False) is not None
     regular = _font_source(False) if cjk else _latin_source(False)
     bold = (_font_source(True) if cjk else _latin_source(True)) or regular
     family = _font(regular, 16).getname()[0] if regular is not None else "sans-serif"
     messages = message_config.MESSAGES
+    variables = {"group_id": group_id, "bot_qq": qq_id or None}
 
     def text(value: str, size: int, width: int, fallback: str | None = None, *, strong: bool = False) -> str:
         if not cjk and fallback is not None and not value.isascii():
@@ -143,7 +145,7 @@ def render_status(
         return _fit(value, _font(bold if strong else regular, size), width)
 
     def label(key: str) -> str:
-        return messages.info_text(f"info.labels.{key}")
+        return messages.info_text(f"info.labels.{key}", **variables)
 
     def metric(value: int | None) -> tuple[str, int]:
         count = str(value) if value is not None else EMPTY
@@ -216,7 +218,7 @@ def render_status(
 
     fields = {
         "font_family": family,
-        "title": text(messages.info_text("info.title"), 29, 485, "MC-QQ-Auth", strong=True),
+        "title": text(messages.info_text("info.title", **variables), 29, 485, "MC-QQ-Auth", strong=True),
         "page_label": "运行状态" if cjk else "Runtime status",
         "avatar": _avatar_uri(avatar),
         "avatar_display": "inline" if avatar is not None else "none",

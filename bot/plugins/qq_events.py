@@ -21,7 +21,7 @@ import message_config
 from binding_service import (
     DepartureCheck, handle_departure, membership_audit_snapshot, reconcile_checked_bindings, revoke_checked_bindings,
 )
-from qq_group import TARGET_GROUP_ID, group_rule
+from qq_group import TARGET_GROUP_ID, group_rule, message_variables
 from runtime_status import record_outcome
 
 driver = get_driver()
@@ -72,7 +72,10 @@ async def handle_member_join(
         "[MC-QQ-AUTH] 检测到目标群成员加入事件"
     )
     if message_config.MESSAGES.enabled("join"):
-        message = message_config.MESSAGES.render("events.join.message", member=MessageSegment.at(event.user_id))
+        message = message_config.MESSAGES.render(
+            "events.join.message", **message_variables(bot), member=MessageSegment.at(event.user_id),
+            member_qq=event.user_id,
+        )
         await send_member_notice(bot, message)
 
 
@@ -131,13 +134,13 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
             pending_departures.move_to_end(key)
             if len(pending_departures) > RECENT_DEPARTURE_LIMIT:
                 pending_departures.popitem(last=False)
-            outcome = await verify_same_second_departure(bot, qq_id, result)
+            outcome, mc_name = await verify_same_second_departure(bot, qq_id, result)
         else:
-            outcome = "revoked" if result is not None else "no_binding"
+            outcome, mc_name = result
         pending_departures.pop(key, None)
     except (sqlite3.Error, UnverifiedMembers, TimeoutError, OneBotV11AdapterException) as exc:
         logger.error("[MC-QQ-AUTH] {}后的撤权暂未确认（{}）", reason, type(exc).__name__)
-        outcome = "failed"
+        outcome, mc_name = "failed", None
     else:
         handling = "handled"
         if outcome == "revoked":
@@ -147,7 +150,9 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
             recent_departures[key] = handling
     if (outcome != "present" and (previous != "handled" or outcome == "revoked")
             and (previous, outcome) != ("failed", "failed") and message_config.MESSAGES.enabled(event.sub_type)):
-        await send_member_notice(bot, message_config.MESSAGES.render(f"events.{event.sub_type}.{outcome}"))
+        await send_member_notice(bot, message_config.MESSAGES.render(
+            f"events.{event.sub_type}.{outcome}", **message_variables(bot), member_qq=qq_id, mc_name=mc_name,
+        ))
 
 
 class UnverifiedMembers(ValueError):
@@ -193,7 +198,9 @@ async def verified_group_members(bot: Bot) -> set[str]:
     return second
 
 
-async def verify_same_second_departure(bot: Bot, qq_id: str, check: DepartureCheck) -> str:
+async def verify_same_second_departure(
+    bot: Bot, qq_id: str, check: DepartureCheck,
+) -> tuple[Literal["present", "revoked", "no_binding"], str | None]:
     async with reconcile_lock:
         if not can_verify_members(bot):
             raise UnverifiedMembers
@@ -203,11 +210,11 @@ async def verify_same_second_departure(bot: Bot, qq_id: str, check: DepartureChe
             if membership_generation != generation or not can_verify_members(bot):
                 raise UnverifiedMembers
             if qq_id in members:
-                return "present"
+                return "present", None
             deleted = await asyncio.to_thread(revoke_checked_bindings, GROUP_ID, check.version, {qq_id: check.binding_id})
             if deleted is None:
                 raise UnverifiedMembers
-            return "revoked" if deleted else "no_binding"
+            return ("revoked", check.mc_name) if deleted else ("no_binding", None)
 
 
 async def reconcile_members(bot: Bot, *, only_pending: bool = False) -> int | None:
@@ -301,9 +308,10 @@ reconcile = on_command(
 
 @reconcile.handle()
 async def handle_reconcile(bot: Bot, event: GroupMessageEvent):
+    variables = message_variables(bot)
     if reconcile_lock.locked():
-        await reconcile.finish(message_config.MESSAGES.render("commands.reconcile.busy"))
+        await reconcile.finish(message_config.MESSAGES.render("commands.reconcile.busy", **variables))
     count = await reconcile_members(bot)
     if count is None:
-        await reconcile.finish(message_config.MESSAGES.render("commands.reconcile.failed"))
-    await reconcile.finish(message_config.MESSAGES.render("commands.reconcile.success", count=count))
+        await reconcile.finish(message_config.MESSAGES.render("commands.reconcile.failed", **variables))
+    await reconcile.finish(message_config.MESSAGES.render("commands.reconcile.success", **variables, count=count))

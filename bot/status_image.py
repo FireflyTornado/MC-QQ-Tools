@@ -18,6 +18,7 @@ from runtime_status import HealthResult, ResourceUsage, RuntimeStatus
 WIDTH, HEIGHT = 720, 640
 LEFT_CONTENT_WIDTH = 322
 METRIC_CONTENT_WIDTH = 143
+METRIC_LABEL_WIDTH = 151
 MINT, YELLOW, RED, GRAY = "#7ae7c2", "#f5ce79", "#ff8c91", "#8a9aa8"
 STROKE_DASHES = {MINT: "none", YELLOW: "8 3", RED: "5 4", GRAY: "2 4"}
 EMPTY = "—"
@@ -223,10 +224,10 @@ def render_status(
         "nickname": text(nickname or "QQ 机器人", 23, 245, "QQ Bot", strong=True),
         "qq": text(f"QQ {qq_id or EMPTY}", 16, 245),
         "timestamp_label": "采集时间" if cjk else "Collected",
-        "bindings_label": text(label("bindings"), 19, METRIC_CONTENT_WIDTH, "Active bindings"),
+        "bindings_label": text(label("bindings"), 19, METRIC_LABEL_WIDTH, "Active bindings"),
         "bindings_count": bindings_count,
         "bindings_size": bindings_size,
-        "bans_label": text(label("bans"), 19, METRIC_CONTENT_WIDTH, "Ban records"),
+        "bans_label": text(label("bans"), 19, METRIC_LABEL_WIDTH, "Ban records"),
         "bans_count": bans_count,
         "bans_size": bans_size,
         "services_label": "服务状态" if cjk else "Services",

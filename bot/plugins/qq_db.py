@@ -69,6 +69,7 @@ async def handle_db(bot: Bot, event: GroupMessageEvent, args: Message = CommandA
         status = "error"
 
     reply_key = f"commands.db.{status}"
+    reply_values = dict(variables, member_qq=qq_id, mc_name=mc_name)
     if action != "get":
         logger.info(
             "/db {} operator={} group={} target={!r} qq={!r} mc_name={!r} result={}",
@@ -77,7 +78,9 @@ async def handle_db(bot: Bot, event: GroupMessageEvent, args: Message = CommandA
     if qq_id is not None:
         if is_qq_id(qq_id):
             group_id = None if status == "not_member" else event.group_id
-            variables.update(await member_name_variables(bot, messages, reply_key, int(qq_id), group_id=group_id))
+            reply_values.update(await member_name_variables(
+                bot, messages, reply_key, int(qq_id), group_id=group_id, values=reply_values,
+            ))
         else:
-            variables.update(member_name="", member_display=qq_id)
-    await db.finish(messages.render(reply_key, **variables, member_qq=qq_id, mc_name=mc_name))
+            reply_values.update(member_name="", member_display=qq_id)
+    await db.finish(messages.render(reply_key, **reply_values))

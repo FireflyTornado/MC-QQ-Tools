@@ -129,14 +129,14 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
         async with membership_write_lock:
             result = await asyncio.to_thread(
                 handle_departure, GROUP_ID, qq_id, event.time,
-                only_same_second=previous == "handled" or key in pending_departures,
+                recheck_seconds=MEMBER_CHECK_TIMEOUT, recheck_only=previous == "handled" or key in pending_departures,
             )
         if isinstance(result, DepartureCheck):
             pending_departures[key] = event
             pending_departures.move_to_end(key)
             if len(pending_departures) > RECENT_DEPARTURE_LIMIT:
                 pending_departures.popitem(last=False)
-            outcome, mc_name = await verify_same_second_departure(bot, qq_id, result)
+            outcome, mc_name = await verify_departure_membership(bot, qq_id, result)
         else:
             outcome, mc_name = result
         pending_departures.pop(key, None)
@@ -208,12 +208,12 @@ async def bind_verified_member(bot: Bot, qq_id: str, mc_name: str) -> tuple[str,
     if not can_verify_members(bot):
         return "members_unverified", None
     generation = membership_generation
-    # Leave events during the roster check or write must still be able to revoke the binding.
-    checked_at = int(time.time())
     try:
         members = await verified_group_members(bot)
     except (UnverifiedMembers, TimeoutError, OneBotV11AdapterException):
         return "members_unverified", None
+    # Capture completion before waiting for the write lock so subsequent departures still revoke.
+    checked_at = int(time.time())
 
     async with membership_write_lock:
         if membership_generation != generation or not can_verify_members(bot):
@@ -225,7 +225,7 @@ async def bind_verified_member(bot: Bot, qq_id: str, mc_name: str) -> tuple[str,
         )
 
 
-async def verify_same_second_departure(
+async def verify_departure_membership(
     bot: Bot, qq_id: str, check: DepartureCheck,
 ) -> tuple[Literal["present", "revoked", "no_binding"], str | None]:
     async with reconcile_lock:

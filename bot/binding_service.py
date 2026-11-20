@@ -157,7 +157,7 @@ def resolve_binding(
 
 
 def _request_unbind(
-    group_id: str, qq_id: str, left_at: int | None, *, only_same_second: bool = False,
+    group_id: str, qq_id: str, left_at: int | None, *, recheck_seconds: int = 0, recheck_only: bool = False,
 ) -> tuple[str, str | None] | DepartureCheck:
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -166,9 +166,9 @@ def _request_unbind(
             return _reserved_binding(conn, group_id, qq_id) or ("not_bound", None)
         binding_id, mc_name, authorized_at = row
         if left_at is not None:
-            if authorized_at == left_at:
+            if authorized_at - recheck_seconds <= left_at <= authorized_at:
                 return DepartureCheck(binding_id, mc_name, _audit_version(conn))
-            if only_same_second or authorized_at > left_at:
+            if recheck_only or authorized_at > left_at:
                 return "not_bound", None
         _delete_active_bindings(conn, group_id, {qq_id: binding_id})
         update_auth_version(conn)
@@ -191,9 +191,9 @@ def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> s
 
 
 def handle_departure(
-    group_id: str, qq_id: str, left_at: int, *, only_same_second: bool = False,
+    group_id: str, qq_id: str, left_at: int, *, recheck_seconds: int = 0, recheck_only: bool = False,
 ) -> DepartureCheck | tuple[Literal["revoked", "retained", "no_binding"], str | None]:
-    result = _request_unbind(group_id, qq_id, left_at, only_same_second=only_same_second)
+    result = _request_unbind(group_id, qq_id, left_at, recheck_seconds=recheck_seconds, recheck_only=recheck_only)
     if isinstance(result, DepartureCheck):
         return result
     status, mc_name = result

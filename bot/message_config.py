@@ -160,6 +160,7 @@ BUSINESS_FIELDS = {
 }
 TOKENS = re.compile(r"(\{\{|\}\}|\{[a-z_]+\}|[{}])")
 UNSAFE_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")
+MessageValue = str | int | MessageSegment | None
 
 
 @dataclass(frozen=True)
@@ -174,13 +175,19 @@ class MessageConfig:
         assert isinstance(value, str)
         return value
 
-    def uses_fields(self, key: str, *fields: str) -> bool:
-        return any(token[1:-1] in fields for token in TOKENS.split(self.text(key))[1::2])
+    def uses_fields(self, key: str, *fields: str, values: Mapping[str, MessageValue] | None = None) -> bool:
+        """Check the configured template and, when its values overflow, the default template."""
+        template = self.text(key)
+        if _uses_fields(template, fields):
+            return True
+        default = DEFAULTS[key]
+        return (values is not None and isinstance(default, str) and _uses_fields(default, fields)
+                and _render(template, values)[1] > MAX_TEXT_LENGTH)
 
     def info_text(self, key: str, **values: str | int | None) -> str:
         return self.render(key, **values).extract_plain_text()
 
-    def render(self, key: str, **values: str | int | MessageSegment | None) -> Message:
+    def render(self, key: str, **values: MessageValue) -> Message:
         template = self.text(key)
         message, length = _render(template, values)
         if length > MAX_TEXT_LENGTH:
@@ -189,9 +196,11 @@ class MessageConfig:
         return message
 
 
-def _render(
-    template: str, values: Mapping[str, str | int | MessageSegment | None],
-) -> tuple[Message, int]:
+def _uses_fields(template: str, fields: tuple[str, ...]) -> bool:
+    return any(token[1:-1] in fields for token in TOKENS.split(template)[1::2])
+
+
+def _render(template: str, values: Mapping[str, MessageValue]) -> tuple[Message, int]:
     message = Message()
     text: list[str] = []
     length = 0

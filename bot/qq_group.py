@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping
 from unicodedata import category
 
 from nonebot import get_driver
@@ -7,7 +8,7 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.adapters.onebot.v11.exception import OneBotV11AdapterException
 from nonebot.rule import Rule
 
-from message_config import MessageConfig
+from message_config import MessageConfig, MessageValue
 
 
 TARGET_GROUP_ID = int(get_driver().config.target_group_id)
@@ -54,9 +55,10 @@ async def lookup_member_name(bot: Bot, group_id: int | None, user_id: int) -> st
 
 async def member_name_variables(
     bot: Bot, messages: MessageConfig, key: str, user_id: int, *, group_id: int | None = None,
+    values: Mapping[str, MessageValue] | None = None,
 ) -> dict[str, str]:
     member_name = ""
-    if messages.uses_fields(key, "member_name", "member_display"):
+    if messages.uses_fields(key, "member_name", "member_display", values=values):
         member_name = await lookup_member_name(bot, group_id, user_id)
     return {
         "member_name": member_name,

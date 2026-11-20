@@ -381,13 +381,30 @@ events:
         self.send_group.assert_awaited_once()
 
     async def test_old_departure_after_restart_does_not_touch_new_binding(self):
-        self.bind(timestamp=DEPARTED_AT + 1)
+        self.bind(timestamp=DEPARTED_AT + 21)
         version = self.version()
         self.notify.reset_mock()
-        await self.events.handle_member_leave(self.bot, departure())
+        with patch.object(self.bot, "call_api", AsyncMock()) as api:
+            await self.events.handle_member_leave(self.bot, departure())
+        api.assert_not_awaited()
         self.assertEqual(self.binding(), "Steve")
         self.assertEqual(self.version(), version)
         self.notify.assert_not_called()
+
+    async def test_nearby_departure_rechecks_an_existing_binding_without_in_memory_history(self):
+        self.bind(timestamp=DEPARTED_AT + 1)
+        self.notify.reset_mock()
+
+        with self.mock_roster(member_rows(BOT, ABSENT)) as api:
+            await self.events.handle_member_leave(self.bot, departure())
+            self.assertEqual(api.await_count, 3)
+        self.assertEqual(self.binding(), "Steve")
+        self.notify.assert_not_called()
+
+        with self.mock_roster(member_rows(BOT, MEMBER)):
+            await self.events.handle_member_leave(self.bot, departure())
+        self.assertIsNone(self.binding())
+        self.notify.assert_called_once_with()
 
     async def test_bot_removed_does_not_revoke_and_disables_audit(self):
         self.bind()
@@ -827,6 +844,37 @@ events:
         self.assertIsNone(self.binding())
         self.notify.assert_not_called()
 
+    async def test_db_add_rechecks_departures_up_to_twenty_seconds_before_roster_confirmation(self):
+        checked_at = DEPARTED_AT + 2
+        roster = member_rows(BOT, MEMBER, ABSENT)
+
+        async def confirm_members(bot):
+            self.assertIs(bot, self.bot)
+            clock.time.return_value = checked_at
+            return {str(BOT), str(MEMBER), str(ABSENT)}
+
+        with (patch.object(self.events, "time") as clock,
+              patch.object(self.events, "verified_group_members", side_effect=confirm_members)):
+            clock.time.return_value = DEPARTED_AT - 2
+            reply = await self.command_reply(f"/db add {ABSENT} Steve", user=MEMBER)
+        self.assertIn("已添加绑定", reply.extract_plain_text())
+        version = self.version()
+        self.notify.reset_mock()
+
+        for left_at in (DEPARTED_AT, checked_at - 20):
+            with self.subTest(left_at=left_at), self.mock_roster(roster, count=3) as api:
+                await self.events.handle_member_leave(self.bot, departure(timestamp=left_at))
+                self.assertEqual(api.await_count, 3)
+            self.assertEqual(self.binding(), "Steve")
+            self.assertEqual(self.version(), version)
+        self.notify.assert_not_called()
+
+        with patch.object(self.bot, "call_api", AsyncMock()) as api:
+            await self.events.handle_member_leave(self.bot, departure(timestamp=checked_at + 1))
+        api.assert_not_awaited()
+        self.assertIsNone(self.binding())
+        self.notify.assert_called_once_with()
+
     async def test_db_add_and_rm_can_render_member_names_after_writes(self):
         member = {"group_id": GROUP, "user_id": ABSENT, "card": "小夜"}
         with (patch.object(self.bot, "get_group_member_info", AsyncMock(return_value=member)) as lookup,
@@ -922,6 +970,17 @@ commands:
             reply = await self.command_reply("/db get Steve", user=MEMBER)
         self.assertEqual(reply.extract_plain_text(), f"{{member_name}} {ABSENT} Steve")
         api.assert_not_awaited()
+
+    async def test_db_get_fetches_group_card_when_rendering_falls_back(self):
+        name = "SixteenChars1234"
+        self.bind(name=name)
+        template = "{mc_name}" * 80
+        member = {"group_id": GROUP, "user_id": ABSENT, "card": "小夜"}
+        with (self.configure(f'commands: {{db: {{active: "{template}"}}}}'),
+              patch.object(self.bot, "call_api", AsyncMock(return_value=member)) as api):
+            reply = await self.command_reply(f"/db get {name}", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"小夜（{ABSENT}） ↔ {name}〔有效〕")
+        api.assert_awaited_once_with("get_group_member_info", group_id=GROUP, user_id=ABSENT, no_cache=True)
 
     async def test_db_rm_leaves_frozen_and_pending_bindings_available_for_restoration(self):
         self.bind()

@@ -119,16 +119,19 @@ DEFAULTS = MappingProxyType({
 SECTIONS = {key.rsplit(".", depth)[0] for key in DEFAULTS for depth in range(1, key.count(".") + 1)}
 
 COMMON_FIELDS = {"group_id", "bot_qq"}
+MEMBER_FIELDS = {"member_qq", "member_name", "member_display"}
 BUSINESS_FIELDS = {
-    "events.join.message": {"member", "member_qq"},
-    "events.leave.revoked": {"member_qq", "mc_name"},
-    "events.leave.retained": {"member_qq", "mc_name"},
-    "events.leave.no_binding": {"member_qq"},
-    "events.leave.failed": {"member_qq"},
-    "events.kick.revoked": {"member_qq", "mc_name"},
-    "events.kick.retained": {"member_qq", "mc_name"},
-    "events.kick.no_binding": {"member_qq"},
-    "events.kick.failed": {"member_qq"},
+    "events.join.message": MEMBER_FIELDS | {"member"},
+    **{
+        f"events.{event}.{outcome}": MEMBER_FIELDS | {"mc_name"}
+        for event in ("leave", "kick")
+        for outcome in ("revoked", "retained")
+    },
+    **{
+        f"events.{event}.{outcome}": MEMBER_FIELDS
+        for event in ("leave", "kick")
+        for outcome in ("no_binding", "failed")
+    },
     "commands.bind.success": {"mc_name"},
     "commands.bind.already_bound": {"mc_name"},
     "commands.bind.banned_name": {"mc_name"},
@@ -143,16 +146,14 @@ BUSINESS_FIELDS = {
     "commands.ping.connection_error": {"latency_ms"},
     "commands.ping.error": {"latency_ms"},
     "commands.reconcile.success": {"count"},
-    "commands.db.not_member": {"member_qq"},
-    "commands.db.name_taken": {"mc_name"},
-    "commands.db.banned_name": {"mc_name"},
+    "commands.db.not_member": MEMBER_FIELDS,
+    "commands.db.members_unverified": MEMBER_FIELDS,
     **{
-        f"commands.db.{status}": {"member_qq", "mc_name", "member_name", "member_display"}
-        for status in ("active", "frozen", "pending")
-    },
-    **{
-        f"commands.db.{status}": {"member_qq", "mc_name"}
-        for status in ("success", "already_same", "already_bound", "removed", "rm_frozen", "rm_pending")
+        f"commands.db.{status}": MEMBER_FIELDS | {"mc_name"}
+        for status in (
+            "active", "frozen", "pending", "success", "already_same", "already_bound", "name_taken",
+            "banned_name", "removed", "rm_frozen", "rm_pending",
+        )
     },
 }
 TOKENS = re.compile(r"(\{\{|\}\}|\{[a-z_]+\}|[{}])")

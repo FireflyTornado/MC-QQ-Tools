@@ -433,24 +433,56 @@ events:
 
     async def test_join_switch_preserves_membership_tracking_and_custom_welcome_uses_structured_at(self):
         generation = self.events.membership_generation
-        with self.configure("events: {join: {enabled: false}}"):
+        with (self.configure('events: {join: {enabled: false, message: "{member_name}"}}'),
+              patch.object(self.bot, "call_api", AsyncMock()) as api):
             await self.events.handle_member_join(self.bot, arrival())
+        api.assert_not_awaited()
         self.send_group.assert_not_awaited()
         self.assertEqual(self.events.membership_generation, generation + 1)
-        with self.configure("""
+        member = {"group_id": GROUP, "user_id": ABSENT, "card": "小夜", "nickname": "夜猫"}
+        with (patch.object(self.bot, "call_api", AsyncMock(return_value=member)) as api, self.configure("""
 events:
   join:
     enabled: true
-    message: "你好 {member}！群 {group_id} Bot {bot_qq} 成员 {member_qq} [CQ:at,qq=all]"
-"""):
+    message: "你好 {member}！{member_display} {member_name} 群 {group_id} Bot {bot_qq} 成员 {member_qq} [CQ:at,qq=all]"
+""")):
             await self.events.handle_member_join(self.bot, arrival())
+        api.assert_awaited_once_with("get_group_member_info", group_id=GROUP, user_id=ABSENT, no_cache=True)
         self.send_group.assert_awaited_once()
         message = self.send_group.call_args.kwargs["message"]
         self.assertEqual([segment.type for segment in message], ["text", "at", "text"])
         self.assertEqual(message[1].data["qq"], str(ABSENT))
-        self.assertEqual(message.extract_plain_text(), f"你好 ！群 {GROUP} Bot {BOT} 成员 {ABSENT} [CQ:at,qq=all]")
+        self.assertEqual(message.extract_plain_text(),
+                         f"你好 ！小夜（{ABSENT}） 小夜 群 {GROUP} Bot {BOT} 成员 {ABSENT} [CQ:at,qq=all]")
         self.assertIsNone(self.binding())
         self.notify.assert_not_called()
+
+    async def test_departure_templates_look_up_the_departed_member_after_revocation(self):
+        async def profile(action, **data):
+            self.assertEqual((action, data), ("get_stranger_info", {"user_id": ABSENT}))
+            self.assertIsNone(self.binding())
+            self.notify.assert_called_once_with()
+            self.send_group.assert_not_awaited()
+            return {"user_id": ABSENT, "nickname": "夜猫"}
+
+        with self.configure("""
+events:
+  leave: {enabled: true, revoked: "{member_display} 离群，已撤销 {mc_name}"}
+  kick: {enabled: true, revoked: "{member_qq}/{member_name}/{member_display} 已被移出"}
+"""):
+            self.bind()
+            self.notify.reset_mock()
+            with patch.object(self.bot, "call_api", AsyncMock(side_effect=profile)) as api:
+                await self.events.handle_member_leave(self.bot, departure("leave"))
+            api.assert_awaited_once()
+            self.assert_notice(f"夜猫（{ABSENT}） 离群，已撤销 Steve")
+
+            self.bind()
+            self.send_group.reset_mock()
+            with patch.object(self.bot, "call_api", AsyncMock(side_effect=ActionFailed(retcode=100))) as api:
+                await self.events.handle_member_leave(self.bot, departure("kick"))
+            api.assert_awaited_once_with("get_stranger_info", user_id=ABSENT)
+            self.assert_notice(f"{ABSENT}//{ABSENT} 已被移出")
 
     async def test_departure_switches_are_independent_and_never_skip_revocation(self):
         for enabled in ("leave", "kick"):
@@ -733,6 +765,24 @@ events:
         self.assertIn("无法核实", str(reply))
         self.assertIsNone(self.binding())
         self.notify.assert_not_called()
+
+    async def test_db_add_and_rm_can_render_member_names_after_writes(self):
+        member = {"group_id": GROUP, "user_id": ABSENT, "card": "小夜"}
+        with (patch.object(self.bot, "get_group_member_info", AsyncMock(return_value=member)) as lookup,
+              self.configure("""
+commands:
+  db:
+    success: "已绑定 {member_name} 的 {mc_name}"
+    removed: "已撤销 {member_display} 的 {mc_name}"
+""")):
+            with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+                reply = await self.command_reply(f"/db add {ABSENT} Steve", user=MEMBER)
+            self.assertEqual(reply.extract_plain_text(), "已绑定 小夜 的 Steve")
+            self.assertEqual(self.binding(), "Steve")
+            reply = await self.command_reply("/db rm Steve", user=MEMBER)
+            self.assertEqual(reply.extract_plain_text(), f"已撤销 小夜（{ABSENT}） 的 Steve")
+            self.assertIsNone(self.binding())
+        self.assertEqual(lookup.await_args_list, [call(group_id=GROUP, user_id=ABSENT, no_cache=True)] * 2)
 
     async def test_db_get_and_rm_resolve_numeric_ambiguity_and_scope_to_the_target_group(self):
         self.bind(ABSENT, "Steve")

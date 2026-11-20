@@ -10,7 +10,7 @@ import message_config
 from binding_service import resolve_binding
 from database import valid_mc_name
 from qq_avatar import is_qq_id
-from qq_group import group_rule, lookup_member_name, message_variables
+from qq_group import group_rule, member_name_variables, message_variables
 
 from .qq_events import bind_verified_member
 
@@ -69,15 +69,15 @@ async def handle_db(bot: Bot, event: GroupMessageEvent, args: Message = CommandA
         status = "error"
 
     reply_key = f"commands.db.{status}"
-    if action == "get" and qq_id is not None:
-        member_name = ""
-        if is_qq_id(qq_id) and messages.uses_fields(reply_key, "member_name", "member_display"):
-            member_name = await lookup_member_name(bot, event.group_id, int(qq_id))
-        variables["member_name"] = member_name
-        variables["member_display"] = f"{member_name}（{qq_id}）" if member_name else qq_id
-    elif action != "get":
+    if action != "get":
         logger.info(
             "/db {} operator={} group={} target={!r} qq={!r} mc_name={!r} result={}",
             action, event.user_id, event.group_id, " ".join(parts[1:]), qq_id, mc_name, status,
         )
+    if qq_id is not None:
+        if is_qq_id(qq_id):
+            group_id = None if status == "not_member" else event.group_id
+            variables.update(await member_name_variables(bot, messages, reply_key, int(qq_id), group_id=group_id))
+        else:
+            variables.update(member_name="", member_display=qq_id)
     await db.finish(messages.render(reply_key, **variables, member_qq=qq_id, mc_name=mc_name))

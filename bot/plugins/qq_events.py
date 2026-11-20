@@ -22,7 +22,7 @@ from binding_service import (
     DepartureCheck, bind_player, handle_departure, membership_audit_snapshot, reconcile_checked_bindings,
     revoke_checked_bindings,
 )
-from qq_group import TARGET_GROUP_ID, group_rule, message_variables
+from qq_group import TARGET_GROUP_ID, group_rule, member_name_variables, message_variables
 from runtime_status import record_outcome
 
 driver = get_driver()
@@ -72,12 +72,13 @@ async def handle_member_join(
     logger.info(
         "[MC-QQ-AUTH] 检测到目标群成员加入事件"
     )
-    if message_config.MESSAGES.enabled("join"):
-        message = message_config.MESSAGES.render(
-            "events.join.message", **message_variables(bot), member=MessageSegment.at(event.user_id),
-            member_qq=event.user_id,
-        )
-        await send_member_notice(bot, message)
+    messages = message_config.MESSAGES
+    if messages.enabled("join"):
+        key = "events.join.message"
+        names = await member_name_variables(bot, messages, key, event.user_id, group_id=event.group_id)
+        await send_member_notice(bot, messages.render(
+            key, **message_variables(bot), **names, member=MessageSegment.at(event.user_id), member_qq=event.user_id,
+        ))
 
 
 # 监听成员退群
@@ -149,10 +150,13 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
     finally:
         if recent_departures.get(key) == "processing":
             recent_departures[key] = handling
+    messages = message_config.MESSAGES
     if (outcome != "present" and (previous != "handled" or outcome == "revoked")
-            and (previous, outcome) != ("failed", "failed") and message_config.MESSAGES.enabled(event.sub_type)):
-        await send_member_notice(bot, message_config.MESSAGES.render(
-            f"events.{event.sub_type}.{outcome}", **message_variables(bot), member_qq=qq_id, mc_name=mc_name,
+            and (previous, outcome) != ("failed", "failed") and messages.enabled(event.sub_type)):
+        notice_key = f"events.{event.sub_type}.{outcome}"
+        names = await member_name_variables(bot, messages, notice_key, event.user_id)
+        await send_member_notice(bot, messages.render(
+            notice_key, **message_variables(bot), **names, member_qq=qq_id, mc_name=mc_name,
         ))
 
 

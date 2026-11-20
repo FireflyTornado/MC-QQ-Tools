@@ -771,6 +771,47 @@ events:
         self.assertEqual(str(await self.command_reply(f"/db get {MEMBER}", user=MEMBER)),
                          f"{MEMBER} ↔ {MEMBER}〔有效〕")
 
+    async def test_db_get_prefers_group_card_then_qq_nickname_for_each_binding_state(self):
+        self.bind()
+        member = {"group_id": GROUP, "user_id": ABSENT, "card": " 小夜[CQ:at,qq=all]\n", "nickname": "夜猫"}
+        group_lookup = call("get_group_member_info", group_id=GROUP, user_id=ABSENT, no_cache=True)
+        with patch.object(self.bot, "call_api", AsyncMock(return_value=member)) as api:
+            reply = await self.command_reply("/db get Steve", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"小夜[CQ:at,qq=all]（{ABSENT}） ↔ Steve〔有效〕")
+        self.assertEqual([segment.type for segment in reply], ["text"])
+        self.assertEqual(api.await_args_list, [group_lookup])
+
+        binding_service.apply_ban_snapshot({"Steve": None})
+        with patch.object(self.bot, "call_api", AsyncMock(return_value={**member, "card": "  "})) as api:
+            reply = await self.command_reply("/db get Steve", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"夜猫（{ABSENT}） ↔ Steve〔封禁冻结〕")
+        self.assertEqual(api.await_args_list, [group_lookup])
+
+        binding_service.apply_ban_snapshot({})
+        responses = [ActionFailed(retcode=100), {"user_id": ABSENT, "nickname": "QQ昵称"}]
+        with patch.object(self.bot, "call_api", AsyncMock(side_effect=responses)) as api:
+            reply = await self.command_reply("/db get Steve", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"QQ昵称（{ABSENT}） ↔ Steve〔待核实群成员〕")
+        self.assertEqual(api.await_args_list, [group_lookup, call("get_stranger_info", user_id=ABSENT)])
+
+    async def test_db_get_handles_missing_names_and_skips_lookup_without_name_fields(self):
+        self.bind()
+        with patch.object(self.bot, "call_api", AsyncMock(side_effect=TimeoutError)) as api:
+            reply = await self.command_reply("/db get Steve", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"{ABSENT} ↔ Steve〔有效〕")
+        self.assertEqual(api.await_count, 2)
+
+        with (self.configure('commands: {db: {active: "{qq_id}/{member_name}/{mc_name}"}}'),
+              patch.object(self.bot, "call_api", AsyncMock(side_effect=ActionFailed(retcode=100)))):
+            reply = await self.command_reply("/db get Steve", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"{ABSENT}//Steve")
+
+        with (self.configure('commands: {db: {active: "{{member_name}} {qq_id} {mc_name}"}}'),
+              patch.object(self.bot, "call_api", AsyncMock()) as api):
+            reply = await self.command_reply("/db get Steve", user=MEMBER)
+        self.assertEqual(reply.extract_plain_text(), f"{{member_name}} {ABSENT} Steve")
+        api.assert_not_awaited()
+
     async def test_db_rm_leaves_frozen_and_pending_bindings_available_for_restoration(self):
         self.bind()
         binding_service.apply_ban_snapshot({"Steve": None})

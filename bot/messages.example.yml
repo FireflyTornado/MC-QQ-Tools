@@ -113,9 +113,11 @@ commands:
     # name_taken 和 banned_name 的 {mc_name} 是申请绑定的游戏 ID。
     name_taken: "游戏名 {mc_name} 已被其他绑定占用。"
     banned_name: "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。"
-    active: "{qq_id} ↔ {mc_name}〔有效〕"
-    frozen: "{qq_id} ↔ {mc_name}〔封禁冻结〕"
-    pending: "{qq_id} ↔ {mc_name}〔待核实群成员〕"
+    # 这三条 /db get 文案可用 {member_name}（群名片、QQ 昵称或空字符串）。
+    # {member_display} 显示「昵称（QQ号）」，取不到昵称时仅显示 QQ 号。
+    active: "{member_display} ↔ {mc_name}〔有效〕"
+    frozen: "{member_display} ↔ {mc_name}〔封禁冻结〕"
+    pending: "{member_display} ↔ {mc_name}〔待核实群成员〕"
     removed: "已删除有效绑定：{qq_id} ↔ {mc_name}"
     rm_frozen: "{qq_id} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。"
     rm_pending: "{qq_id} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。"

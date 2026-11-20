@@ -73,9 +73,9 @@ DEFAULTS = MappingProxyType({
     "commands.db.already_bound": "QQ {qq_id} 已有绑定：{mc_name}。",
     "commands.db.name_taken": "游戏名 {mc_name} 已被其他绑定占用。",
     "commands.db.banned_name": "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。",
-    "commands.db.active": "{qq_id} ↔ {mc_name}〔有效〕",
-    "commands.db.frozen": "{qq_id} ↔ {mc_name}〔封禁冻结〕",
-    "commands.db.pending": "{qq_id} ↔ {mc_name}〔待核实群成员〕",
+    "commands.db.active": "{member_display} ↔ {mc_name}〔有效〕",
+    "commands.db.frozen": "{member_display} ↔ {mc_name}〔封禁冻结〕",
+    "commands.db.pending": "{member_display} ↔ {mc_name}〔待核实群成员〕",
     "commands.db.removed": "已删除有效绑定：{qq_id} ↔ {mc_name}",
     "commands.db.rm_frozen": "{qq_id} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。",
     "commands.db.rm_pending": "{qq_id} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。",
@@ -147,11 +147,12 @@ BUSINESS_FIELDS = {
     "commands.db.name_taken": {"mc_name"},
     "commands.db.banned_name": {"mc_name"},
     **{
+        f"commands.db.{status}": {"qq_id", "mc_name", "member_name", "member_display"}
+        for status in ("active", "frozen", "pending")
+    },
+    **{
         f"commands.db.{status}": {"qq_id", "mc_name"}
-        for status in (
-            "success", "already_same", "already_bound", "active", "frozen", "pending", "removed",
-            "rm_frozen", "rm_pending",
-        )
+        for status in ("success", "already_same", "already_bound", "removed", "rm_frozen", "rm_pending")
     },
 }
 TOKENS = re.compile(r"(\{\{|\}\}|\{[a-z_]+\}|[{}])")
@@ -169,6 +170,9 @@ class MessageConfig:
         value = self.values[key]
         assert isinstance(value, str)
         return value
+
+    def uses_fields(self, key: str, *fields: str) -> bool:
+        return any(token[1:-1] in fields for token in TOKENS.split(self.text(key))[1::2])
 
     def info_text(self, key: str, **values: str | int | None) -> str:
         return self.render(key, **values).extract_plain_text()

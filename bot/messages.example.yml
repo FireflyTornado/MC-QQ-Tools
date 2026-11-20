@@ -8,13 +8,16 @@ events:
   join:
     enabled: false
     # {member} 会生成对新成员的 QQ @，{member_qq} 是新成员的 QQ 号纯文本。
+    # {member_name} 优先用群名片，其次用 QQ 昵称。
+    # {member_display} 显示「昵称（QQ号）」，取不到昵称时仅显示 QQ 号。
     message: |-
       {member} 欢迎加入！请用 /绑定 游戏ID 或 /bind 游戏ID 绑定 Minecraft 游戏 ID。
       发送 /帮助 或 /help 查看指令。
   leave:
     # 关闭后仍会撤销离群成员的有效授权绑定。
     enabled: false
-    # 四种通知均支持 {member_qq}，即退群成员的 QQ 号。
+    # 四种通知均支持离群成员的 {member_qq}、{member_name} 和 {member_display}。
+    # 离群通知直接查询 QQ 昵称。取不到时 {member_name} 为空。
     # revoked 和 retained 还支持 {mc_name}，即撤销或保留的原绑定游戏 ID。
     # 例如 retained: "成员 {member_qq} 已退出群聊，Minecraft 绑定 {mc_name} 仍保留。"
     revoked: "成员已退出群聊。Minecraft 授权已自动撤销。"
@@ -24,7 +27,8 @@ events:
   kick:
     # 关闭后仍会撤销被移出成员的有效授权绑定。
     enabled: false
-    # 四种通知均支持 {member_qq}，即被移出成员的 QQ 号。
+    # 四种通知均支持被移出成员的 {member_qq}、{member_name} 和 {member_display}。
+    # 被移出通知直接查询 QQ 昵称。取不到时 {member_name} 为空。
     # revoked 和 retained 还支持 {mc_name}，即撤销或保留的原绑定游戏 ID。
     revoked: "成员已被移出群聊。Minecraft 授权已自动撤销。"
     retained: "成员已被移出群聊。Minecraft 绑定仍保留。"
@@ -47,8 +51,8 @@ commands:
       你已经绑定了游戏 ID：{mc_name}
       如需更换，请先使用 /解绑
     name_taken: "该游戏 ID 已经被绑定，无法重复绑定。"
-    # {requested_mc_name} 是玩家本次申请绑定的游戏 ID，保留输入大小写。
-    banned_name: "游戏 ID {requested_mc_name} 已被 Minecraft 服务器封禁，暂时无法绑定。"
+    # banned_name 的 {mc_name} 是玩家本次申请绑定的游戏 ID，保留输入大小写。
+    banned_name: "游戏 ID {mc_name} 已被 Minecraft 服务器封禁，暂时无法绑定。"
     error: "绑定服务发生错误，请稍后重试"
   unbind:
     # success、frozen 和 pending 中的 {mc_name} 是本次操作涉及的原绑定游戏 ID。
@@ -93,6 +97,40 @@ commands:
     success: "授权对账完成，已撤销 {count} 条离群绑定。"
     failed: "授权对账未完成，请检查群成员名单和服务日志。"
     busy: "授权对账正在执行，请稍后重试。"
+  db:
+    usage: |-
+      /db add <QQ号> <游戏名> · 添加绑定
+      /db rm <QQ号或游戏名> · 删除有效绑定
+      /db get <QQ号或游戏名> · 查询绑定
+      纯数字有歧义时，用 qq: 或 mc: 指定类型。
+    add_usage: "用法：/db add <QQ号> <游戏名>"
+    rm_usage: "用法：/db rm <QQ号或游戏名>，可加 qq: 或 mc: 前缀。"
+    get_usage: "用法：/db get <QQ号或游戏名>，可加 qq: 或 mc: 前缀。"
+    invalid_qq: "QQ 号格式不正确，请输入 QQ 号的数字。"
+    invalid_name: "游戏名须由 1–16 位英文字母、数字或下划线组成。"
+    # members_unverified 至 rm_pending 的文案均支持 {member_qq}、{member_name} 和 {member_display}。
+    # {member_name} 是群名片、QQ 昵称或空字符串。
+    # {member_display} 显示「昵称（QQ号）」，取不到昵称时仅显示 QQ 号。
+    members_unverified: "暂时无法核实目标群成员，请稍后重试。"
+    # {member_qq} 是目标成员的 QQ 号，{mc_name} 是相关绑定的游戏 ID。
+    not_member: "QQ {member_qq} 当前不在目标群，无法添加绑定。"
+    success: "已添加绑定：{member_qq} ↔ {mc_name}〔有效〕"
+    already_same: "已绑定：{member_qq} ↔ {mc_name}〔有效〕"
+    already_bound: "QQ {member_qq} 已有绑定：{mc_name}〔有效〕。"
+    already_frozen: "{member_qq} ↔ {mc_name}〔封禁冻结〕，请先在游戏服解封。"
+    already_pending: "{member_qq} ↔ {mc_name}〔待核实群成员〕，可用 /授权对账 触发检查。"
+    # name_taken 和 banned_name 的 {mc_name} 是申请绑定的游戏 ID。
+    name_taken: "游戏名 {mc_name} 已被其他绑定占用。"
+    banned_name: "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。"
+    active: "{member_display} ↔ {mc_name}〔有效〕"
+    frozen: "{member_display} ↔ {mc_name}〔封禁冻结〕"
+    pending: "{member_display} ↔ {mc_name}〔待核实群成员〕"
+    removed: "已删除有效绑定：{member_qq} ↔ {mc_name}"
+    rm_frozen: "{member_qq} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。"
+    rm_pending: "{member_qq} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。"
+    ambiguous: "按 QQ 号和游戏名查到了两条不同绑定，请用 qq: 或 mc: 指定类型。"
+    not_bound: "未找到绑定。"
+    error: "绑定数据库操作失败，请稍后重试。"
   help:
     message: |-
       [MC-QQ-Auth] 指令帮助
@@ -104,6 +142,7 @@ commands:
       超级用户专用
       /信息 或 /info · 查看状态图片
       /授权对账 或 /reconcile · 核对群成员与授权
+      /db · 手动添加、删除或查询绑定
   info:
     busy: "状态图正在生成，请稍后重试。"
     error: "状态图暂不可用，请稍后重试。"

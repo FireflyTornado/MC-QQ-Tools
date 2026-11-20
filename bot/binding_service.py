@@ -24,6 +24,14 @@ class DepartureCheck:
     version: int
 
 
+@dataclass(frozen=True)
+class BindingRecord:
+    id: int
+    qq_id: str
+    mc_name: str
+    state: str
+
+
 def _active_binding(conn: sqlite3.Connection, group_id: str, qq_id: str) -> tuple[int, str, int] | None:
     return conn.execute(
         """
@@ -59,24 +67,31 @@ def get_binding(group_id: str, qq_id: str) -> str | None:
     return name if status == "success" else None
 
 
-def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | None]:
-    """绑定玩家，返回操作状态和关联的游戏 ID。"""
+def bind_player(
+    group_id: str, qq_id: str, mc_name: str, *, authorization_checked_at: int | None = None,
+    report_reserved_state: bool = False,
+) -> tuple[str, str | None]:
+    """绑定玩家，可为管理指令区分冻结和待核实的已有绑定。"""
     if not valid_mc_name(mc_name):
         return "invalid_name", None
 
     name_key = mc_name.lower()
-    now = int(time.time())
+    now = int(time.time()) if authorization_checked_at is None else authorization_checked_at
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             """
-            SELECT mc_name FROM offline_bindings WHERE group_id = ? AND qq_id = ? AND status = 'ACTIVE'
-            UNION ALL SELECT mc_name FROM frozen_bindings WHERE group_id = ? AND qq_id = ? LIMIT 1
+            SELECT 'already_bound', mc_name
+            FROM offline_bindings WHERE group_id = ? AND qq_id = ? AND status = 'ACTIVE'
+            UNION ALL
+            SELECT CASE state WHEN 'FROZEN' THEN 'already_frozen' ELSE 'already_pending' END, mc_name
+            FROM frozen_bindings WHERE group_id = ? AND qq_id = ? LIMIT 1
             """,
             (group_id, qq_id, group_id, qq_id),
         ).fetchone()
         if existing:
-            return "already_bound", existing[0]
+            status, existing_name = existing
+            return (status if report_reserved_state else "already_bound"), existing_name
 
         ban = conn.execute(
             "SELECT 1 FROM server_bans WHERE state = 'BANNED' AND mc_name_key = ? LIMIT 1", (name_key,),
@@ -106,8 +121,43 @@ def bind_player(group_id: str, qq_id: str, mc_name: str) -> tuple[str, str | Non
     return "success", mc_name
 
 
+def resolve_binding(
+    group_id: str, *, qq_id: str | None, mc_name: str | None, remove: bool = False,
+) -> tuple[str, BindingRecord | None]:
+    """Resolve an admin lookup and optionally remove a unique active match in the same transaction."""
+    name_key = mc_name.lower() if mc_name is not None else None
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
+        if remove:
+            conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT id, qq_id, mc_name, 'active'
+            FROM offline_bindings
+            WHERE group_id = ? AND status = 'ACTIVE' AND (qq_id = ? OR mc_name_key = ?)
+            UNION ALL
+            SELECT id, qq_id, mc_name, CASE state WHEN 'FROZEN' THEN 'frozen' ELSE 'pending' END
+            FROM frozen_bindings
+            WHERE group_id = ? AND (qq_id = ? OR mc_name_key = ?)
+            LIMIT 2
+            """,
+            (group_id, qq_id, name_key, group_id, qq_id, name_key),
+        ).fetchall()
+        if not rows:
+            return "not_bound", None
+        if len(rows) > 1:
+            return "ambiguous", None
+        record = BindingRecord(*rows[0])
+        if not remove or record.state != "active":
+            return record.state, record
+        _delete_active_bindings(conn, group_id, {record.qq_id: record.id})
+        update_auth_version(conn)
+
+    notify_auth_updated()
+    return "removed", record
+
+
 def _request_unbind(
-    group_id: str, qq_id: str, left_at: int | None, *, only_same_second: bool = False,
+    group_id: str, qq_id: str, left_at: int | None, *, recheck_seconds: int = 0, recheck_only: bool = False,
 ) -> tuple[str, str | None] | DepartureCheck:
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -116,9 +166,9 @@ def _request_unbind(
             return _reserved_binding(conn, group_id, qq_id) or ("not_bound", None)
         binding_id, mc_name, authorized_at = row
         if left_at is not None:
-            if authorized_at == left_at:
+            if authorized_at - recheck_seconds <= left_at <= authorized_at:
                 return DepartureCheck(binding_id, mc_name, _audit_version(conn))
-            if only_same_second or authorized_at > left_at:
+            if recheck_only or authorized_at > left_at:
                 return "not_bound", None
         _delete_active_bindings(conn, group_id, {qq_id: binding_id})
         update_auth_version(conn)
@@ -141,9 +191,9 @@ def unbind_player(group_id: str, qq_id: str, *, left_at: int | None = None) -> s
 
 
 def handle_departure(
-    group_id: str, qq_id: str, left_at: int, *, only_same_second: bool = False,
+    group_id: str, qq_id: str, left_at: int, *, recheck_seconds: int = 0, recheck_only: bool = False,
 ) -> DepartureCheck | tuple[Literal["revoked", "retained", "no_binding"], str | None]:
-    result = _request_unbind(group_id, qq_id, left_at, only_same_second=only_same_second)
+    result = _request_unbind(group_id, qq_id, left_at, recheck_seconds=recheck_seconds, recheck_only=recheck_only)
     if isinstance(result, DepartureCheck):
         return result
     status, mc_name = result

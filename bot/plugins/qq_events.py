@@ -19,9 +19,10 @@ from nonebot.permission import SUPERUSER
 
 import message_config
 from binding_service import (
-    DepartureCheck, handle_departure, membership_audit_snapshot, reconcile_checked_bindings, revoke_checked_bindings,
+    DepartureCheck, bind_player, handle_departure, membership_audit_snapshot, reconcile_checked_bindings,
+    revoke_checked_bindings,
 )
-from qq_group import TARGET_GROUP_ID, group_rule, message_variables
+from qq_group import TARGET_GROUP_ID, group_rule, member_name_variables, message_variables
 from runtime_status import record_outcome
 
 driver = get_driver()
@@ -71,12 +72,13 @@ async def handle_member_join(
     logger.info(
         "[MC-QQ-AUTH] 检测到目标群成员加入事件"
     )
-    if message_config.MESSAGES.enabled("join"):
-        message = message_config.MESSAGES.render(
-            "events.join.message", **message_variables(bot), member=MessageSegment.at(event.user_id),
-            member_qq=event.user_id,
-        )
-        await send_member_notice(bot, message)
+    messages = message_config.MESSAGES
+    if messages.enabled("join"):
+        key = "events.join.message"
+        names = await member_name_variables(bot, messages, key, event.user_id, group_id=event.group_id)
+        await send_member_notice(bot, messages.render(
+            key, **message_variables(bot), **names, member=MessageSegment.at(event.user_id), member_qq=event.user_id,
+        ))
 
 
 # 监听成员退群
@@ -127,14 +129,14 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
         async with membership_write_lock:
             result = await asyncio.to_thread(
                 handle_departure, GROUP_ID, qq_id, event.time,
-                only_same_second=previous == "handled" or key in pending_departures,
+                recheck_seconds=MEMBER_CHECK_TIMEOUT, recheck_only=previous == "handled" or key in pending_departures,
             )
         if isinstance(result, DepartureCheck):
             pending_departures[key] = event
             pending_departures.move_to_end(key)
             if len(pending_departures) > RECENT_DEPARTURE_LIMIT:
                 pending_departures.popitem(last=False)
-            outcome, mc_name = await verify_same_second_departure(bot, qq_id, result)
+            outcome, mc_name = await verify_departure_membership(bot, qq_id, result)
         else:
             outcome, mc_name = result
         pending_departures.pop(key, None)
@@ -148,10 +150,13 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
     finally:
         if recent_departures.get(key) == "processing":
             recent_departures[key] = handling
+    messages = message_config.MESSAGES
     if (outcome != "present" and (previous != "handled" or outcome == "revoked")
-            and (previous, outcome) != ("failed", "failed") and message_config.MESSAGES.enabled(event.sub_type)):
-        await send_member_notice(bot, message_config.MESSAGES.render(
-            f"events.{event.sub_type}.{outcome}", **message_variables(bot), member_qq=qq_id, mc_name=mc_name,
+            and (previous, outcome) != ("failed", "failed") and messages.enabled(event.sub_type)):
+        notice_key = f"events.{event.sub_type}.{outcome}"
+        names = await member_name_variables(bot, messages, notice_key, event.user_id)
+        await send_member_notice(bot, messages.render(
+            notice_key, **message_variables(bot), **names, member_qq=qq_id, mc_name=mc_name,
         ))
 
 
@@ -198,7 +203,29 @@ async def verified_group_members(bot: Bot) -> set[str]:
     return second
 
 
-async def verify_same_second_departure(
+async def bind_verified_member(bot: Bot, qq_id: str, mc_name: str) -> tuple[str, str | None]:
+    """Bind a target-group member, coordinating the write with member departures."""
+    if not can_verify_members(bot):
+        return "members_unverified", None
+    generation = membership_generation
+    try:
+        members = await verified_group_members(bot)
+    except (UnverifiedMembers, TimeoutError, OneBotV11AdapterException):
+        return "members_unverified", None
+    # Capture completion before waiting for the write lock so subsequent departures still revoke.
+    checked_at = int(time.time())
+
+    async with membership_write_lock:
+        if membership_generation != generation or not can_verify_members(bot):
+            return "members_unverified", None
+        if qq_id not in members:
+            return "not_member", None
+        return await asyncio.to_thread(
+            bind_player, GROUP_ID, qq_id, mc_name, authorization_checked_at=checked_at, report_reserved_state=True,
+        )
+
+
+async def verify_departure_membership(
     bot: Bot, qq_id: str, check: DepartureCheck,
 ) -> tuple[Literal["present", "revoked", "no_binding"], str | None]:
     async with reconcile_lock:
@@ -219,12 +246,14 @@ async def verify_same_second_departure(
 
 async def reconcile_members(bot: Bot, *, only_pending: bool = False) -> int | None:
     async with reconcile_lock:
-        if not can_verify_members(bot):
-            return None
-        generation = membership_generation
         outcome = None
         try:
-            audit = await asyncio.to_thread(membership_audit_snapshot, GROUP_ID, only_pending=only_pending)
+            # Include writes that began on the previous connection before accepting an empty audit.
+            async with membership_write_lock:
+                if not can_verify_members(bot):
+                    return None
+                generation = membership_generation
+                audit = await asyncio.to_thread(membership_audit_snapshot, GROUP_ID, only_pending=only_pending)
             if not audit.bindings and not audit.pending:
                 if not only_pending:
                     outcome = "OK, 0 revoked"

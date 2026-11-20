@@ -89,13 +89,24 @@ info:
 
     def test_rejects_unknown_or_non_simple_placeholders(self):
         key = "commands.bind.success"
-        for token in ("{member}", "{requested_mc_name}", "{groupid}", "{mc_name.__class__}", "{mc_name[0]}", "{mc_name!r}",
+        for token in ("{member}", "{groupid}", "{mc_name.__class__}", "{mc_name[0]}", "{mc_name!r}",
                       "{mc_name:}", "{mc_name:{count}}", "{mc_name", "mc_name}"):
             with self.subTest(token=token), patch.object(config.logger, "warning") as warning:
                 snapshot = self.load(f'commands: {{bind: {{success: "{token}"}}}}')
                 self.assertEqual(snapshot.text(key), config.DEFAULTS[key])
                 warning.assert_called_once()
                 self.assertNotIn(token, repr(warning.call_args))
+
+    def test_removed_template_placeholders_fall_back_to_defaults(self):
+        with patch.object(config.logger, "warning") as warning:
+            snapshot = self.load("""
+commands:
+  bind: {banned_name: "旧游戏名 {requested_mc_name}"}
+  db: {active: "旧 QQ 号 {qq_id}"}
+""")
+        self.assertEqual(snapshot.text("commands.bind.banned_name"), config.DEFAULTS["commands.bind.banned_name"])
+        self.assertEqual(snapshot.text("commands.db.active"), config.DEFAULTS["commands.db.active"])
+        self.assertEqual(warning.call_count, 2)
 
     def test_length_limits_for_file_template_and_rendered_reply(self):
         key = "commands.bind.success"

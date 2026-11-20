@@ -58,7 +58,7 @@ async def handle_bind(
         await bind.finish(message_config.MESSAGES.render("commands.bind.error", **variables))
 
     await bind.finish(message_config.MESSAGES.render(
-        f"commands.bind.{status}", **variables, mc_name=value, requested_mc_name=mc_name,
+        f"commands.bind.{status}", **variables, mc_name=mc_name if status == "banned_name" else value,
     ))
 
 

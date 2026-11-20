@@ -598,6 +598,47 @@ events:
         self.assertEqual(self.version(), version)
         self.notify.assert_called_once_with()
 
+    async def test_reconnect_audit_waits_for_member_binding_to_commit_before_reading(self):
+        write_started = Event()
+        finish_write = Event()
+        audit_waiting = asyncio.Event()
+
+        class WriteLock(asyncio.Lock):
+            async def acquire(self):
+                if self.locked():
+                    audit_waiting.set()
+                return await super().acquire()
+
+        def delayed_bind(*args, **kwargs):
+            write_started.set()
+            if not finish_write.wait(10):
+                raise AssertionError("Timed out waiting to release the test binding write")
+            return binding_service.bind_player(*args, **kwargs)
+
+        reconnected_bot = Bot(nonebot.get_adapter(Adapter), str(BOT))
+        before = {str(BOT), str(MEMBER), str(ABSENT)}
+        after = {str(BOT), str(MEMBER)}
+        with (patch.object(self.events, "membership_write_lock", WriteLock()),
+              patch.object(self.events, "bind_player", delayed_bind),
+              patch.object(self.events, "verified_group_members", side_effect=[before, after]) as roster):
+            bind = asyncio.create_task(self.events.bind_verified_member(self.bot, str(ABSENT), "Steve"))
+            audit = None
+            try:
+                self.assertTrue(await asyncio.to_thread(write_started.wait, 5))
+                self.driver.bots[self.bot.self_id] = reconnected_bot
+                audit = asyncio.create_task(self.events.reconcile_on_connect(reconnected_bot))
+                await asyncio.wait_for(audit_waiting.wait(), timeout=5)
+                self.assertIsNone(self.binding())
+            finally:
+                finish_write.set()
+                result = await bind
+                if audit is not None:
+                    await audit
+        self.assertEqual(result, ("success", "Steve"))
+        self.assertIsNone(self.binding())
+        self.assertEqual(roster.await_args_list, [call(self.bot), call(reconnected_bot)])
+        self.assertEqual(self.notify.call_count, 2)
+
     async def test_failed_member_api_keeps_all_bindings(self):
         self.bind()
         version = self.version()
@@ -744,9 +785,10 @@ events:
         version = self.version()
         with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
             self.assertEqual(str(await self.command_reply(f"/db add {ABSENT} STEVE", user=MEMBER)),
-                             f"已绑定：{ABSENT} ↔ Steve")
+                             f"已绑定：{ABSENT} ↔ Steve〔有效〕")
         with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
-            self.assertIn("已有绑定", str(await self.command_reply(f"/db add {ABSENT} Alex", user=MEMBER)))
+            self.assertEqual(str(await self.command_reply(f"/db add {ABSENT} Alex", user=MEMBER)),
+                             f"QQ {ABSENT} 已有绑定：Steve〔有效〕。")
         with self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
             self.assertIn("已被其他绑定占用", str(await self.command_reply(f"/db add {MEMBER} steve", user=MEMBER)))
         binding_service.apply_ban_snapshot({"Banned": None})
@@ -754,6 +796,25 @@ events:
             self.assertIn("已被游戏服封禁", str(await self.command_reply(f"/db add {MEMBER} banned", user=MEMBER)))
         self.assertEqual(self.version(), version)
         self.notify.assert_called_once_with()
+
+    async def test_db_add_reports_reserved_binding_states_for_same_or_different_names(self):
+        self.bind()
+        binding_service.apply_ban_snapshot({"Steve": None})
+        self.notify.reset_mock()
+        version = self.version()
+        for state, expected in (
+            ("frozen", f"{ABSENT} ↔ Steve〔封禁冻结〕，请先在游戏服解封。"),
+            ("pending", f"{ABSENT} ↔ Steve〔待核实群成员〕，可用 /授权对账 触发检查。"),
+        ):
+            if state == "pending":
+                binding_service.apply_ban_snapshot({})
+            for name in ("sTeVe", "Alex"):
+                with self.subTest(state=state, name=name), self.mock_roster(member_rows(BOT, MEMBER, ABSENT), count=3):
+                    reply = await self.command_reply(f"/db add {ABSENT} {name}", user=MEMBER)
+                    self.assertEqual(reply.extract_plain_text(), expected)
+            self.assertEqual(binding_service.query_binding(str(GROUP), str(ABSENT)), (state, "Steve"))
+        self.assertEqual(self.version(), version)
+        self.notify.assert_not_called()
 
     async def test_db_add_rejects_roster_changed_during_verification(self):
         async def roster_with_departure(bot):

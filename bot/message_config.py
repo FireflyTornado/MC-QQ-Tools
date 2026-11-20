@@ -69,8 +69,10 @@ DEFAULTS = MappingProxyType({
     "commands.db.members_unverified": "暂时无法核实目标群成员，请稍后重试。",
     "commands.db.not_member": "QQ {member_qq} 当前不在目标群，无法添加绑定。",
     "commands.db.success": "已添加绑定：{member_qq} ↔ {mc_name}〔有效〕",
-    "commands.db.already_same": "已绑定：{member_qq} ↔ {mc_name}",
-    "commands.db.already_bound": "QQ {member_qq} 已有绑定：{mc_name}。",
+    "commands.db.already_same": "已绑定：{member_qq} ↔ {mc_name}〔有效〕",
+    "commands.db.already_bound": "QQ {member_qq} 已有绑定：{mc_name}〔有效〕。",
+    "commands.db.already_frozen": "{member_qq} ↔ {mc_name}〔封禁冻结〕，请先在游戏服解封。",
+    "commands.db.already_pending": "{member_qq} ↔ {mc_name}〔待核实群成员〕，可用 /授权对账 触发检查。",
     "commands.db.name_taken": "游戏名 {mc_name} 已被其他绑定占用。",
     "commands.db.banned_name": "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。",
     "commands.db.active": "{member_display} ↔ {mc_name}〔有效〕",
@@ -151,8 +153,8 @@ BUSINESS_FIELDS = {
     **{
         f"commands.db.{status}": MEMBER_FIELDS | {"mc_name"}
         for status in (
-            "active", "frozen", "pending", "success", "already_same", "already_bound", "name_taken",
-            "banned_name", "removed", "rm_frozen", "rm_pending",
+            "active", "frozen", "pending", "success", "already_same", "already_bound", "already_frozen",
+            "already_pending", "name_taken", "banned_name", "removed", "rm_frozen", "rm_pending",
         )
     },
 }

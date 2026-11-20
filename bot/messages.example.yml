@@ -115,8 +115,10 @@ commands:
     # {member_qq} 是目标成员的 QQ 号，{mc_name} 是相关绑定的游戏 ID。
     not_member: "QQ {member_qq} 当前不在目标群，无法添加绑定。"
     success: "已添加绑定：{member_qq} ↔ {mc_name}〔有效〕"
-    already_same: "已绑定：{member_qq} ↔ {mc_name}"
-    already_bound: "QQ {member_qq} 已有绑定：{mc_name}。"
+    already_same: "已绑定：{member_qq} ↔ {mc_name}〔有效〕"
+    already_bound: "QQ {member_qq} 已有绑定：{mc_name}〔有效〕。"
+    already_frozen: "{member_qq} ↔ {mc_name}〔封禁冻结〕，请先在游戏服解封。"
+    already_pending: "{member_qq} ↔ {mc_name}〔待核实群成员〕，可用 /授权对账 触发检查。"
     # name_taken 和 banned_name 的 {mc_name} 是申请绑定的游戏 ID。
     name_taken: "游戏名 {mc_name} 已被其他绑定占用。"
     banned_name: "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。"

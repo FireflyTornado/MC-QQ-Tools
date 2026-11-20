@@ -220,7 +220,9 @@ async def bind_verified_member(bot: Bot, qq_id: str, mc_name: str) -> tuple[str,
             return "members_unverified", None
         if qq_id not in members:
             return "not_member", None
-        return await asyncio.to_thread(bind_player, GROUP_ID, qq_id, mc_name, authorization_checked_at=checked_at)
+        return await asyncio.to_thread(
+            bind_player, GROUP_ID, qq_id, mc_name, authorization_checked_at=checked_at, report_reserved_state=True,
+        )
 
 
 async def verify_same_second_departure(
@@ -244,12 +246,14 @@ async def verify_same_second_departure(
 
 async def reconcile_members(bot: Bot, *, only_pending: bool = False) -> int | None:
     async with reconcile_lock:
-        if not can_verify_members(bot):
-            return None
-        generation = membership_generation
         outcome = None
         try:
-            audit = await asyncio.to_thread(membership_audit_snapshot, GROUP_ID, only_pending=only_pending)
+            # Include writes that began on the previous connection before accepting an empty audit.
+            async with membership_write_lock:
+                if not can_verify_members(bot):
+                    return None
+                generation = membership_generation
+                audit = await asyncio.to_thread(membership_audit_snapshot, GROUP_ID, only_pending=only_pending)
             if not audit.bindings and not audit.pending:
                 if not only_pending:
                     outcome = "OK, 0 revoked"

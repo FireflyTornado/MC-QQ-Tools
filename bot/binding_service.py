@@ -69,8 +69,9 @@ def get_binding(group_id: str, qq_id: str) -> str | None:
 
 def bind_player(
     group_id: str, qq_id: str, mc_name: str, *, authorization_checked_at: int | None = None,
+    report_reserved_state: bool = False,
 ) -> tuple[str, str | None]:
-    """绑定玩家，返回操作状态和关联的游戏 ID。"""
+    """绑定玩家，可为管理指令区分冻结和待核实的已有绑定。"""
     if not valid_mc_name(mc_name):
         return "invalid_name", None
 
@@ -80,13 +81,17 @@ def bind_player(
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             """
-            SELECT mc_name FROM offline_bindings WHERE group_id = ? AND qq_id = ? AND status = 'ACTIVE'
-            UNION ALL SELECT mc_name FROM frozen_bindings WHERE group_id = ? AND qq_id = ? LIMIT 1
+            SELECT 'already_bound', mc_name
+            FROM offline_bindings WHERE group_id = ? AND qq_id = ? AND status = 'ACTIVE'
+            UNION ALL
+            SELECT CASE state WHEN 'FROZEN' THEN 'already_frozen' ELSE 'already_pending' END, mc_name
+            FROM frozen_bindings WHERE group_id = ? AND qq_id = ? LIMIT 1
             """,
             (group_id, qq_id, group_id, qq_id),
         ).fetchone()
         if existing:
-            return "already_bound", existing[0]
+            status, existing_name = existing
+            return (status if report_reserved_state else "already_bound"), existing_name
 
         ban = conn.execute(
             "SELECT 1 FROM server_bans WHERE state = 'BANNED' AND mc_name_key = ? LIMIT 1", (name_key,),

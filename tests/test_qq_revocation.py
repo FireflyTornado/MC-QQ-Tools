@@ -801,12 +801,12 @@ events:
         self.assertEqual(reply.extract_plain_text(), f"{ABSENT} ↔ Steve〔有效〕")
         self.assertEqual(api.await_count, 2)
 
-        with (self.configure('commands: {db: {active: "{qq_id}/{member_name}/{mc_name}"}}'),
+        with (self.configure('commands: {db: {active: "{member_qq}/{member_name}/{mc_name}"}}'),
               patch.object(self.bot, "call_api", AsyncMock(side_effect=ActionFailed(retcode=100)))):
             reply = await self.command_reply("/db get Steve", user=MEMBER)
         self.assertEqual(reply.extract_plain_text(), f"{ABSENT}//Steve")
 
-        with (self.configure('commands: {db: {active: "{{member_name}} {qq_id} {mc_name}"}}'),
+        with (self.configure('commands: {db: {active: "{{member_name}} {member_qq} {mc_name}"}}'),
               patch.object(self.bot, "call_api", AsyncMock()) as api):
             reply = await self.command_reply("/db get Steve", user=MEMBER)
         self.assertEqual(reply.extract_plain_text(), f"{{member_name}} {ABSENT} Steve")
@@ -1076,7 +1076,7 @@ commands:
     invalid_name: 自定义格式错误
     already_bound: "已有 {mc_name}"
     name_taken: 自定义名称占用
-    banned_name: "Bot {bot_qq} 拒绝游戏 ID {requested_mc_name}"
+    banned_name: "Bot {bot_qq} 拒绝游戏 ID {mc_name}"
   binding: {success: "查询到 {mc_name}", not_bound: 自定义未绑定}
   unbind: {success: "已解绑 {mc_name}", not_bound: 自定义无法解绑}
 """):

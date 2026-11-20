@@ -80,4 +80,4 @@ async def handle_db(bot: Bot, event: GroupMessageEvent, args: Message = CommandA
             "/db {} operator={} group={} target={!r} qq={!r} mc_name={!r} result={}",
             action, event.user_id, event.group_id, " ".join(parts[1:]), qq_id, mc_name, status,
         )
-    await db.finish(messages.render(reply_key, **variables, qq_id=qq_id, mc_name=mc_name))
+    await db.finish(messages.render(reply_key, **variables, member_qq=qq_id, mc_name=mc_name))

@@ -36,7 +36,7 @@ DEFAULTS = MappingProxyType({
     "commands.bind.invalid_name": "游戏 ID 格式不正确。\n请填写由英文字母、数字或下划线组成的游戏 ID，最多 16 位。",
     "commands.bind.already_bound": "你已经绑定了游戏 ID：{mc_name}\n如需更换，请先使用 /解绑",
     "commands.bind.name_taken": "该游戏 ID 已经被绑定，无法重复绑定。",
-    "commands.bind.banned_name": "游戏 ID {requested_mc_name} 已被 Minecraft 服务器封禁，暂时无法绑定。",
+    "commands.bind.banned_name": "游戏 ID {mc_name} 已被 Minecraft 服务器封禁，暂时无法绑定。",
     "commands.bind.error": "绑定服务发生错误，请稍后重试",
     "commands.unbind.success": "解绑成功！\n原 Minecraft ID：{mc_name}\n绑定记录已删除。",
     "commands.unbind.not_bound": "你当前没有有效的绑定记录。",
@@ -67,18 +67,18 @@ DEFAULTS = MappingProxyType({
     "commands.db.invalid_qq": "QQ 号格式不正确，请输入 QQ 号的数字。",
     "commands.db.invalid_name": "游戏名须由 1–16 位英文字母、数字或下划线组成。",
     "commands.db.members_unverified": "暂时无法核实目标群成员，请稍后重试。",
-    "commands.db.not_member": "QQ {qq_id} 当前不在目标群，无法添加绑定。",
-    "commands.db.success": "已添加绑定：{qq_id} ↔ {mc_name}〔有效〕",
-    "commands.db.already_same": "已绑定：{qq_id} ↔ {mc_name}",
-    "commands.db.already_bound": "QQ {qq_id} 已有绑定：{mc_name}。",
+    "commands.db.not_member": "QQ {member_qq} 当前不在目标群，无法添加绑定。",
+    "commands.db.success": "已添加绑定：{member_qq} ↔ {mc_name}〔有效〕",
+    "commands.db.already_same": "已绑定：{member_qq} ↔ {mc_name}",
+    "commands.db.already_bound": "QQ {member_qq} 已有绑定：{mc_name}。",
     "commands.db.name_taken": "游戏名 {mc_name} 已被其他绑定占用。",
     "commands.db.banned_name": "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。",
     "commands.db.active": "{member_display} ↔ {mc_name}〔有效〕",
     "commands.db.frozen": "{member_display} ↔ {mc_name}〔封禁冻结〕",
     "commands.db.pending": "{member_display} ↔ {mc_name}〔待核实群成员〕",
-    "commands.db.removed": "已删除有效绑定：{qq_id} ↔ {mc_name}",
-    "commands.db.rm_frozen": "{qq_id} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。",
-    "commands.db.rm_pending": "{qq_id} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。",
+    "commands.db.removed": "已删除有效绑定：{member_qq} ↔ {mc_name}",
+    "commands.db.rm_frozen": "{member_qq} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。",
+    "commands.db.rm_pending": "{member_qq} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。",
     "commands.db.ambiguous": "按 QQ 号和游戏名查到了两条不同绑定，请用 qq: 或 mc: 指定类型。",
     "commands.db.not_bound": "未找到绑定。",
     "commands.db.error": "绑定数据库操作失败，请稍后重试。",
@@ -131,7 +131,7 @@ BUSINESS_FIELDS = {
     "events.kick.failed": {"member_qq"},
     "commands.bind.success": {"mc_name"},
     "commands.bind.already_bound": {"mc_name"},
-    "commands.bind.banned_name": {"requested_mc_name"},
+    "commands.bind.banned_name": {"mc_name"},
     "commands.unbind.success": {"mc_name"},
     "commands.unbind.frozen": {"mc_name"},
     "commands.unbind.pending": {"mc_name"},
@@ -143,15 +143,15 @@ BUSINESS_FIELDS = {
     "commands.ping.connection_error": {"latency_ms"},
     "commands.ping.error": {"latency_ms"},
     "commands.reconcile.success": {"count"},
-    "commands.db.not_member": {"qq_id"},
+    "commands.db.not_member": {"member_qq"},
     "commands.db.name_taken": {"mc_name"},
     "commands.db.banned_name": {"mc_name"},
     **{
-        f"commands.db.{status}": {"qq_id", "mc_name", "member_name", "member_display"}
+        f"commands.db.{status}": {"member_qq", "mc_name", "member_name", "member_display"}
         for status in ("active", "frozen", "pending")
     },
     **{
-        f"commands.db.{status}": {"qq_id", "mc_name"}
+        f"commands.db.{status}": {"member_qq", "mc_name"}
         for status in ("success", "already_same", "already_bound", "removed", "rm_frozen", "rm_pending")
     },
 }

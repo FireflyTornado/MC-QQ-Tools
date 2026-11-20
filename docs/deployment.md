@@ -71,7 +71,7 @@ events:
 commands:
   bind:
     success: "已绑定 Minecraft ID：{mc_name}"
-    banned_name: "游戏 ID {requested_mc_name} 已被封禁，暂时无法绑定。"
+    banned_name: "游戏 ID {mc_name} 已被封禁，暂时无法绑定。"
   help:
     message: "发送 /bind 游戏ID 绑定账号，发送 /binding 查询。"
 info:
@@ -86,6 +86,8 @@ info:
 中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。通用变量 `{group_id}` 和 `{bot_qq}` 分别是目标群号和机器人 QQ 号，可用于所有文字文案，包括状态图的标题和标签。业务变量的含义和可用字段见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。可用变量在本次渲染时缺少实际值会显示为 `—`。指令权限继续由目标群和 `SUPERUSERS` 控制。
 
 已有绑定时，`/绑定` 统一使用 `commands.bind.already_bound`，默认提示如需更换请先使用 `/解绑`。旧配置里的 `commands.bind.frozen` 和 `commands.bind.pending` 可以删除。`/解绑` 和 `/我的绑定` 仍可显示冻结或待核实状态。
+
+已有自定义文案时，将 `commands.bind.banned_name` 中的 `{requested_mc_name}` 改为 `{mc_name}`，并将 `commands.db` 下的 `{qq_id}` 改为 `{member_qq}`。包含旧占位符的文案会回退到该项默认值。
 
 每条文案最多 1000 字符，配置文件最多 64 KiB。缺失字段、空文案、类型错误、非法占位符和过长文案使用该字段的内置默认值。请用布尔值 `true` 或 `false` 设置通知开关。无法解析或读取文件时使用全部内置默认值，群通知因此默认关闭，日志只记录错误类别和已知字段。状态图使用 `info.title` 和仍在显示的 `info.labels.*`，超宽时截断并加省略号。`info.footer` 和隐藏字段的旧标签仍可解析，便于保留已有配置。
 

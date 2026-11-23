@@ -334,7 +334,7 @@ MC_SUDO_PLUGIN_TOKEN=REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN
 mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
 ```
 
-产物是 `minecraft-sudo/target/mcqqauth-sudo-0.2.0.jar`，包含指令通道和输出收集器。MCQQAuth 授权插件可按需安装。首次启动会创建 `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。填入与 FastAPI 一致的 `MC_SUDO_PLUGIN_TOKEN` 并设置 WSS 地址。
+产物是 `minecraft-sudo/target/mcqqauth-sudo-0.3.0.jar`，包含指令通道和输出收集器。MCQQAuth 授权插件可按需安装。首次启动会创建 `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。填入与 FastAPI 一致的 `MC_SUDO_PLUGIN_TOKEN` 并设置 WSS 地址。
 
 ```yaml
 sudo:

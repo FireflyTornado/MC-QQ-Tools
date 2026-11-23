@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>cn.nightbugclub</groupId>
     <artifactId>mcqqauth-sudo</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <maven.compiler.proc>none</maven.compiler.proc>

@@ -8,7 +8,8 @@ from dotenv import dotenv_values
 
 BOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = BOT_DIR / ".env"
-DEFAULT_NOTIFY_URL = "http://127.0.0.1:18765/internal/mc/notify"
+API_PORT = 18765
+DEFAULT_NOTIFY_URL = f"http://127.0.0.1:{API_PORT}/internal/mc/notify"
 MAX_TOKEN_LENGTH = 4096
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~+/-]+=*")
 
@@ -47,6 +48,18 @@ def require_token(config: dict[str, str | None], key: str) -> str:
     if value == f"REPLACE_WITH_{key}" or not is_bearer_token(value):
         raise ConfigError(f"{key} 必须是有效的 ASCII Bearer Token，长度最多 {MAX_TOKEN_LENGTH}")
     return value
+
+
+def read_switch(config: dict[str, str | None], key: str, *, default: bool | None) -> bool | None:
+    value = config.get(key)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ConfigError(f"{key} 必须是 true 或 false")
 
 
 def target_group_id(config: dict[str, str | None]) -> int:

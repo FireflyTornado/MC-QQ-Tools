@@ -30,9 +30,13 @@ cp -n bot/.env.example bot/.env
 
 `bot/.env.example` 分为公共配置、授权与通知、远程指令三段。按需填写已启用配置的占位值。将 `TARGET_GROUP_ID=0` 改为目标群的数字编号，保留 `ONEBOT_WS_URLS` 的 JSON 数组格式。OneBot Token 要与 NapCat 的实际配置一致。授权插件的 `api.token` 对应 `MC_API_TOKEN`，`MC_NOTIFY_TOKEN` 使用独立的值。进程环境变量优先于 `bot/.env`，显式空值也会覆盖文件值。Bot 和 API 在启动时读取配置，通知客户端在发送时读取。更换凭据时应同步更新调用端并重启相应服务。
 
-在仓库根目录运行 `python bot/migrate.py` 初始化或升级默认数据库 `bot/data/auth.db`。`python bot/migrate.py --db <路径>` 可为迁移命令指定其他目标。升级已有库前先做一致性备份，迁移报错时保留原库并检查原因。
+启用授权时，在仓库根目录运行 `python bot/migrate.py` 初始化或升级默认数据库 `bot/data/auth.db`。`python bot/migrate.py --db <路径>` 可为迁移命令指定其他目标。升级已有库前先做一致性备份，迁移报错时保留原库并检查原因。
 
-数据库就绪后，可在仓库根目录用 `python bot/bot.py` 和 `python -m uvicorn --app-dir bot mc_api:app --host 127.0.0.1 --port 18765` 分别启动两个进程。在 `bot/` 中也可继续使用 `python bot.py` 和 `python -m uvicorn mc_api:app --host 127.0.0.1 --port 18765`。
+可在仓库根目录用 `python bot/bot.py` 和 `python -m uvicorn --app-dir bot mc_api:app --host 127.0.0.1 --port 18765` 分别启动两个进程。在 `bot/` 中也可继续使用 `python bot.py` 和 `python -m uvicorn mc_api:app --host 127.0.0.1 --port 18765`。
+
+Bot 和 FastAPI 使用同一组组件开关，修改后重启两个进程。未设置 `MC_AUTH_ENABLED` 时，默认启用授权。未设置 `MC_SUDO_ENABLED` 时，沿用 `MC_SUDO_QQ_IDS` 的启用方式。显式设置为 `false` 会关闭对应的命令和 API 路由。两项同时启用时，凭据配置错误会停用出错的组件，另一项仍可启动。
+
+只部署 MCQQSudo 时，在现有 `bot/.env` 中设置 `MC_AUTH_ENABLED=false` 和 `MC_SUDO_ENABLED=true`，填好公共配置和 [远程指令凭据](#qq群管理指令)，即可用上述启动命令启动 Bot 和 FastAPI。授权 Token 和 SQLite 仅在启用 MCQQAuth 时需要。只部署 MCQQAuth 时，可设置 `MC_SUDO_ENABLED=false`。
 
 通知默认发送到 `http://127.0.0.1:18765/internal/mc/notify`。可用 `MC_NOTIFY_URL` 覆盖为可信网络上的直连 HTTP(S) 地址。通知请求绕过环境代理并拒绝重定向。
 
@@ -115,7 +119,7 @@ sudo python3.12 -m venv bot/.venv
 sudo bot/.venv/bin/python -m pip install -r requirements.txt
 ```
 
-准备好 `bot/.env` 和已初始化的 SQLite 数据库后再启动服务。unit 文件采用 `root:root`、`0644`。由 root 持有的 `bot/.env` 和数据库宜使用 `0600`，`bot/data/` 宜使用 `0700`。应用从自己的目录读取 `bot/.env`。unit 的 `UMask=0077` 限制新建文件的默认权限，已有文件权限需单独核对。
+准备好 `bot/.env` 后再启动服务。启用授权的部署还需要已初始化的 SQLite 数据库。unit 文件采用 `root:root`、`0644`。由 root 持有的 `bot/.env` 和数据库宜使用 `0600`，`bot/data/` 宜使用 `0700`。应用从自己的目录读取 `bot/.env`。unit 的 `UMask=0077` 限制新建文件的默认权限，已有文件权限需单独核对。
 
 Bot 通过 `Wants=` 请求一同启动 API，通过 `After=` 排在 API 的启动作业之后。API 启动失败时 Bot 仍可保存绑定，通知失败由现有机制处理。`Type=exec` 只确认解释器已执行，API 就绪需检查本机端口和健康接口。NapCat 仍由 Compose 独立管理。
 
@@ -206,18 +210,21 @@ sudo journalctl -u mc-qq-api.service -u mc-qq-bot.service -n 100 --no-pager
 sudo journalctl -u mc-qq-api.service -u mc-qq-bot.service -f
 ```
 
-确认 `18765` 只监听 `127.0.0.1`，健康接口返回 `{"status":"ok"}`，未授权快照返回 `401`。健康接口只检查 API 进程，数据库完整性另行核验。
+确认 `18765` 只监听 `127.0.0.1`，健康接口返回 `"status":"ok"`。授权启用时，未带凭据的快照请求返回 `401`。关闭授权时，快照路由返回 `404`。健康接口只检查 API 进程，数据库完整性另行核验。
 
 ```sh
 sudo ss -ltnp 'sport = :18765'
 curl -fsS http://127.0.0.1:18765/internal/health
+# 授权启用时执行下一条快照检查。
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
   http://127.0.0.1:18765/internal/mc/snapshot)" = 401
 ```
 
 ### 安全升级工具
 
-`deploy/update.sh` 用于 Ubuntu 24.04 上的人工升级。从生产工作目录执行，检查和升级分别选择一条命令。
+`deploy/update.sh` 用于 Ubuntu 24.04 上的人工升级。升级工具的健康检查仍要求授权快照接口。仅部署 MCQQSudo 时，按下方手工升级流程更新源码和依赖，并用健康接口和 `/sudo` 回执验收。
+
+从生产工作目录执行，检查和升级分别选择一条命令。
 
 ```sh
 cd /opt/mc-qq-auth
@@ -437,7 +444,7 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 
 TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod，之后修改这三个阈值只需重启 Bot。
 
-每次提交一条纯文本命令。在机器人发出结果前，新的请求会收到忙碌提示。Bot 在同一进程内保留消息 ID 5 分钟，忙碌时拒绝的指令也会登记，以忽略 OneBot 重投。去重缓存满时，Bot 暂停接收新指令，最后一次因容量拒绝的消息再过 5 分钟才恢复接收。等待满 30 秒会回复「执行超时，结果未知」。若 API 先检测到游戏端指令连接断开且仍在等回执，Bot 会立即回复「指令通道已断开，执行结果未知」，回复后释放名额。两种情况下，已经开始的指令仍可能完成，机器人不会自动重发。Bot 和 FastAPI 日志可按请求编号关联群号、QQ 号、命令和回执。要关闭功能，可把 `MC_SUDO_QQ_IDS` 置空数组并重启 Bot 和 FastAPI，或将 Mod 的 `sudo.enabled` 改为 `false` 后重启游戏服。
+每次提交一条纯文本命令。在机器人发出结果前，新的请求会收到忙碌提示。Bot 在同一进程内保留消息 ID 5 分钟，忙碌时拒绝的指令也会登记，以忽略 OneBot 重投。去重缓存满时，Bot 暂停接收新指令，最后一次因容量拒绝的消息再过 5 分钟才恢复接收。等待满 30 秒会回复「执行超时，结果未知」。若 API 先检测到游戏端指令连接断开且仍在等回执，Bot 会立即回复「指令通道已断开，执行结果未知」，回复后释放名额。两种情况下，已经开始的指令仍可能完成，机器人不会自动重发。Bot 和 FastAPI 日志可按请求编号关联群号、QQ 号、命令和回执。可在 Bot 和 FastAPI 的配置中设 `MC_SUDO_ENABLED=false` 后重启两者。将 Mod 的 `sudo.enabled` 改为 `false` 后重启游戏服也可关闭游戏端指令通道。
 
 ## 本地测试和锁文件维护
 

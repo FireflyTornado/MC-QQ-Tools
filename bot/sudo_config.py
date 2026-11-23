@@ -3,7 +3,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from app_config import ConfigError, require_token
+from app_config import ConfigError, read_switch, require_token
 
 SUDO_TIMEOUT = 30
 SUDO_SUBMIT_PATH = "/internal/mc/sudo/submit"
@@ -58,12 +58,15 @@ class SudoSettings:
     plugin_token: str
 
 
-def read_sudo_settings(config: dict[str, str | None]) -> SudoSettings | None:
-    raw_ids = config.get("MC_SUDO_QQ_IDS")
-    if raw_ids is None:
+def read_sudo_settings(
+    config: dict[str, str | None], *, auth_tokens: tuple[str, ...] = (),
+) -> SudoSettings | None:
+    enabled = read_switch(config, "MC_SUDO_ENABLED", default=None)
+    if enabled is False:
         return None
+    raw_ids = config.get("MC_SUDO_QQ_IDS")
     try:
-        ids = json.loads(raw_ids)
+        ids = json.loads(raw_ids) if raw_ids is not None else []
     except (ValueError, RecursionError):
         ids = None
     if not isinstance(ids, list) or any(
@@ -72,14 +75,12 @@ def read_sudo_settings(config: dict[str, str | None]) -> SudoSettings | None:
     ):
         raise ConfigError("MC_SUDO_QQ_IDS 必须为 QQ 号字符串的 JSON 数组")
     if not ids:
+        if enabled:
+            raise ConfigError("启用 /sudo 时，MC_SUDO_QQ_IDS 必须至少包含一个 QQ 号")
         return None
     bot_token = require_token(config, "MC_SUDO_BOT_TOKEN")
     plugin_token = require_token(config, "MC_SUDO_PLUGIN_TOKEN")
-    if bot_token == plugin_token or {bot_token, plugin_token} & {
-        config.get("MC_API_TOKEN"),
-        config.get("MC_NOTIFY_TOKEN"),
-        config.get("ONEBOT_ACCESS_TOKEN"),
-    }:
+    if bot_token == plugin_token or {bot_token, plugin_token} & {config.get("ONEBOT_ACCESS_TOKEN"), *auth_tokens}:
         raise ConfigError("/sudo 凭据必须独立配置")
     return SudoSettings(frozenset(ids), bot_token, plugin_token)
 

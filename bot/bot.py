@@ -12,12 +12,15 @@ from app_config import (
     require_token,
     target_group_id,
 )
+from component_config import read_components
+from sudo_config import read_sudo_output_settings
 
 
 def init_bot() -> None:
     config = load_config()
     group_id = target_group_id(config)
     ws_urls = onebot_ws_urls(config)
+    components = read_components(config)
     access_token = None
     if config.get("ONEBOT_ACCESS_TOKEN"):
         access_token = require_token(config, "ONEBOT_ACCESS_TOKEN")
@@ -42,7 +45,20 @@ def init_bot() -> None:
         finally:
             nonebot.logger.enable("nonebot")
 
-        nonebot.load_plugins("plugins")
+        if components.auth is not None:
+            for name in ("qq_events", "qq_bindings", "qq_db", "status_commands"):
+                nonebot.load_plugin(f"plugins.{name}")
+        if components.sudo is not None:
+            try:
+                output = read_sudo_output_settings(config)
+            except ConfigError as exc:
+                if components.auth is None:
+                    raise
+                nonebot.logger.error("/sudo 已关闭：{}", exc)
+            else:
+                plugin = nonebot.load_plugin("plugins.qq_sudo")
+                if plugin is not None:
+                    plugin.module.configure(components.sudo, output)
 
 
 init_bot()

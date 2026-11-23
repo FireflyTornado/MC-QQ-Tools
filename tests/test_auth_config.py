@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
@@ -21,10 +22,13 @@ BOT_DIR = Path(__file__).resolve().parents[1] / "bot"
 sys.path.insert(0, str(BOT_DIR))
 
 import app_config
+import auth_api
 import binding_service
 import database
 import notify_client
 import runtime_status
+from component_config import read_components
+from sudo_config import SUDO_SUBMIT_PATH
 
 API_TOKEN = "test-only.api~token+="
 NOTIFY_TOKEN = "test-only.notify-token"
@@ -90,9 +94,10 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 "MC_API_TOKEN": API_TOKEN, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN, "MC_BANLIST_TOKEN": BANLIST_TOKEN,
             }, clear=True
         ):
-            self.api = importlib.import_module("mc_api")
+            self.app = importlib.import_module("mc_api").app
+        self.api = self.app.state.auth
         self.addCleanup(sys.modules.pop, "mc_api", None)
-        self.api.DB_PATH = db_path
+        self.api.db_path = db_path
 
     async def request(self, path, authorization=(), method="GET", body=b""):
         sent = []
@@ -103,7 +108,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         async def send(message):
             sent.append(message)
 
-        await self.api.app(
+        await self.app(
             {**scope("http", path, authorization), "method": method}, receive, send
         )
         headers = dict(sent[0]["headers"])
@@ -123,6 +128,23 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         if profiles is not None:
             payload["profiles"] = profiles
         return await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", json.dumps(payload).encode())
+
+    async def test_both_components_mount_their_routes_and_use_separate_credentials(self):
+        self.app = sys.modules["mc_api"].create_app({
+            **ENV, "MC_SUDO_ENABLED": "true", "MC_SUDO_QQ_IDS": '["123"]',
+            "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_PLUGIN_TOKEN": "mod-token",
+        })
+        self.app.state.auth.db_path = self.api.db_path
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer("bot-token")]))[0], 401)
+        payload = json.dumps({
+            "id": "a" * 32, "group_id": GROUP_ID, "qq_id": "123", "command": "list",
+            "deadline_ms": time.time_ns() // 1_000_000 + 10_000,
+        }).encode()
+        path = SUDO_SUBMIT_PATH
+        self.assertEqual((await self.request(path, [bearer(API_TOKEN)], "POST", payload))[0], 401)
+        status, _, reply = await self.request(path, [bearer("bot-token")], "POST", payload)
+        self.assertEqual((status, reply), (200, {"status": "unavailable"}))
 
     async def test_banlist_upload_freezes_broadcasts_and_only_restores_after_membership_check(self):
         status, headers, cursor = await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)])
@@ -144,7 +166,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2], frozen)
             self.assertTrue(updates.empty())
 
-        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+        with (patch.object(binding_service, "DB_PATH", self.api.db_path),
               patch.object(binding_service, "notify_auth_updated")):
             self.assertEqual(binding_service.request_unbind(GROUP_ID, "1"), ("pending", "Steve"))
             audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
@@ -168,11 +190,11 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 409)
         self.assertNotIn(b"x-mcqq-banlist-conflict", headers)
         self.assertEqual((await self.upload_banlist(3, 1, {"Steve": None}, client_id="b" * 32))[0], 409)
-        db_path = self.api.DB_PATH
+        db_path = self.api.db_path
         database.init_database(db_path)
-        with patch.object(app_config, "load_config", return_value={**ENV, "MC_BANLIST_TOKEN": BANLIST_TOKEN}):
-            self.api = importlib.reload(self.api)
-        self.api.DB_PATH = db_path
+        self.app = sys.modules["mc_api"].create_app({**ENV, "MC_BANLIST_TOKEN": BANLIST_TOKEN})
+        self.api = self.app.state.auth
+        self.api.db_path = db_path
         self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 2})
         self.assertEqual((await self.upload_banlist(2, 1, {"alex": None}, client_id="b" * 32))[0], 200)
         self.assertEqual((await self.upload_banlist(1, 2, {}))[0], 409)
@@ -196,7 +218,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2], {
             "version": VERSION, "active_names": ["alex", "steve"],
         })
-        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+        with closing(sqlite3.connect(self.api.db_path)) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM server_bans").fetchone()[0], 0)
 
     async def test_uuid_only_bans_preserve_known_names_without_blocking_other_bans_and_pardons(self):
@@ -211,15 +233,15 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.upload_banlist(1, 2, entries, profiles=initial))[0], 200)
         mixed = {other: {"name": "Other", "expires_at": None}}
         self.assertEqual((await self.upload_banlist(1, 3, {**entries, "STEVE": None}, profiles=mixed))[0], 200)
-        database.init_database(self.api.DB_PATH)
-        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+        database.init_database(self.api.db_path)
+        with closing(sqlite3.connect(self.api.db_path)) as conn:
             saved = conn.execute(
                 "SELECT mc_name_key, state FROM server_bans WHERE profile_uuid = ?", (steve,),
             ).fetchone()
             self.assertEqual(saved, ("steve", "KNOWN_PROFILE"))
 
         def states():
-            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            with closing(sqlite3.connect(self.api.db_path)) as conn:
                 return dict(conn.execute("SELECT mc_name_key, state FROM frozen_bindings"))
 
         profiles = {
@@ -232,11 +254,11 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(states(), {
             "steve": "FROZEN", "alex": "PENDING_MEMBERSHIP_CHECK", "other": "FROZEN",
         })
-        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+        with closing(sqlite3.connect(self.api.db_path)) as conn:
             self.assertEqual(set(conn.execute("SELECT profile_uuid, mc_name_key, state FROM server_bans")), {
                 (steve, "steve", "BANNED"), (unknown, None, "BANNED"), (other, "other", "BANNED"),
             })
-        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+        with (patch.object(binding_service, "DB_PATH", self.api.db_path),
               patch.object(binding_service, "notify_auth_updated")):
             audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
             self.assertEqual(binding_service.reconcile_checked_bindings(GROUP_ID, audit, {"2"}, 2), 0)
@@ -252,7 +274,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         alex = "00000000-0000-4000-8000-000000000003"
 
         def profile(uuid):
-            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            with closing(sqlite3.connect(self.api.db_path)) as conn:
                 return conn.execute(
                     "SELECT id, mc_name_key, expires_at, state FROM server_bans WHERE profile_uuid = ?", (uuid,),
                 ).fetchone()
@@ -266,8 +288,8 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
         expires_at = database.MAX_AUTH_VERSION
         profiles = {known: {"name": None, "expires_at": expires_at}}
-        with (patch.object(database, "DB_PATH", self.api.DB_PATH),
-              patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+        with (patch.object(database, "DB_PATH", self.api.db_path),
+              patch.object(binding_service, "DB_PATH", self.api.db_path),
               patch.object(binding_service, "notify_auth_updated")):
             self.assertEqual((await self.upload_banlist(1, 2, {"Alex": None}, profiles=profiles))[0], 200)
             self.assertEqual(profile(known), (row_id, "steve", expires_at, "BANNED"))
@@ -299,7 +321,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             clock.time_ns.return_value = (expiration - 60_000) * 1_000_000
             self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=profiles))[0], 200)
             self.assertEqual((await self.upload_banlist(1, 2, {}, profiles=profiles))[0], 200)
-        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+        with (patch.object(binding_service, "DB_PATH", self.api.db_path),
               patch.object(binding_service, "notify_auth_updated")):
             self.assertEqual(binding_service.query_binding(GROUP_ID, "1"), ("pending", "Steve"))
             audit = binding_service.membership_audit_snapshot(GROUP_ID, only_pending=True)
@@ -308,7 +330,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
 
         def stored_profiles():
-            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            with closing(sqlite3.connect(self.api.db_path)) as conn:
                 return {
                     uuid: (name, expiration, state)
                     for uuid, name, expiration, state in conn.execute(
@@ -316,7 +338,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                     )
                 }
 
-        database.init_database(self.api.DB_PATH)
+        database.init_database(self.api.db_path)
         self.assertEqual(stored_profiles(), {steve: (None, expiration, "BANNED"), unknown: (None, None, "BANNED")})
         # An explicit server name associates the UUID and restores the usual ban behavior.
         self.assertEqual((await self.upload_banlist(1, 3, {}, profiles={
@@ -331,7 +353,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         expiration = 1_850_000_000_000
 
         def reservations():
-            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            with closing(sqlite3.connect(self.api.db_path)) as conn:
                 return conn.execute("SELECT state, qq_id FROM frozen_bindings").fetchall()
 
         with patch("banlist_sync.time") as clock:
@@ -341,7 +363,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 second: {"name": "STEVE", "expires_at": expiration},
             }))[0], 200)
             self.assertEqual(reservations(), [("FROZEN", "1")])
-            with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+            with closing(sqlite3.connect(self.api.db_path)) as conn:
                 self.assertEqual(set(conn.execute("SELECT profile_uuid, mc_name_key, expires_at FROM server_bans")), {
                     (first, "steve", expiration - 10_000), (second, "steve", expiration),
                 })
@@ -353,15 +375,15 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             clock.time_ns.return_value = expiration * 1_000_000
             self.assertEqual((await self.upload_banlist(1, 3, {}, profiles=remaining))[0], 200)
         self.assertEqual(reservations(), [("PENDING_MEMBERSHIP_CHECK", "1")])
-        with closing(sqlite3.connect(self.api.DB_PATH)) as conn:
+        with closing(sqlite3.connect(self.api.db_path)) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM server_bans").fetchone(), (0,))
 
     async def test_banlist_auth_validation_and_rollback_leave_cursor_unchanged(self):
         for header in ([bearer(API_TOKEN)], [bearer(NOTIFY_TOKEN)], [], [bearer(BANLIST_TOKEN)] * 2):
             self.assertEqual((await self.request(BANLIST_PATH, header, "PUT", b"{}"))[0], 401)
-        with patch.object(self.api, "BANLIST_TOKEN", None):
+        with patch.object(self.api, "banlist_token", None):
             self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 404)
-        with patch.object(self.api, "MAX_BANLIST_BYTES", 4):
+        with patch.object(auth_api, "MAX_BANLIST_BYTES", 4):
             self.assertEqual((await self.upload_banlist(1, 1, {}))[0], 413)
         for entries in ({"Bad Name": None}, {"Steve": True}, {"Steve": "42"}):
             self.assertEqual((await self.upload_banlist(1, 1, entries))[0], 422)
@@ -373,7 +395,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
 
     async def test_snapshot_excludes_frozen_and_pending_bindings_until_membership_is_verified(self):
-        with (patch.object(binding_service, "DB_PATH", self.api.DB_PATH),
+        with (patch.object(binding_service, "DB_PATH", self.api.db_path),
               patch.object(binding_service, "notify_auth_updated") as notify):
             binding_service.apply_ban_snapshot({"STEVE": None})
             status, _, frozen = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
@@ -438,7 +460,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
             with self.subTest(case=name):
                 await asyncio.wait_for(
-                    self.api.app(scope("websocket", WS_PATH, [header]), receive, send), timeout=2
+                    self.app(scope("websocket", WS_PATH, [header]), receive, send), timeout=2
                 )
                 self.assertEqual([message["type"] for message in sent], ["websocket.close"])
                 self.assertFalse(self.api.connections)
@@ -450,7 +472,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         outgoing = asyncio.Queue()
         await incoming.put({"type": "websocket.connect"})
         task = asyncio.create_task(
-            self.api.app(
+            self.app(
                 scope("websocket", WS_PATH, [bearer(API_TOKEN)]), incoming.get, outgoing.put
             )
         )
@@ -485,7 +507,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 await intercept(message)
             outgoing.put_nowait(message)
 
-        task = asyncio.create_task(self.api.app(
+        task = asyncio.create_task(self.app(
             scope("websocket", WS_PATH, [bearer(API_TOKEN)]), incoming.get, send,
         ))
         try:
@@ -497,7 +519,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, 2)
 
     def set_version(self, version):
-        with closing(sqlite3.connect(self.api.DB_PATH)) as conn, conn:
+        with closing(sqlite3.connect(self.api.db_path)) as conn, conn:
             conn.execute("UPDATE auth_state SET version = ?", (version,))
 
     async def test_failed_send_closes_only_the_failed_websocket(self):
@@ -536,7 +558,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 closing_socket.set()
                 await asyncio.Future()
 
-        with patch.object(self.api, "WS_SEND_TIMEOUT", 0.15), patch.object(self.api, "WS_CLOSE_TIMEOUT", 0.3):
+        with patch.object(auth_api, "WS_SEND_TIMEOUT", 0.15), patch.object(auth_api, "WS_CLOSE_TIMEOUT", 0.3):
             async with self.websocket(stalled_io) as (_, failed_task), self.websocket() as (healthy, _):
                 broadcast = asyncio.create_task(self.api.broadcast_latest())
                 await asyncio.wait_for(sending.wait(), 2)
@@ -557,7 +579,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         async def app_with_transport_failure(scope, receive, send):
             nonlocal inject_failure
             if scope["type"] != "websocket" or not inject_failure:
-                await self.api.app(scope, receive, send)
+                await self.app(scope, receive, send)
                 return
             inject_failure = False
 
@@ -569,7 +591,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError("synthetic send failure")
                 await send(message)
 
-            await self.api.app(scope, receive, send_with_failure)
+            await self.app(scope, receive, send_with_failure)
 
         with closing(socket.socket()) as listener:
             listener.bind(("127.0.0.1", 0))
@@ -585,7 +607,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 headers = {"Authorization": bearer(API_TOKEN).decode("ascii")}
                 async with connect(uri, additional_headers=headers, proxy=None) as client:
                     self.assertEqual(json.loads(await asyncio.wait_for(client.recv(), 2))["type"], "connected")
-                    with patch.object(binding_service, "DB_PATH", self.api.DB_PATH), patch.object(
+                    with patch.object(binding_service, "DB_PATH", self.api.db_path), patch.object(
                         binding_service, "notify_auth_updated", return_value=False
                     ):
                         self.assertEqual(binding_service.unbind_player(GROUP_ID, "1"), "Steve")
@@ -608,7 +630,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         async with self.websocket() as (outgoing, _):
             self.assertEqual(await self.api.broadcast_latest(), (VERSION, 1))
             await asyncio.wait_for(outgoing.get(), 2)
-            with patch.object(binding_service, "DB_PATH", self.api.DB_PATH), patch.object(
+            with patch.object(binding_service, "DB_PATH", self.api.db_path), patch.object(
                 notify_client, "load_config", return_value=ENV
             ), patch.object(notify_client.opener, "open", side_effect=URLError(NOTIFY_TOKEN)), self.assertLogs(
                 "mc_qq_auth", "WARNING"
@@ -617,12 +639,9 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(binding_service.get_binding(GROUP_ID, "1"))
             self.assertNotIn(NOTIFY_TOKEN, "\n".join(logs.output))
             self.assertTrue(outgoing.empty())
-            with patch.object(self.api, "RECONCILE_INTERVAL", 0.01):
-                await self.api.start_reconciliation()
-                try:
+            with patch.object(auth_api, "RECONCILE_INTERVAL", 0.01):
+                async with self.app.router.lifespan_context(self.app):
                     update = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
-                finally:
-                    await self.api.stop_reconciliation()
             self.assertEqual(update["type"], "auth_updated")
             self.assertGreater(update["version"], VERSION)
             status, _, snapshot = await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)])
@@ -709,6 +728,32 @@ class ConfigTests(unittest.TestCase):
                     importlib.import_module("mc_api")
                 self.assertNotIn(API_TOKEN, str(error.exception))
 
+    def test_component_switches_and_credentials_are_independent(self):
+        sudo = {
+            "MC_SUDO_QQ_IDS": '["123"]',
+            "MC_SUDO_BOT_TOKEN": "bot-token",
+            "MC_SUDO_PLUGIN_TOKEN": "mod-token",
+        }
+        both = read_components({**ENV, **sudo})
+        self.assertIsNotNone(both.auth)
+        self.assertIsNotNone(both.sudo)
+        auth_only = read_components({**ENV, **sudo, "MC_SUDO_ENABLED": "false", "MC_SUDO_QQ_IDS": "invalid"})
+        self.assertIsNotNone(auth_only.auth)
+        self.assertIsNone(auth_only.sudo)
+        sudo_only = read_components({**sudo, "MC_AUTH_ENABLED": "false", "MC_API_TOKEN": "bot-token"})
+        self.assertIsNone(sudo_only.auth)
+        self.assertIsNotNone(sudo_only.sudo)
+        with self.assertLogs("mc_qq_auth", "ERROR"):
+            sudo_only = read_components({**sudo, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN})
+        self.assertIsNone(sudo_only.auth)
+        self.assertIsNotNone(sudo_only.sudo)
+        with self.assertLogs("mc_qq_auth", "ERROR"):
+            auth_only = read_components({**ENV, **sudo, "MC_SUDO_BOT_TOKEN": API_TOKEN})
+        self.assertIsNotNone(auth_only.auth)
+        self.assertIsNone(auth_only.sudo)
+        with self.assertRaisesRegex(app_config.ConfigError, "MC_SUDO_QQ_IDS"):
+            read_components({"MC_AUTH_ENABLED": "false", "MC_SUDO_ENABLED": "true"})
+
     def test_notify_url_override_and_direct_request(self):
         url = "http://127.0.0.1:19002/custom/notify"
         with patch.dict(os.environ, {"MC_NOTIFY_URL": url}, clear=True), patch.object(
@@ -758,10 +803,11 @@ class ConfigTests(unittest.TestCase):
         project = self.root / "source"
         (project / "plugins").mkdir(parents=True)
         for rel in (
-            "app_config.py", "banlist_sync.py", "bot.py", "binding_service.py", "database.py", "mc_api.py",
+            "api_security.py", "app_config.py", "auth_api.py", "banlist_sync.py", "bot.py", "binding_service.py",
+            "component_config.py", "database.py", "mc_api.py",
             "notify_client.py", "qq_avatar.py", "qq_group.py", "runtime_status.py", "status_image.py",
             "status_card.svg", "message_config.py", "sudo_api.py", "sudo_config.py",
-            "plugins/qq_bindings.py", "plugins/qq_events.py", "plugins/status_commands.py", "plugins/qq_sudo.py",
+            "plugins/qq_bindings.py", "plugins/qq_db.py", "plugins/qq_events.py", "plugins/status_commands.py",
         ):
             shutil.copyfile(BOT_DIR / rel, project / rel)
         onebot_token = "76543210123456"
@@ -791,22 +837,22 @@ assert message_config.MESSAGES.text("commands.help.message") == "configured"
 message_config.MESSAGE_FILE.unlink()
 assert message_config.MESSAGES.text("commands.help.message") == "configured"
 assert nonebot.get_driver().config.target_group_id == 98765
-assert mc_api.TARGET_GROUP_ID == "98765"
+assert mc_api.app.state.auth.target_group == "98765"
 adapter = nonebot.get_adapter(Adapter)
 assert adapter.onebot_config.onebot_access_token == os.environ["ONEBOT_ACCESS_TOKEN"]
 assert {plugin.module_name for plugin in nonebot.get_loaded_plugins()} == {
-    "plugins.qq_bindings", "plugins.qq_events", "plugins.status_commands", "plugins.qq_sudo",
+    "plugins.qq_bindings", "plugins.qq_db", "plugins.qq_events", "plugins.status_commands",
 }
-assert mc_api.sudo_settings is None
-assert mc_api.BANLIST_TOKEN is None
+assert "plugins.qq_sudo" not in sys.modules
+assert mc_api.app.state.auth.banlist_token is None
 """
         env = {
             key: value for key, value in os.environ.items()
             if key.upper() not in {
                 *ENV, "DRIVER", "LOG_LEVEL", "ENVIRONMENT", "ONEBOT_ACCESS_TOKEN",
                 "ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_WS_URLS", "ONEBOT_V11_WS_URLS",
+                "MC_AUTH_ENABLED", "MC_BANLIST_TOKEN", "MC_SUDO_ENABLED",
                 "MC_SUDO_QQ_IDS", "MC_SUDO_BOT_TOKEN", "MC_SUDO_PLUGIN_TOKEN",
-                "MC_BANLIST_TOKEN",
             }
         }
         env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, PYTHONUTF8="1")
@@ -818,3 +864,113 @@ assert mc_api.BANLIST_TOKEN is None
             if token in result.stdout or token in result.stderr:
                 self.fail("Bot startup exposed a synthetic credential")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_sudo_only_boots_without_auth_files_and_delivers_a_delayed_reply(self):
+        project = self.root / "sudo-only"
+        (project / "plugins").mkdir(parents=True)
+        for rel in (
+            "api_security.py", "app_config.py", "bot.py", "component_config.py", "mc_api.py", "qq_group.py",
+            "sudo_api.py", "sudo_config.py", "plugins/qq_sudo.py",
+        ):
+            shutil.copyfile(BOT_DIR / rel, project / rel)
+        (project / ".env").write_text(
+            'DRIVER=~websockets\nTARGET_GROUP_ID=12345\nMC_AUTH_ENABLED=false\nMC_SUDO_ENABLED=true\n'
+            'MC_SUDO_QQ_IDS=["123"]\nMC_SUDO_BOT_TOKEN=bot-token\nMC_SUDO_PLUGIN_TOKEN=mod-token\n',
+            encoding="utf-8",
+        )
+        code = """
+import asyncio
+import json
+import socket
+import sys
+from contextlib import closing
+from http.client import HTTPConnection
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import nonebot
+import uvicorn
+from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, Message
+from websockets.asyncio.client import connect
+
+sys.path.insert(0, sys.argv[1])
+import bot
+import mc_api
+from plugins import qq_sudo
+from sudo_config import SUDO_WS_PATH
+
+assert {plugin.module_name for plugin in nonebot.get_loaded_plugins()} == {"plugins.qq_sudo"}
+assert {"auth_api", "database", "banlist_sync", "runtime_status"}.isdisjoint(sys.modules)
+
+def check_routes(port):
+    with closing(HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
+        conn.request("GET", "/internal/health")
+        response = conn.getresponse()
+        assert response.status == 200
+        assert json.load(response) == {"status": "ok", "minecraft_connections": 0}
+        conn.request("GET", "/internal/mc/snapshot")
+        assert conn.getresponse().status == 404
+
+async def exercise(port):
+    await asyncio.to_thread(check_routes, port)
+    qq_bot = Bot(nonebot.get_adapter(Adapter), "201")
+    text = "/sudo list"
+    event = GroupMessageEvent.model_validate({
+        "time": 1, "self_id": 201, "post_type": "message", "message_type": "group",
+        "sub_type": "normal", "message_id": 1, "group_id": 12345, "user_id": 123,
+        "message": Message(text), "original_message": Message(text), "raw_message": text,
+        "font": 0, "sender": {},
+    })
+    with (
+        patch.object(qq_sudo, "API_PORT", port),
+        patch.object(qq_bot, "send", new_callable=AsyncMock) as initial,
+        patch.object(qq_bot, "send_group_msg", new_callable=AsyncMock) as delayed,
+    ):
+        async with connect(f"ws://127.0.0.1:{port}{SUDO_WS_PATH}",
+                           additional_headers={"Authorization": "Bearer mod-token"}, proxy=None) as mod:
+            command = asyncio.create_task(qq_bot.handle_event(event))
+            request = json.loads(await asyncio.wait_for(mod.recv(), 2))
+            assert request["command"] == "list" and request["stream_followup"] is True
+            request_id = request["id"]
+            await mod.send(json.dumps({"id": request_id, "status": "ok", "output": "", "wait_seconds": 30}))
+            await asyncio.wait_for(command, 2)
+            assert "正在执行..." in str(initial.call_args.kwargs["message"])
+            assert request_id in str(initial.call_args.kwargs["message"])
+            tasks = tuple(qq_sudo.followup_tasks)
+            assert len(tasks) == 1
+            await mod.send(json.dumps({
+                "id": request_id, "status": "ok", "output": "Delayed command output",
+                "followup": True, "sequence": 1, "final": True,
+            }))
+            await asyncio.wait_for(asyncio.gather(*tasks), 3)
+            delayed.assert_awaited_once()
+            assert f"指令后续回执 {request_id}\\nDelayed command output" == str(delayed.call_args.kwargs["message"])
+
+async def main():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(mc_api.app, lifespan="on", log_level="critical"))
+        task = asyncio.create_task(server.serve(sockets=[listener]))
+        try:
+            async with asyncio.timeout(8):
+                while not server.started:
+                    await asyncio.sleep(0.01)
+                await exercise(port)
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, 5)
+
+asyncio.run(main())
+assert not (Path(sys.argv[1]) / "data").exists()
+"""
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.upper().startswith(("MC_", "ONEBOT_"))
+            and key.upper() not in {"TARGET_GROUP_ID", "DRIVER", "LOG_LEVEL", "ENVIRONMENT"}
+        }
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code, str(project)],
+            cwd=self.root, env={**env, "PYTHONUTF8": "1"}, capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)

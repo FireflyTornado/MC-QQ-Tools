@@ -1157,7 +1157,7 @@ commands:
                 disconnected.set()
 
         async with await asyncio.start_server(slow_reply, "127.0.0.1", 0) as server:
-            self.enterContext(patch.object(self.sudo, "HEALTH_PORT", server.sockets[0].getsockname()[1]))
+            self.enterContext(patch.object(self.sudo, "API_PORT", server.sockets[0].getsockname()[1]))
             reply = await self.command_reply("/sudo list", message_id=48)
             self.assertTrue(reply_started.is_set())
             self.assertEqual(Message(reply).extract_plain_text(), "执行超时，结果未知。")

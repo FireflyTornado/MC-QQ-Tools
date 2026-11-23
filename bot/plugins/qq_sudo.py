@@ -12,9 +12,8 @@ from nonebot import logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.permission import Permission
 
-from app_config import ConfigError, load_config
+from app_config import API_PORT
 from qq_group import group_rule
-from runtime_status import HEALTH_PORT
 from sudo_config import (
     MAX_FOLLOWUP_FRAMES,
     MAX_RESULT_MESSAGE_BYTES,
@@ -24,18 +23,17 @@ from sudo_config import (
     SUDO_SUBMIT_PATH,
     SUDO_TIMEOUT,
     SudoOutputSettings,
+    SudoSettings,
     is_single_command,
-    read_sudo_output_settings,
-    read_sudo_settings,
 )
 
-try:
-    config = load_config()
-    settings = read_sudo_settings(config)
-    output_settings = read_sudo_output_settings(config) if settings else SudoOutputSettings()
-except ConfigError as exc:
-    logger.error("/sudo 已关闭：{}", exc)
-    settings = None
+settings: SudoSettings | None = None
+output_settings = SudoOutputSettings()
+
+
+def configure(sudo_settings: SudoSettings, output: SudoOutputSettings) -> None:
+    global settings, output_settings
+    settings, output_settings = sudo_settings, output
 
 running = asyncio.Lock()
 followup_tasks: set[asyncio.Task] = set()
@@ -120,12 +118,12 @@ async def submit(token: str, payload: dict) -> Reply:
 async def request_result(token: str, method: str, path: str, payload: dict | None = None) -> Reply:
     # Socket I/O is cancellable under the handler's total deadline.
     try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", HEALTH_PORT)
+        reader, writer = await asyncio.open_connection("127.0.0.1", API_PORT)
         try:
             protocol = h11.Connection(h11.CLIENT)
             body = json.dumps(payload).encode("utf-8") if payload is not None else b""
             request = h11.Request(method=method, target=path, headers=[
-                ("Host", f"127.0.0.1:{HEALTH_PORT}"),
+                ("Host", f"127.0.0.1:{API_PORT}"),
                 ("Authorization", f"Bearer {token}"),
                 ("Content-Type", "application/json"),
                 ("Content-Length", str(len(body))),

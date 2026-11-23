@@ -15,12 +15,11 @@ import psutil
 from mcstatus import JavaServer
 
 import database
-from app_config import ConfigError, load_config
+from app_config import API_PORT, ConfigError, load_config
 
 
 UNAVAILABLE = "Unavailable"
 HEALTH_TIMEOUT = 2
-HEALTH_PORT = 18765
 MINECRAFT_TIMEOUT = 2
 CPU_SAMPLE_INTERVAL = 0.12
 OutcomeKind = Literal["reconcile", "notify"]
@@ -58,7 +57,7 @@ def check_fastapi(*, include_connections: bool = False) -> HealthResult:
     """Probe the fixed loopback health endpoint."""
     started = time.monotonic()
     try:
-        with closing(HTTPConnection("127.0.0.1", HEALTH_PORT, timeout=HEALTH_TIMEOUT)) as connection:
+        with closing(HTTPConnection("127.0.0.1", API_PORT, timeout=HEALTH_TIMEOUT)) as connection:
             connection.request("GET", "/internal/health")
             with connection.getresponse() as response:
                 status = response.status

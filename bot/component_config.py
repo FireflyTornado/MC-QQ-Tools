@@ -3,7 +3,14 @@ import secrets
 from dataclasses import dataclass, replace
 
 from app_config import ConfigError, read_switch, require_token
-from sudo_config import SudoOutputSettings, SudoSettings, read_sudo_output_settings, read_sudo_settings
+from sudo_config import (
+    LEGACY_MOD_TOKEN_KEY,
+    MOD_TOKEN_KEY,
+    SudoOutputSettings,
+    SudoSettings,
+    read_sudo_output_settings,
+    read_sudo_settings,
+)
 
 
 logger = logging.getLogger("mc_qq_tools")
@@ -11,8 +18,8 @@ logger = logging.getLogger("mc_qq_tools")
 
 @dataclass(frozen=True)
 class AuthSettings:
-    api_token: str
     notify_token: str
+    api_token: str | None
 
 
 @dataclass(frozen=True)
@@ -22,28 +29,28 @@ class ComponentSettings:
     sudo_output: SudoOutputSettings | None = None
 
 
-def read_auth_settings(config: dict[str, str | None]) -> AuthSettings | None:
+def read_auth_settings(config: dict[str, str | None], *, require_api_token: bool) -> AuthSettings | None:
     if not read_switch(config, "MC_AUTH_ENABLED", default=True):
         return None
-    api_token = require_token(config, "MC_API_TOKEN")
+    api_token = require_token(config, "MC_API_TOKEN") if require_api_token else None
     notify_token = require_token(config, "MC_NOTIFY_TOKEN")
-    if secrets.compare_digest(api_token, notify_token):
+    if api_token is not None and secrets.compare_digest(api_token, notify_token):
         raise ConfigError("MC_API_TOKEN 与 MC_NOTIFY_TOKEN 必须使用不同的值")
-    return AuthSettings(api_token, notify_token)
+    return AuthSettings(notify_token=notify_token, api_token=api_token)
 
 
-def read_components(config: dict[str, str | None]) -> ComponentSettings:
+def read_components(config: dict[str, str | None], *, for_api: bool = True) -> ComponentSettings:
     auth = None
     sudo = None
     auth_error = None
     sudo_error = None
     sudo_output = None
     try:
-        auth = read_auth_settings(config)
+        auth = read_auth_settings(config, require_api_token=for_api)
     except ConfigError as exc:
         auth_error = exc
     try:
-        sudo = read_sudo_settings(config, auth_tokens=(auth.api_token, auth.notify_token) if auth else ())
+        sudo = read_sudo_settings(config, require_mod_token=for_api)
         if sudo is not None:
             sudo_output = read_sudo_output_settings(config)
     except ConfigError as exc:
@@ -87,8 +94,8 @@ def read_banlist_token(config: dict[str, str | None], auth: AuthSettings) -> byt
                 auth.notify_token,
                 config.get("ONEBOT_ACCESS_TOKEN"),
                 config.get("MC_SUDO_BOT_TOKEN"),
-                config.get("MC_SUDO_MOD_TOKEN"),
-                config.get("MC_SUDO_PLUGIN_TOKEN"),
+                config.get(MOD_TOKEN_KEY),
+                config.get(LEGACY_MOD_TOKEN_KEY),
             }
             if token in other_tokens:
                 raise ConfigError("MC_BANLIST_TOKEN 必须使用独立凭据")

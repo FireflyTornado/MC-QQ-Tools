@@ -138,6 +138,16 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[0], 404)
                 self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
 
+    async def test_duplicate_sudo_and_banlist_tokens_disable_both_routes(self):
+        with self.assertLogs("mc_qq_tools", "ERROR"):
+            self.app = sys.modules["mc_api"].create_app({
+                **ENV, "MC_SUDO_BOT_TOKEN": BANLIST_TOKEN, "MC_SUDO_MOD_TOKEN": "mod-token",
+                "MC_SUDO_QQ_IDS": '["123"]', "MC_BANLIST_TOKEN": BANLIST_TOKEN,
+            })
+        self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[0], 404)
+        self.assertEqual((await self.request(SUDO_SUBMIT_PATH, [bearer(BANLIST_TOKEN)], "POST"))[0], 404)
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
+
     async def test_stale_auth_database_stays_closed_while_sudo_keeps_its_routes(self):
         with closing(sqlite3.connect(database.DB_PATH)) as conn:
             conn.execute("PRAGMA user_version = 1")
@@ -833,7 +843,7 @@ class ConfigTests(unittest.TestCase):
         auth_only = read_components({**ENV, **sudo, "MC_SUDO_ENABLED": "false", "MC_SUDO_QQ_IDS": "invalid"})
         self.assertIsNotNone(auth_only.auth)
         self.assertIsNone(auth_only.sudo)
-        sudo_only = read_components({**sudo, "MC_AUTH_ENABLED": "false", "MC_API_TOKEN": "bot-token"})
+        sudo_only = read_components({**sudo, "MC_AUTH_ENABLED": "false"})
         self.assertIsNone(sudo_only.auth)
         self.assertIsNotNone(sudo_only.sudo)
         with self.assertLogs("mc_qq_tools", "ERROR"):
@@ -846,6 +856,41 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(auth_only.sudo)
         with self.assertRaisesRegex(app_config.ConfigError, "MC_SUDO_QQ_IDS"):
             read_components({"MC_AUTH_ENABLED": "false", "MC_SUDO_ENABLED": "true"})
+
+    def test_sudo_rejects_configured_auth_tokens_even_when_auth_is_unavailable(self):
+        sudo = {"MC_SUDO_QQ_IDS": '["123"]', "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_MOD_TOKEN": "mod-token"}
+        for key in ("MC_API_TOKEN", "MC_NOTIFY_TOKEN"):
+            for sudo_key in ("MC_SUDO_BOT_TOKEN", "MC_SUDO_MOD_TOKEN"):
+                configured = {**sudo, key: sudo[sudo_key]}
+                with self.subTest(key=key, sudo_key=sudo_key):
+                    with self.assertRaisesRegex(app_config.ConfigError, "/sudo 凭据必须独立配置"):
+                        read_components({**configured, "MC_AUTH_ENABLED": "false"})
+                    missing_key = "MC_NOTIFY_TOKEN" if key == "MC_API_TOKEN" else "MC_API_TOKEN"
+                    with self.assertRaisesRegex(app_config.ConfigError, missing_key):
+                        read_components(configured)
+
+    def test_bot_can_enable_both_components_without_api_only_tokens(self):
+        sudo = {"MC_SUDO_QQ_IDS": '["123"]', "MC_SUDO_BOT_TOKEN": "bot-token"}
+        components = read_components({**sudo, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN}, for_api=False)
+        self.assertIsNotNone(components.auth)
+        self.assertIsNotNone(components.sudo)
+        with self.assertRaisesRegex(app_config.ConfigError, "MC_NOTIFY_TOKEN"):
+            read_components({}, for_api=False)
+        with self.assertRaisesRegex(app_config.ConfigError, "MC_SUDO_MOD_TOKEN"):
+            read_components({**sudo, "MC_AUTH_ENABLED": "false"})
+
+    def test_sudo_rejects_configured_banlist_token_even_when_auth_is_disabled(self):
+        for key in ("MC_SUDO_BOT_TOKEN", "MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN"):
+            config = {
+                "MC_AUTH_ENABLED": "false", "MC_SUDO_QQ_IDS": '["123"]', "MC_BANLIST_TOKEN": BANLIST_TOKEN,
+                "MC_SUDO_BOT_TOKEN": "bot-token", key: BANLIST_TOKEN,
+            }
+            if key == "MC_SUDO_BOT_TOKEN":
+                config["MC_SUDO_MOD_TOKEN"] = "mod-token"
+            for for_api in (True, False):
+                with self.subTest(key=key, for_api=for_api):
+                    with self.assertRaisesRegex(app_config.ConfigError, "/sudo 凭据必须独立配置"):
+                        read_components(config, for_api=for_api)
 
     def test_notify_url_override_and_direct_request(self):
         url = "http://127.0.0.1:19002/custom/notify"
@@ -906,8 +951,9 @@ class ConfigTests(unittest.TestCase):
             shutil.copyfile(BOT_DIR / rel, project / rel)
         database.init_database(project / "data" / "auth.db")
         onebot_token = "76543210123456"
+        shared_env = self.env_file.read_text(encoding="utf-8").replace(f"MC_API_TOKEN={API_TOKEN}\n", "", 1)
         (project / ".env").write_text(
-            self.env_file.read_text(encoding="utf-8")
+            shared_env
             + 'DRIVER=~websockets\nLOG_LEVEL=TRACE\nONEBOT_WS_URLS=["ws://127.0.0.1:13001/"]\n'
               'MC_SUDO_BOT_TOKEN=bot-token\nMC_SUDO_MOD_TOKEN=mod-token\nMC_SUDO_QQ_IDS=["123"]\n'
               'MC_SUDO_TEXT_MAX_CHARS=invalid\n',
@@ -924,7 +970,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 before = Path.cwd()
+api_token = os.environ.pop("MC_API_TOKEN")
 import bot
+os.environ["MC_API_TOKEN"] = api_token
 import mc_api
 import message_config
 import nonebot
@@ -953,7 +1001,7 @@ assert mc_api.app.state.auth.banlist_token is None
                 "MC_SUDO_TEXT_MAX_CHARS",
             }
         }
-        env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, PYTHONUTF8="1")
+        env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, MC_API_TOKEN=API_TOKEN, PYTHONUTF8="1")
         result = subprocess.run(
             [sys.executable, "-B", "-c", code, str(project)],
             cwd=decoy, env=env, capture_output=True, text=True, encoding="utf-8", timeout=10,
@@ -975,12 +1023,13 @@ assert mc_api.app.state.auth.banlist_token is None
             shutil.copyfile(BOT_DIR / rel, project / rel)
         (project / ".env").write_text(
             'DRIVER=~websockets\nTARGET_GROUP_ID=12345\nMC_AUTH_ENABLED=false\nMC_SUDO_ENABLED=true\n'
-            'MC_SUDO_QQ_IDS=["123"]\nMC_SUDO_BOT_TOKEN=bot-token\nMC_SUDO_MOD_TOKEN=mod-token\n',
+            'MC_SUDO_QQ_IDS=["123"]\nMC_SUDO_BOT_TOKEN=bot-token\n',
             encoding="utf-8",
         )
         code = """
 import asyncio
 import json
+import os
 import socket
 import sys
 from contextlib import closing
@@ -995,6 +1044,7 @@ from websockets.asyncio.client import connect
 
 sys.path.insert(0, sys.argv[1])
 import bot
+os.environ["MC_SUDO_MOD_TOKEN"] = "mod-token"
 import mc_api
 import runtime_status
 from plugins import qq_sudo, status_commands

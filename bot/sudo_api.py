@@ -122,6 +122,7 @@ def sudo_router(
     verify_bearer: Callable[[list[str] | None, bytes], bool],
 ) -> SudoRouter:
     router = SudoRouter()
+    mod_token = settings.mod_token.encode("ascii") if settings is not None and settings.mod_token is not None else None
     plugin: WebSocket | None = None
     pending: PendingCommand | None = None
     followups: dict[str, Followup] = {}
@@ -229,8 +230,8 @@ def sudo_router(
     async def results(websocket: WebSocket):
         nonlocal plugin
         if (
-            settings is None or plugin is not None
-            or not verify_bearer(websocket.headers.getlist("authorization"), settings.mod_token.encode("ascii"))
+            mod_token is None or plugin is not None
+            or not verify_bearer(websocket.headers.getlist("authorization"), mod_token)
         ):
             await websocket.close(code=1008)
             return

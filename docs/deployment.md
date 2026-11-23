@@ -36,6 +36,8 @@ cp -n bot/.env.example bot/.env
 
 Bot 和 FastAPI 使用同一组组件开关，修改后重启两个进程。未设置 `MC_AUTH_ENABLED` 时，默认启用授权。未设置 `MC_SUDO_ENABLED` 时，沿用 `MC_SUDO_QQ_IDS` 的启用方式。显式设置为 `false` 会关闭对应的命令和 API 路由。两项同时启用时，凭据配置错误会停用出错的组件，另一项仍可启动。
 
+按进程配置授权凭据时，`MC_API_TOKEN` 可只在 FastAPI 服务环境中设置。`MC_NOTIFY_TOKEN` 由 Bot 发送，由 FastAPI 校验，两边须使用相同的值。停用授权时，已配置的这两个 Token 仍须与 Sudo 凭据不同。
+
 只部署 MCQQSudo 时，在现有 `bot/.env` 中设置 `MC_AUTH_ENABLED=false` 和 `MC_SUDO_ENABLED=true`，填好公共配置和 [远程指令凭据](#qq群管理指令)，即可用上述启动命令启动 Bot 和 FastAPI。授权 Token 和 SQLite 仅在启用 MCQQAuth 时需要。只部署 MCQQAuth 时，可设置 `MC_SUDO_ENABLED=false`。
 
 通知默认发送到 `http://127.0.0.1:18765/internal/mc/notify`。可用 `MC_NOTIFY_URL` 覆盖为可信网络上的直连 HTTP(S) 地址。通知请求绕过环境代理并拒绝重定向。
@@ -376,7 +378,7 @@ MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。两个键同时设置时值必须一致，否则 Sudo 停用。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。两个键同时设置时值必须一致，否则 FastAPI 停用 Sudo。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
 用 JDK 17 构建 MCQQSudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
 

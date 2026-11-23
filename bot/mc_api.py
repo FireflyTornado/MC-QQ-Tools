@@ -16,14 +16,16 @@ def create_app(config: dict[str, str | None]) -> FastAPI:
     )
 
     auth = None
-    if components.auth is not None:
+    if components.auth is not None and components.auth.api_token is not None:
         from auth_api import AuthApi
 
-        auth = AuthApi(components.auth, group_id, read_banlist_token(config, components.auth))
+        auth = AuthApi(
+            components.auth.api_token, components.auth.notify_token, group_id, read_banlist_token(config, components.auth),
+        )
         app.include_router(auth.router)
     app.state.auth = auth
     sudo = None
-    if components.sudo is not None:
+    if components.sudo is not None and components.sudo.mod_token is not None:
         from sudo_api import sudo_router
 
         sudo = sudo_router(components.sudo, group_id, verify_bearer)

@@ -19,7 +19,7 @@ def init_bot() -> None:
     config = load_config()
     group_id = target_group_id(config)
     ws_urls = onebot_ws_urls(config)
-    components = check_auth_database(read_components(config))
+    components = check_auth_database(read_components(config, for_api=False))
     access_token = None
     if config.get("ONEBOT_ACCESS_TOKEN"):
         access_token = require_token(config, "ONEBOT_ACCESS_TOKEN")

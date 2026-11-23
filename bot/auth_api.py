@@ -14,7 +14,6 @@ from starlette.requests import ClientDisconnect
 import database
 from api_security import require_bearer, verify_bearer
 from banlist_sync import GenerationClaimed, UploadConflict, read_generation, store_upload
-from component_config import AuthSettings
 
 
 WS_SEND_TIMEOUT = 3
@@ -53,9 +52,9 @@ class BroadcastConnection:
 
 
 class AuthApi:
-    def __init__(self, settings: AuthSettings, target_group: str, banlist_token: bytes | None):
-        self.api_token = settings.api_token.encode("ascii")
-        self.notify_token = settings.notify_token.encode("ascii")
+    def __init__(self, api_token: str, notify_token: str, target_group: str, banlist_token: bytes | None):
+        self.api_token = api_token.encode("ascii")
+        self.notify_token = notify_token.encode("ascii")
         self.banlist_token = banlist_token
         self.target_group = target_group
         self.db_path = database.DB_PATH

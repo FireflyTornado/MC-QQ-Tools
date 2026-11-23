@@ -65,6 +65,10 @@ FOLLOWUP_REPLIES = REPLIES | {
     "ok": "已安排的任务执行完毕，服务端无输出。",
     "disconnected": "指令通道已断开，无法接收任务后续结果。",
 }
+INITIAL_STATUS_NOTICES = {
+    "error": "首轮命令执行失败或无法确认结果。",
+    "partial": REPLIES["partial"],
+}
 
 
 @dataclass(frozen=True)
@@ -209,7 +213,7 @@ async def upload_followup(bot: Bot, group_id: int, filename_id: str, output: str
 
 async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, *, followup: bool = False,
                         waiting: bool = False, terminal_notice: str | None = None,
-                        initial_failure_pending: bool = False) -> RenderedReply:
+                        pending_initial_notice: str | None = None) -> RenderedReply:
     status, output = reply.status, reply.output
     text = "".join(
         char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
@@ -255,18 +259,18 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
     if failed_with_followup:
         text += f"\n后台任务的结果会继续补发。请求编号：{request_id}"
     if followup:
-        if initial_failure_pending:
-            text = f"首轮命令执行失败或无法确认结果。\n{text}"
+        if pending_initial_notice is not None:
+            text = f"{pending_initial_notice}\n{text}"
         text = f"指令后续回执 {request_id}\n{text}"
     return RenderedReply(MessageSegment.text(text), output_in_file, output_in_message)
 
 
 async def send_followup(bot: Bot, group_id: int, request_id: str, reply: Reply, deadline: float,
-                        *, terminal_notice: str | None = None, initial_failure_pending: bool = False) -> bool:
+                        *, terminal_notice: str | None = None, pending_initial_notice: str | None = None) -> bool:
     loop = asyncio.get_running_loop()
     delay = FOLLOWUP_RETRY_DELAY
     rendered = await render_result(bot, group_id, request_id, reply, followup=True, terminal_notice=terminal_notice,
-                                   initial_failure_pending=initial_failure_pending)
+                                   pending_initial_notice=pending_initial_notice)
     assert rendered.message is not None  # Follow-up files always have a text receipt.
     # File retries have their own budget. Keep the full text delivery window after rendering.
     deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
@@ -298,7 +302,7 @@ async def confirm_followup(token: str, request_id: str, sequence: int) -> None:
 
 
 async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str, initial: Reply,
-                           *, delivered_output: bool, initial_failure_pending: bool = False) -> None:
+                           *, delivered_output: bool, pending_initial_notice: str | None = None) -> None:
     path = f"{SUDO_FOLLOWUP_PATH}/{request_id}"
     after = 0 if initial.wait_seconds is not None else None
     tracked_task = initial.status == "scheduled" or initial.wait_seconds == SUDO_FOLLOWUP_TIMEOUT
@@ -327,25 +331,25 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
                 terminal_notice = TRACKED_FOLLOWUP_TIMEOUT_NOTICE
             elif reply.status == "ok" and not has_output:
                 terminal_notice = "已安排的任务执行完毕。" if reported_output else FOLLOWUP_REPLIES["ok"]
-        if (terminal_notice is not None or initial_failure_pending or has_output or not reported_output
+        if (terminal_notice is not None or pending_initial_notice is not None or has_output or not reported_output
                 or reply.status not in {"ok", "expired"}):
             if not await send_followup(bot, group_id, request_id, reply, deadline, terminal_notice=terminal_notice,
-                                       initial_failure_pending=initial_failure_pending):
+                                       pending_initial_notice=pending_initial_notice):
                 return
             deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
             # A confirmed file failure notice also tells the group that output existed.
             reported_output |= has_output
-            initial_failure_pending = False
+            pending_initial_notice = None
         if reply.sequence is not None:
             after = reply.sequence
         if reply.final:
             if reply.sequence is not None or after is None:
                 await confirm_followup(token, request_id, reply.sequence or 1)
             return
-    if tracked_task or initial_failure_pending or not reported_output:
+    if tracked_task or pending_initial_notice is not None or not reported_output:
         await send_followup(bot, group_id, request_id, Reply("expired"), loop.time() + SUDO_TIMEOUT,
                             terminal_notice=TRACKED_FOLLOWUP_TIMEOUT_NOTICE if tracked_task else None,
-                            initial_failure_pending=initial_failure_pending)
+                            pending_initial_notice=pending_initial_notice)
 
 
 @sudo.handle()
@@ -397,16 +401,16 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
         rendered = await render_result(bot, event.group_id, request_id, reply, waiting=waiting)
         if waiting:
             delivered_output = rendered.output_in_file
-            initial_failure_pending = reply.status == "error"
+            pending_initial_notice = INITIAL_STATUS_NOTICES.get(reply.status)
             try:
                 if rendered.message is not None:
                     await sudo.send(rendered.message)
                     delivered_output |= rendered.output_in_message
-                    initial_failure_pending = False
+                    pending_initial_notice = None
             finally:
                 task = asyncio.create_task(deliver_followup(
                     bot, event.group_id, settings.bot_token, request_id, reply, delivered_output=delivered_output,
-                    initial_failure_pending=initial_failure_pending,
+                    pending_initial_notice=pending_initial_notice,
                 ))
                 followup_tasks.add(task)
                 task.add_done_callback(followup_tasks.discard)

@@ -832,32 +832,45 @@ events:
             group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n等待任务回传超时。"),
         )
 
-    async def test_sudo_includes_unsent_initial_failure_in_the_first_delivered_followup_only(self):
+    async def test_sudo_includes_unsent_initial_status_in_the_first_delivered_followup_only(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
             frozenset({str(ABSENT)}), "bot-token", "plugin-token",
         )))
         self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
         self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
-        self.reply.side_effect = RuntimeError("OneBot unavailable for initial reply")
-        self.send_group.side_effect = [RuntimeError("OneBot unavailable for the first retry"),
-                                       {"message_id": 10}, {"message_id": 11}]
-        frames = [self.sudo.Reply("ok", "后台已有输出", sequence=1, final=False),
-                  self.sudo.Reply("ok", "后台任务完成", sequence=2)]
-        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("error", wait_seconds=3600)) as submit, \
-             patch.object(self.sudo, "request_result", side_effect=frames), \
-             patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0):
-            await self.bot.handle_event(self.group_message("/sudo list", message_id=76))
-            self.reply.assert_awaited_once()
-            request_id = submit.await_args.args[1]["id"]
-            await asyncio.wait_for(asyncio.gather(*self.sudo.followup_tasks), 2)
+        scenarios = [
+            ("error", 3600, "首轮命令执行失败或无法确认结果。"),
+            ("partial", 30, "命令已返回，输出采集不完整。"),
+        ]
+        for message_id, (status, delay, notice) in enumerate(scenarios, start=76):
+            with self.subTest(status=status):
+                self.reply.reset_mock()
+                self.send_group.reset_mock()
+                self.confirm_sudo_followup.reset_mock()
+                self.reply.side_effect = RuntimeError("OneBot unavailable for initial reply")
+                self.send_group.side_effect = [RuntimeError("OneBot unavailable for the first retry"),
+                                               {"message_id": 10}, {"message_id": 11}]
+                frames = [self.sudo.Reply("ok", "后台已有输出", sequence=1, final=False),
+                          self.sudo.Reply("ok", "后台任务完成", sequence=2, final=status == "error")]
+                if status == "partial":
+                    frames.append(self.sudo.Reply("expired", sequence=3))
+                initial = self.sudo.Reply(status, wait_seconds=delay)
+                with patch.object(self.sudo, "submit", return_value=initial) as submit, \
+                     patch.object(self.sudo, "request_result", side_effect=frames), \
+                     patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0):
+                    await self.bot.handle_event(self.group_message("/sudo list", message_id=message_id))
+                    self.reply.assert_awaited_once()
+                    request_id = submit.await_args.args[1]["id"]
+                    await asyncio.wait_for(asyncio.gather(*self.sudo.followup_tasks), 2)
 
-        heading = f"指令后续回执 {request_id}\n"
-        with_initial_error = f"{heading}首轮命令执行失败或无法确认结果。\n后台已有输出"
-        self.assertEqual(
-            [call.kwargs for call in self.send_group.await_args_list],
-            [{"group_id": GROUP, "message": MessageSegment.text(text)}
-             for text in (with_initial_error, with_initial_error, f"{heading}后台任务完成")],
-        )
+                self.confirm_sudo_followup.assert_awaited_once_with("bot-token", request_id, len(frames))
+                heading = f"指令后续回执 {request_id}\n"
+                with_initial_notice = f"{heading}{notice}\n后台已有输出"
+                self.assertEqual(
+                    [call.kwargs for call in self.send_group.await_args_list],
+                    [{"group_id": GROUP, "message": MessageSegment.text(text)}
+                     for text in (with_initial_notice, with_initial_notice, f"{heading}后台任务完成")],
+                )
 
     async def test_sudo_retries_the_same_followup_before_advancing_the_cursor(self):
         request_id = "a" * 32

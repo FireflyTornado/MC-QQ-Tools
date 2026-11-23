@@ -102,15 +102,21 @@ public final class OutputCapture {
     }
 
     public static void runQueuedTask(Runnable task) {
+        callQueuedTask(() -> {
+            task.run();
+            return null;
+        });
+    }
+
+    static <T> T callQueuedTask(Supplier<T> task) {
         Frame previous = ACTIVE.get();
         if (previous == null) {
-            task.run();
-            return;
+            return task.get();
         }
         // Commands such as reload can pump the game queue while dispatch is still on the stack.
         ACTIVE.remove();
         try {
-            task.run();
+            return task.get();
         } finally {
             ACTIVE.set(previous);
         }

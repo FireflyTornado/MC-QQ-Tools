@@ -377,6 +377,22 @@ try {
 }
 ```
 
+需要返回值的线程池任务可以用 `CommandOutputContext.supplyAsync` 提交。用 `whenComplete` 或 `whenCompleteAsync` 注册完成回调可以在 Future 的完成线程或指定线程池恢复原请求。回调里登记的下一项任务继续使用同一个请求，前一项任务结束后仍能补发后续结果。
+
+```java
+var report = CommandOutputContext.supplyAsync(this::buildReport, worker);
+CommandOutputContext.whenComplete(report, (data, failure) -> {
+    if (failure != null) {
+        sender.sendMessage("生成报告失败");
+        return;
+    }
+    CommandOutputContext.whenComplete(uploadAsync(data), (link, uploadFailure) ->
+            sender.sendMessage(uploadFailure == null ? link : "上传报告失败"));
+});
+```
+
+这些接口会在任务完成、失败或取消时结束对应的等待。已有的 `CompletionStage` 也可以在当前请求中用 `track(stage)` 登记，等它结束后再关闭回传。`track` 只延长等待，阶段里的日志和广播需要通过带上下文的任务或回调采集。
+
 已登记的延后任务最多跟踪一小时。对于没有登记延后任务的请求，Mod 在发出首轮回执后继续接收原命令发送者的直接回复 30 秒。到期且始终未收到输出时，群内显示「等待期间未捕获输出」。回传状态保存在内存中，指令连接断开会结束本次回传，游戏服继续执行已安排的任务。请更新 Mod、FastAPI 和 Bot 以启用分批补发。
 
 可在 `bot/.env` 中调整输出发送方式。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。

@@ -2,7 +2,9 @@ package cn.nightbugclub.mcqqauthcapture;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -31,25 +33,30 @@ public final class ScheduledOutput {
     }
 
     public static void enqueueTask(Object task) {
-        enqueue(task, "已取消一项后台任务。");
+        registerTask(task);
     }
 
-    private static void enqueue(Object event, String cancellation) {
+    static boolean registerTask(Object task) {
+        return enqueue(task, "已取消一项后台任务。");
+    }
+
+    private static boolean enqueue(Object event, String cancellation) {
         ScheduledOutput owner = OutputCapture.scheduledOutput();
         if (owner == null) {
-            return;
+            return false;
         }
         synchronized (EVENTS) {
             if (owner.result.isDone()) {
-                return;
+                return false;
             }
             owner.scheduled = true;
             if (EVENTS.size() >= MAX_EVENTS) {
                 owner.complete = false;
-                return;
+                return false;
             }
             EVENTS.put(event, new Event(owner, cancellation));
             owner.pending++;
+            return true;
         }
     }
 
@@ -66,17 +73,36 @@ public final class ScheduledOutput {
     }
 
     public static void run(Object event, Runnable callback) {
+        runCompletion(event, callback, null);
+    }
+
+    static void runCompletion(Object event, Runnable callback, Throwable upstreamFailure) {
+        call(event, () -> {
+            callback.run();
+            return null;
+        }, upstreamFailure);
+    }
+
+    static <T> T call(Object event, Supplier<T> callback) {
+        return call(event, callback, null);
+    }
+
+    private static <T> T call(Object event, Supplier<T> callback, Throwable upstreamFailure) {
+        boolean cancelled = isCancellation(upstreamFailure);
         ScheduledOutput owner;
         synchronized (EVENTS) {
             Event registered = EVENTS.remove(event);
             owner = registered == null ? null : registered.owner();
             if (owner != null) {
-                owner.ran = true;
+                if (cancelled) {
+                    owner.output.appendFollowupLine(registered.cancellation());
+                } else {
+                    owner.ran = true;
+                }
             }
         }
         if (owner == null || owner.result.isDone()) {
-            OutputCapture.runQueuedTask(callback);
-            return;
+            return OutputCapture.callQueuedTask(callback);
         }
 
         Supplier<CompletableFuture<Boolean>> closeCapture;
@@ -84,22 +110,43 @@ public final class ScheduledOutput {
             closeCapture = OutputCapture.begin(owner.output::appendFollowupLine, owner);
         } catch (RuntimeException | LinkageError failure) {
             try {
-                OutputCapture.runQueuedTask(callback);
+                return OutputCapture.callQueuedTask(callback);
             } finally {
                 owner.finishEvent(false);
             }
-            return;
         }
         boolean succeeded = false;
         try {
-            callback.run();
+            T value = callback.get();
             succeeded = true;
+            return value;
         } finally {
-            boolean ranSuccessfully = succeeded;
+            boolean ranSuccessfully = succeeded && (upstreamFailure == null || cancelled);
             closeCapture.get().completeOnTimeout(false, 30, TimeUnit.SECONDS)
                     .whenComplete((captured, failure) ->
                             owner.finishEvent(ranSuccessfully && Boolean.TRUE.equals(captured)));
         }
+    }
+
+    // A stage may settle without ever running its callback, for example if submission was rejected.
+    static void completeTask(Object event, Throwable failure) {
+        if (isCancellation(failure)) {
+            cancel(event);
+            return;
+        }
+        synchronized (EVENTS) {
+            Event registered = EVENTS.remove(event);
+            if (registered != null) {
+                ScheduledOutput owner = registered.owner();
+                owner.ran |= failure == null;
+                owner.finishEvent(failure == null);
+            }
+        }
+    }
+
+    private static boolean isCancellation(Throwable failure) {
+        return failure instanceof CancellationException
+                || (failure instanceof CompletionException && failure.getCause() instanceof CancellationException);
     }
 
     private void finishEvent(boolean captured) {

@@ -94,19 +94,19 @@ final class SudoService {
 
     int reload(Server server, CommandSender sender) {
         if (!canReload(server, sender) || !server.isPrimaryThread()) {
-            sender.sendMessage("[MCQQAuth Sudo] 此指令仅限 Minecraft 服务端控制台使用。");
+            sender.sendMessage("[MCQQSudo] 此指令仅限 Minecraft 服务端控制台使用。");
             return 0;
         }
         if (commands == null) {
-            sender.sendMessage("[MCQQAuth Sudo] /sudo 未启用，请检查 Mod 配置。");
+            sender.sendMessage("[MCQQSudo] /sudo 未启用，请检查 Mod 配置。");
             return 0;
         }
         try {
             int count = commands.reloadAllowlist(directory.resolve(SudoCommands.ALLOWLIST_FILE));
-            sender.sendMessage("[MCQQAuth Sudo] 允许清单已重载，共 " + count + " 条规则。");
+            sender.sendMessage("[MCQQSudo] 允许清单已重载，共 " + count + " 条规则。");
             return 1;
         } catch (IOException | SecurityException | IllegalArgumentException e) {
-            sender.sendMessage("[MCQQAuth Sudo] " + reloadFailure(e));
+            sender.sendMessage("[MCQQSudo] " + reloadFailure(e));
             return 0;
         }
     }

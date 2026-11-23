@@ -14,9 +14,10 @@ import org.bukkit.command.CommandSender;
 
 import java.util.logging.Logger;
 
-@Mod("mcqqauth_output_capture")
+@Mod(SudoMod.MOD_ID)
 public final class SudoMod {
-    private static final Logger LOG = Logger.getLogger("MCQQAuthSudo");
+    static final String MOD_ID = "mcqqsudo";
+    private static final Logger LOG = Logger.getLogger("MCQQSudo");
     private final SudoService service = new SudoService(FMLPaths.CONFIGDIR.get().resolve("mcqqauth-sudo"), LOG);
 
     public SudoMod() {
@@ -46,7 +47,7 @@ public final class SudoMod {
 
     @SuppressWarnings("unchecked")
     private void registerReload(CommandDispatcher<?> dispatcher) {
-        ((CommandDispatcher<Object>) dispatcher).register(LiteralArgumentBuilder.<Object>literal("mcqqsudo")
+        ((CommandDispatcher<Object>) dispatcher).register(LiteralArgumentBuilder.<Object>literal(MOD_ID)
                 .requires(source -> service.canReload(Bukkit.getServer(), sender(source)))
                 .then(LiteralArgumentBuilder.<Object>literal("reload").executes(context -> {
                     CommandSender sender = sender(context.getSource());

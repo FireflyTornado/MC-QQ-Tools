@@ -68,8 +68,8 @@ jobs:
       - name: Verify sudo mod JAR entries
         shell: bash
         run: |
-          entries="$(jar tf minecraft-sudo/target/mcqqauth-sudo-*.jar)"
-          for entry in META-INF/mods.toml mcqqauth-output-capture.mixins.json config.yml sudo-allowlist.txt cn/nightbugclub/mcqqauthcapture/SudoMod.class; do
+          entries="$(jar tf minecraft-sudo/target/MCQQSudo-*.jar)"
+          for entry in META-INF/mods.toml mcqqsudo.mixins.json config.yml sudo-allowlist.txt cn/nightbugclub/mcqqauthcapture/SudoMod.class; do
             if ! grep -Fxq -- "$entry" <<< "$entries"; then
               printf 'Missing mod JAR entry: %s\n' "$entry" >&2
               exit 1

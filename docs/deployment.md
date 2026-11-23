@@ -19,6 +19,8 @@ Windows 可以用 `py -3.12 -m venv .venv` 创建环境，再通过 `.venv\Scrip
 | --- | --- | --- | --- |
 | NoneBot 与 FastAPI | `bot/.env.example` | `bot/.env` | `bot/` |
 | NapCat Compose | `napcat/.env.example` | `napcat/.env` | `napcat/` |
+| MCQQAuth 授权插件 | `minecraft-plugin/src/main/resources/config.yml` | `plugins/MCQQAuth/config.yml` | Minecraft 服务端根目录 |
+| MCQQSudo 模组 | `minecraft-sudo/src/main/resources/config.yml` 和同目录的 `sudo-allowlist.txt` | `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt` | Minecraft 服务端根目录 |
 
 在仓库根目录复制 Bot 配置模板，已有 `.env` 时沿用当前文件。
 
@@ -26,7 +28,7 @@ Windows 可以用 `py -3.12 -m venv .venv` 创建环境，再通过 `.venv\Scrip
 cp -n bot/.env.example bot/.env
 ```
 
-替换占位值。将 `TARGET_GROUP_ID=0` 改为目标群的数字编号，保留 `ONEBOT_WS_URLS` 的 JSON 数组格式。OneBot Token 要与 NapCat 的实际配置一致，API 与 Notify 必须使用不同的 Token。进程环境变量优先于 `bot/.env`，显式空值也会覆盖文件值。Bot 和 API 在启动时读取配置，通知客户端在发送时读取。更换凭据时应同步更新调用端并重启相应服务。
+`bot/.env.example` 分为公共配置、授权与通知、远程指令三段。按需填写已启用配置的占位值。将 `TARGET_GROUP_ID=0` 改为目标群的数字编号，保留 `ONEBOT_WS_URLS` 的 JSON 数组格式。OneBot Token 要与 NapCat 的实际配置一致。授权插件的 `api.token` 对应 `MC_API_TOKEN`，`MC_NOTIFY_TOKEN` 使用独立的值。进程环境变量优先于 `bot/.env`，显式空值也会覆盖文件值。Bot 和 API 在启动时读取配置，通知客户端在发送时读取。更换凭据时应同步更新调用端并重启相应服务。
 
 在仓库根目录运行 `python bot/migrate.py` 初始化或升级默认数据库 `bot/data/auth.db`。`python bot/migrate.py --db <路径>` 可为迁移命令指定其他目标。升级已有库前先做一致性备份，迁移报错时保留原库并检查原因。
 
@@ -318,7 +320,7 @@ FastAPI 按上面的命令监听回环地址。异地游戏主机接入时，只
 
 请勿通过 `/sudo` 发送含密码、令牌或其他凭据的指令。指令参数会出现在群消息中，FastAPI 也会记录完整指令。需要输入凭据时，请直接使用 Minecraft 服务端控制台。
 
-默认关闭。启用时，在 Bot 和 FastAPI 共用的 `bot/.env` 中设置以下变量。群号取现有的 `TARGET_GROUP_ID`，账号名单与 `SUPERUSERS` 独立。
+默认关闭。启用时，在 Bot 和 FastAPI 共用的 `bot/.env` 的远程指令段设置以下变量。群号取公共配置中的 `TARGET_GROUP_ID`，账号名单与 `SUPERUSERS` 独立。
 
 ```dotenv
 MC_SUDO_QQ_IDS=["123456789"]
@@ -326,15 +328,15 @@ MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_PLUGIN_TOKEN=REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知和 OneBot 的凭据区分。Bot 通过固定的回环地址 `127.0.0.1:18765` 提交指令和读取后续回执。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知和 OneBot 的凭据区分。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_PLUGIN_TOKEN`，该环境变量沿用原配置键名。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
-用 JDK 17 构建 MCQQAuth Sudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
+用 JDK 17 构建 MCQQSudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
 
 ```bash
 mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
 ```
 
-产物是 `minecraft-sudo/target/mcqqauth-sudo-0.3.0.jar`，包含指令通道和输出收集器。MCQQAuth 授权插件可按需安装。首次启动会创建 `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。填入与 FastAPI 一致的 `MC_SUDO_PLUGIN_TOKEN` 并设置 WSS 地址。
+产物是 `minecraft-sudo/target/MCQQSudo-0.3.0.jar`，包含指令通道和输出收集器。Forge 加载 ID 为 `mcqqsudo`。MCQQAuth 授权插件可按需安装。首次启动会创建 `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。填入与 FastAPI 一致的 `MC_SUDO_PLUGIN_TOKEN` 并设置 WSS 地址，修改后重启游戏服生效。
 
 ```yaml
 sudo:
@@ -343,11 +345,13 @@ sudo:
   token: "REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN"
 ```
 
-从插件版迁移时，先停游戏服。将旧插件配置的 `sudo` 段和值、仍需使用的 `sync.reconnect-min-ms` 和 `sync.reconnect-max-ms`、以及 `sudo-allowlist.txt` 复制到新的 Mod 配置目录。用新 Mod 替换旧的 `mcqqauth-output-capture-0.1.0.jar`。将授权插件升级到 0.5.3，或在继续使用旧插件时设其 `sudo.enabled: false`。FastAPI 同时接收一个游戏端 `/sudo` 连接。使用已有扩展回显协议的 Bot 和 FastAPI 可直接接入新 Mod。
+从早期独立模组升级时，停服后用 `MCQQSudo-0.3.0.jar` 替换旧的 `mcqqauth-sudo` JAR。已有 `config/mcqqauth-sudo/` 配置和允许清单可直接沿用。
+
+从插件版迁移时，先停游戏服。将旧插件配置的 `sudo` 段和值、仍需使用的 `sync.reconnect-min-ms` 和 `sync.reconnect-max-ms`、以及 `sudo-allowlist.txt` 复制到模组配置目录。用新模组替换旧的 `mcqqauth-output-capture-0.1.0.jar`。将授权插件升级到 0.5.3，或在继续使用旧插件时设其 `sudo.enabled: false`。FastAPI 同时接收一个游戏端 `/sudo` 连接。使用已有扩展回显协议的 Bot 和 FastAPI 可直接接入新模组。
 
 允许清单默认留空。用 UTF-8 编辑，每行一个命令前缀，省略开头的 `/`。空行和以 `#` 开头的行会被跳过。若曾配置 `sudo.allowed-commands`，把仍需开放的条目移入新清单。
 
-保存清单后，在 Minecraft 服务端控制台执行 `mcqqsudo reload`。Mod 校验整份清单后立即替换规则，并报告加载条数。文件无法读取或格式无效时，Mod 清空生效规则并暂停群内 `/sudo`。修正文件后再次执行同一条指令即可恢复。
+保存清单后，在 Minecraft 服务端控制台执行 `mcqqsudo reload`。该指令只重载允许清单。Mod 校验整份清单后立即替换规则，并报告加载条数。文件无法读取或格式无效时，Mod 清空生效规则并暂停群内 `/sudo`。修正文件后再次执行同一条指令即可恢复。
 
 前缀按大小写和空格边界匹配。写入 `whitelist` 即开放服务端当前注册为 `whitelist` 的命令及其所有子命令。只写 `whitelist add` 则允许 `/sudo whitelist add Steve`，并拒绝 `whitelist remove Steve` 和 `whitelist addall Steve`。匹配后，Mod 把命令原样交给服务端，短名按 Mohist 当前的命令注册表解析，参数由服务端校验。`commands.yml` 配置的服务端命令别名会被拒绝。
 
@@ -395,13 +399,13 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 
 已登记的延后任务最多跟踪一小时。任务静默完成或回传超时时，群内仍会收到终态。对于没有登记延后任务的请求，Mod 在发出首轮回执后继续接收原命令发送者的直接回复 30 秒。执行阶段抛出异常时，首轮仍报告失败，并保留这段接收时间。到期且始终未收到输出时，群内显示「等待期间未捕获输出」。首轮采集不完整时，群内会提示采集状态并继续等待迟到输出。Bot 在 OneBot 确认发送后推进补发序号，发送失败时在投递期限内重试。API 在 Bot 投递期间保留回执，收到终帧确认后清理正文。首轮的执行失败或采集不完整提示发送异常时，下一条成功投递的补发会附带该提示。回传状态保存在内存中，指令连接断开会结束本次回传，游戏服继续执行已安排的任务。请更新 Mod、FastAPI 和 Bot 以启用分批补发。
 
-可在 `bot/.env` 中调整输出发送方式。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
+可在 `bot/.env` 的远程指令段调整输出发送方式。阈值只按输出正文判断，请求编号和状态提示不计入。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
 
 | 配置 | 默认 | 判断方式 |
 | --- | --- | --- |
 | `MC_SUDO_FILE_LINE_THRESHOLD` | `10` | 输出行数，末尾单个换行不会新增一行。最小值为 1。 |
 | `MC_SUDO_FILE_LINE_CHAR_THRESHOLD` | `0` | 任意一行的字符数，0 表示关闭该判断。 |
-| `MC_SUDO_TEXT_MAX_CHARS` | `1500` | 单条文本的总字符数，包含换行。最小值为 1。 |
+| `MC_SUDO_TEXT_MAX_CHARS` | `1500` | 单条输出正文的总字符数，包含换行。最小值为 1。 |
 
 TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod，之后修改这三个阈值只需重启 Bot。
 

@@ -28,7 +28,7 @@ import database
 import notify_client
 import runtime_status
 from component_config import read_components
-from sudo_config import SUDO_SUBMIT_PATH
+from sudo_config import SUDO_SUBMIT_PATH, SUDO_WS_PATH
 
 API_TOKEN = "test-only.api~token+="
 NOTIFY_TOKEN = "test-only.notify-token"
@@ -145,6 +145,51 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(path, [bearer(API_TOKEN)], "POST", payload))[0], 401)
         status, _, reply = await self.request(path, [bearer("bot-token")], "POST", payload)
         self.assertEqual((status, reply), (200, {"status": "unavailable"}))
+
+    async def test_disconnecting_either_websocket_leaves_the_other_component_working(self):
+        self.app = sys.modules["mc_api"].create_app({
+            **ENV, "MC_SUDO_ENABLED": "true", "MC_SUDO_QQ_IDS": '["123"]',
+            "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_PLUGIN_TOKEN": "mod-token",
+        })
+        self.app.state.auth.db_path = self.api.db_path
+
+        async def check_channels(auth_connections, sudo_connected):
+            status, _, health = await self.request("/internal/health")
+            self.assertEqual((status, health), (200, {
+                "status": "ok", "minecraft_connections": auth_connections, "sudo_connected": sudo_connected,
+            }))
+
+        await check_channels(0, False)
+        async with self.connected_socket(SUDO_WS_PATH, "mod-token") as (incoming, outgoing, _):
+            async with self.websocket():
+                await check_channels(1, True)
+            await check_channels(0, True)
+            payload = json.dumps({
+                "id": "a" * 32, "group_id": GROUP_ID, "qq_id": "123", "command": "list",
+                "deadline_ms": time.time_ns() // 1_000_000 + 10_000,
+            }).encode()
+            submit = asyncio.create_task(self.request(SUDO_SUBMIT_PATH, [bearer("bot-token")], "POST", payload))
+            try:
+                command = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.assertEqual(command["command"], "list")
+                incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
+                    "id": command["id"], "status": "ok", "output": "Players: 0",
+                })})
+                status, _, reply = await asyncio.wait_for(submit, 2)
+                self.assertEqual((status, reply), (200, {"status": "ok", "output": "Players: 0"}))
+            finally:
+                if not submit.done():
+                    submit.cancel()
+                    await asyncio.gather(submit, return_exceptions=True)
+
+        async with self.websocket() as (outgoing, _):
+            async with self.connected_socket(SUDO_WS_PATH, "mod-token"):
+                await check_channels(1, True)
+            await check_channels(1, False)
+            status, _, reply = await self.request(NOTIFY_PATH, [bearer(NOTIFY_TOKEN)], "POST")
+            self.assertEqual((status, reply["delivered"]), (200, 1))
+            self.assertEqual(json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"]),
+                             {"type": "auth_updated", "version": VERSION})
 
     async def test_banlist_upload_freezes_broadcasts_and_only_restores_after_membership_check(self):
         status, headers, cursor = await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)])
@@ -467,7 +512,9 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_websocket_connects_and_broadcasts_existing_messages(self):
         status, _, health = await self.request("/internal/health")
-        self.assertEqual((status, health), (200, {"status": "ok", "minecraft_connections": 0}))
+        self.assertEqual((status, health), (200, {
+            "status": "ok", "minecraft_connections": 0, "sudo_connected": None,
+        }))
         incoming = asyncio.Queue()
         outgoing = asyncio.Queue()
         await incoming.put({"type": "websocket.connect"})
@@ -484,7 +531,9 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 "type": "connected", "message": "Minecraft authentication connected",
             })
             status, _, health = await self.request("/internal/health")
-            self.assertEqual((status, health), (200, {"status": "ok", "minecraft_connections": 1}))
+            self.assertEqual((status, health), (200, {
+                "status": "ok", "minecraft_connections": 1, "sudo_connected": None,
+            }))
             status, _, notify = await self.request(NOTIFY_PATH, [bearer(NOTIFY_TOKEN)], "POST")
             self.assertEqual(status, 200)
             self.assertEqual(notify, {"success": True, "version": VERSION, "delivered": 1})
@@ -498,6 +547,12 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
 
     @asynccontextmanager
     async def websocket(self, intercept=None):
+        async with self.connected_socket(WS_PATH, API_TOKEN, intercept) as (_, outgoing, task):
+            self.assertEqual(json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])["type"], "connected")
+            yield outgoing, task
+
+    @asynccontextmanager
+    async def connected_socket(self, path, token, intercept=None):
         incoming = asyncio.Queue()
         outgoing = asyncio.Queue()
         incoming.put_nowait({"type": "websocket.connect"})
@@ -508,12 +563,11 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             outgoing.put_nowait(message)
 
         task = asyncio.create_task(self.app(
-            scope("websocket", WS_PATH, [bearer(API_TOKEN)]), incoming.get, send,
+            scope("websocket", path, [bearer(token)]), incoming.get, send,
         ))
         try:
             self.assertEqual((await asyncio.wait_for(outgoing.get(), 2))["type"], "websocket.accept")
-            self.assertEqual(json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])["type"], "connected")
-            yield outgoing, task
+            yield incoming, outgoing, task
         finally:
             incoming.put_nowait({"type": "websocket.disconnect", "code": 1000})
             await asyncio.wait_for(task, 2)
@@ -870,7 +924,8 @@ assert mc_api.app.state.auth.banlist_token is None
         (project / "plugins").mkdir(parents=True)
         for rel in (
             "api_security.py", "app_config.py", "bot.py", "component_config.py", "mc_api.py", "qq_group.py",
-            "sudo_api.py", "sudo_config.py", "plugins/qq_sudo.py",
+            "message_config.py", "qq_avatar.py", "runtime_status.py", "status_image.py", "status_card.svg",
+            "sudo_api.py", "sudo_config.py", "plugins/qq_sudo.py", "plugins/status_commands.py",
         ):
             shutil.copyfile(BOT_DIR / rel, project / rel)
         (project / ".env").write_text(
@@ -896,39 +951,59 @@ from websockets.asyncio.client import connect
 sys.path.insert(0, sys.argv[1])
 import bot
 import mc_api
-from plugins import qq_sudo
+import runtime_status
+from plugins import qq_sudo, status_commands
 from sudo_config import SUDO_WS_PATH
 
-assert {plugin.module_name for plugin in nonebot.get_loaded_plugins()} == {"plugins.qq_sudo"}
-assert {"auth_api", "database", "banlist_sync", "runtime_status"}.isdisjoint(sys.modules)
+assert {plugin.module_name for plugin in nonebot.get_loaded_plugins()} == {
+    "plugins.qq_sudo", "plugins.status_commands",
+}
+assert {"auth_api", "database", "banlist_sync"}.isdisjoint(sys.modules)
 
 def check_routes(port):
     with closing(HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
         conn.request("GET", "/internal/health")
         response = conn.getresponse()
         assert response.status == 200
-        assert json.load(response) == {"status": "ok", "minecraft_connections": 0}
+        assert json.load(response) == {"status": "ok", "minecraft_connections": 0, "sudo_connected": False}
         conn.request("GET", "/internal/mc/snapshot")
         assert conn.getresponse().status == 404
 
 async def exercise(port):
     await asyncio.to_thread(check_routes, port)
     qq_bot = Bot(nonebot.get_adapter(Adapter), "201")
-    text = "/sudo list"
-    event = GroupMessageEvent.model_validate({
-        "time": 1, "self_id": 201, "post_type": "message", "message_type": "group",
-        "sub_type": "normal", "message_id": 1, "group_id": 12345, "user_id": 123,
-        "message": Message(text), "original_message": Message(text), "raw_message": text,
-        "font": 0, "sender": {},
-    })
+
+    def event(text, message_id):
+        return GroupMessageEvent.model_validate({
+            "time": 1, "self_id": 201, "post_type": "message", "message_type": "group",
+            "sub_type": "normal", "message_id": message_id, "group_id": 12345, "user_id": 123,
+            "message": Message(text), "original_message": Message(text), "raw_message": text,
+            "font": 0, "sender": {},
+        })
+
     with (
         patch.object(qq_sudo, "API_PORT", port),
+        patch.object(runtime_status, "API_PORT", port),
+        patch.object(status_commands, "get_avatar", return_value=None),
+        patch.object(runtime_status, "_binding_status") as binding_probe,
         patch.object(qq_bot, "send", new_callable=AsyncMock) as initial,
         patch.object(qq_bot, "send_group_msg", new_callable=AsyncMock) as delayed,
     ):
+        await qq_bot.handle_event(event("/help", 1))
+        help_text = initial.call_args.kwargs["message"].extract_plain_text()
+        assert all(command in help_text for command in ("/sudo", "/ping", "/info"))
+        assert "/bind " not in help_text and "/reconcile" not in help_text
+        initial.reset_mock()
+        await qq_bot.handle_event(event("/ping", 2))
+        assert "HTTP 200" in initial.call_args.kwargs["message"].extract_plain_text()
+        initial.reset_mock()
+        await qq_bot.handle_event(event("/info", 3))
+        assert initial.call_args.kwargs["message"].type == "image"
+        binding_probe.assert_not_called()
+        initial.reset_mock()
         async with connect(f"ws://127.0.0.1:{port}{SUDO_WS_PATH}",
                            additional_headers={"Authorization": "Bearer mod-token"}, proxy=None) as mod:
-            command = asyncio.create_task(qq_bot.handle_event(event))
+            command = asyncio.create_task(qq_bot.handle_event(event("/sudo list", 4)))
             request = json.loads(await asyncio.wait_for(mod.recv(), 2))
             assert request["command"] == "list" and request["stream_followup"] is True
             request_id = request["id"]
@@ -962,15 +1037,17 @@ async def main():
             await asyncio.wait_for(task, 5)
 
 asyncio.run(main())
+assert {"auth_api", "database", "banlist_sync"}.isdisjoint(sys.modules)
 assert not (Path(sys.argv[1]) / "data").exists()
 """
         env = {
             key: value for key, value in os.environ.items()
             if not key.upper().startswith(("MC_", "ONEBOT_"))
-            and key.upper() not in {"TARGET_GROUP_ID", "DRIVER", "LOG_LEVEL", "ENVIRONMENT"}
+            and key.upper() not in {"TARGET_GROUP_ID", "DRIVER", "LOG_LEVEL", "ENVIRONMENT", "SUPERUSERS"}
         }
         result = subprocess.run(
             [sys.executable, "-B", "-c", code, str(project)],
-            cwd=self.root, env={**env, "PYTHONUTF8": "1"}, capture_output=True, text=True, encoding="utf-8", timeout=20,
+            cwd=self.root, env={**env, "PYTHONUTF8": "1", "SUPERUSERS": '["123"]'}, capture_output=True,
+            text=True, encoding="utf-8", timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)

@@ -89,13 +89,20 @@ DEFAULTS = MappingProxyType({
         "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID\n"
         "/我的绑定 或 /binding · 查询自己的绑定\n"
         "/解绑 或 /unbind · 撤销自己的绑定\n"
-        "/认证测试 或 /ping · 检查授权 API\n"
+        "/认证测试 或 /ping · 检查 API\n"
         "/帮助 或 /help · 显示本帮助\n"
         "超级用户专用\n"
         "/信息 或 /info · 查看状态图片\n"
         "/授权对账 或 /reconcile · 核对群成员与授权\n"
         "/db · 手动添加、删除或查询绑定"
     ),
+    "commands.help.shared": (
+        "指令帮助\n"
+        "/认证测试 或 /ping · 检查 API\n"
+        "/帮助 或 /help · 显示本帮助\n"
+        "/信息 或 /info · 查看状态图片（超级用户专用）"
+    ),
+    "commands.help.sudo": "/sudo <Minecraft 指令> · 执行并回显（指定 QQ 号专用）",
     "commands.info.busy": "状态图正在生成，请稍后重试。",
     "commands.info.error": "状态图暂不可用，请稍后重试。",
     "info.title": "MC-QQ-Auth",

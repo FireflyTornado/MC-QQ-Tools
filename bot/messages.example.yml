@@ -132,17 +132,25 @@ commands:
     not_bound: "未找到绑定。"
     error: "绑定数据库操作失败，请稍后重试。"
   help:
+    # 授权启用时的帮助正文。每种文案都支持 {group_id} 和 {bot_qq}。
     message: |-
       [MC-QQ-Auth] 指令帮助
       /绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID
       /我的绑定 或 /binding · 查询自己的绑定
       /解绑 或 /unbind · 撤销自己的绑定
-      /认证测试 或 /ping · 检查授权 API
+      /认证测试 或 /ping · 检查 API
       /帮助 或 /help · 显示本帮助
       超级用户专用
       /信息 或 /info · 查看状态图片
       /授权对账 或 /reconcile · 核对群成员与授权
       /db · 手动添加、删除或查询绑定
+    # 授权关闭时使用共用帮助。启用 /sudo 时追加 sudo 文案。
+    shared: |-
+      指令帮助
+      /认证测试 或 /ping · 检查 API
+      /帮助 或 /help · 显示本帮助
+      /信息 或 /info · 查看状态图片（超级用户专用）
+    sudo: "/sudo <Minecraft 指令> · 执行并回显（指定 QQ 号专用）"
   info:
     busy: "状态图正在生成，请稍后重试。"
     error: "状态图暂不可用，请稍后重试。"

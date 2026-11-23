@@ -45,8 +45,10 @@ def init_bot() -> None:
         finally:
             nonebot.logger.enable("nonebot")
 
-        if components.auth is not None:
-            for name in ("qq_events", "qq_bindings", "qq_db", "status_commands"):
+        auth_enabled = components.auth is not None
+        sudo_enabled = False
+        if auth_enabled:
+            for name in ("qq_events", "qq_bindings", "qq_db"):
                 nonebot.load_plugin(f"plugins.{name}")
         if components.sudo is not None:
             try:
@@ -59,6 +61,10 @@ def init_bot() -> None:
                 plugin = nonebot.load_plugin("plugins.qq_sudo")
                 if plugin is not None:
                     plugin.module.configure(components.sudo, output)
+                    sudo_enabled = True
+        status = nonebot.load_plugin("plugins.status_commands")
+        if status is not None:
+            status.module.configure(auth=auth_enabled, sudo=sudo_enabled)
 
 
 init_bot()

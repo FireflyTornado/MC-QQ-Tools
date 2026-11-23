@@ -171,20 +171,22 @@ class RuntimeStatusTests(unittest.TestCase):
         connection.request.assert_called_once_with("GET", "/internal/health")
         connection.close.assert_called_once_with()
 
-    def test_health_reads_optional_connection_count_without_changing_http_result(self):
+    def test_health_reads_both_connections_without_changing_http_result(self):
         for body, expected in (
-            (b'{"status":"ok","minecraft_connections":1}', 1),
-            (b'{"status":"ok","minecraft_connections":0}', 0),
-            (b'{"status":"ok"}', None),
-            (b'{"minecraft_connections":true}', None),
-            (b'broken', None),
+            (b'{"status":"ok","minecraft_connections":1,"sudo_connected":false}', (1, False)),
+            (b'{"status":"ok","minecraft_connections":0,"sudo_connected":true}', (0, True)),
+            (b'{"status":"ok","minecraft_connections":1}', (1, None)),
+            (b'{"status":"ok"}', (None, None)),
+            (b'{"minecraft_connections":true,"sudo_connected":1}', (None, None)),
+            (b'broken', (None, None)),
         ):
             with self.subTest(body=body), patch.object(runtime_status, "HTTPConnection") as http:
                 response = http.return_value.getresponse.return_value.__enter__.return_value
                 response.status = 200
                 response.read.return_value = body
                 result = runtime_status.check_fastapi(include_connections=True)
-                self.assertEqual((result.status_code, result.minecraft_connections), (200, expected))
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual((result.minecraft_connections, result.sudo_connected), expected)
 
     def test_minecraft_probe_reports_unconfigured_reachable_and_unresponsive(self):
         address = "play.example.org:25565"
@@ -324,6 +326,31 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(nodes["wss-link"][0].get("stroke-dasharray"), "5 4")
         self.assertEqual(nodes["minecraft-node"].get("stroke"), status_image.MINT)
         self.assertEqual([element.tag.rsplit("}", 1)[-1] for element in nodes["wss-link"]], ["path", "text"])
+
+    def test_status_card_hides_disabled_components_and_keeps_channel_states_independent(self):
+        for auth_enabled, sudo_enabled, auth_connections, sudo_connected in (
+            (True, False, 1, None),
+            (False, True, 0, True),
+            (True, True, 1, False),
+            (True, True, 0, True),
+        ):
+            with self.subTest(auth=auth_enabled, sudo=sudo_enabled, connections=(auth_connections, sudo_connected)):
+                status = runtime_status.RuntimeStatus(
+                    datetime.now(UTC), auth_enabled=auth_enabled, sudo_enabled=sudo_enabled,
+                    api=runtime_status.HealthResult(200, 10, minecraft_connections=auth_connections,
+                                                    sudo_connected=sudo_connected),
+                )
+                nodes = self.rendered_svg(status)
+                for node in ("bindings", "bans", "sqlite-link", "wss-link"):
+                    self.assertEqual(nodes[node].get("display"), "inline" if auth_enabled else "none")
+                self.assertEqual(nodes["sudo-wss-link"].get("display"), "inline" if sudo_enabled else "none")
+                if auth_enabled:
+                    self.assertEqual(nodes["wss-link"].get("stroke"), status_image.MINT if auth_connections else status_image.RED)
+                if sudo_enabled:
+                    self.assertEqual(nodes["sudo-wss-link"].get("stroke"),
+                                     status_image.MINT if sudo_connected else status_image.RED)
+                if auth_enabled and sudo_enabled:
+                    self.assertNotEqual(nodes["wss-link"][0].get("d"), nodes["sudo-wss-link"][0].get("d"))
 
     def test_missing_cjk_font_warns_and_renders_fallbacks(self):
         find_font = status_image._find_font

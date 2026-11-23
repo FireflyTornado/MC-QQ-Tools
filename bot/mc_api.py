@@ -22,14 +22,20 @@ def create_app(config: dict[str, str | None]) -> FastAPI:
         auth = AuthApi(components.auth, group_id, read_banlist_token(config, components.auth, components.sudo))
         app.include_router(auth.router)
     app.state.auth = auth
+    sudo = None
     if components.sudo is not None:
         from sudo_api import sudo_router
 
-        app.include_router(sudo_router(components.sudo, group_id, verify_bearer))
+        sudo = sudo_router(components.sudo, group_id, verify_bearer)
+        app.include_router(sudo)
 
     @app.get("/internal/health")
     async def health():
-        return {"status": "ok", "minecraft_connections": len(auth.connections) if auth is not None else 0}
+        return {
+            "status": "ok",
+            "minecraft_connections": len(auth.connections) if auth is not None else 0,
+            "sudo_connected": sudo.connected if sudo is not None else None,
+        }
 
     return app
 

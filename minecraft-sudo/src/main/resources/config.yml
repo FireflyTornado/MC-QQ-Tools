@@ -5,7 +5,7 @@ sudo:
   enabled: false
   # FastAPI 的 WSS 地址，路径为 /internal/mc/sudo/ws。
   websocket-url: ""
-  # 与 Bot 和 FastAPI 共用配置中的 MC_SUDO_PLUGIN_TOKEN 一致。
+  # 与 Bot 和 FastAPI 共用配置中的 MC_SUDO_MOD_TOKEN 一致。
   token: ""
 
 # 指令通道断线后的重连间隔，单位为毫秒。

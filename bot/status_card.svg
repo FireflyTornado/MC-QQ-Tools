@@ -36,19 +36,19 @@
     <text id="timestamp" x="366" y="185" text-anchor="end" font-size="14" fill="#edf5f6">$timestamp</text>
   </g>
 
-  <g id="bindings">
+  <g id="bindings" display="$auth_display">
     <rect x="24" y="214" width="175" height="90" rx="16" fill="url(#binding-fill)" stroke="#35514f"/>
     <text id="bindings-label" x="40" y="240" font-size="19" fill="#d1e8e5">$bindings_label</text>
     <text id="bindings-count" x="183" y="290" text-anchor="end" font-size="$bindings_size" font-weight="700" fill="#7ae7c2">$bindings_count</text>
   </g>
-  <g id="bans">
+  <g id="bans" display="$auth_display">
     <rect x="211" y="214" width="175" height="90" rx="16" fill="url(#ban-fill)" stroke="#673742"/>
     <text id="bans-label" x="227" y="240" font-size="19" fill="#f0d7db">$bans_label</text>
     <text id="bans-count" x="370" y="290" text-anchor="end" font-size="$bans_size" font-weight="700" fill="#ff8c91">$bans_count</text>
   </g>
 
-  <g id="resources">
-    <rect x="24" y="316" width="362" height="300" rx="16" fill="#192632" stroke="#2b3d4b"/>
+  <g id="resources" transform="translate(0 $resources_offset)">
+    <rect x="24" y="316" width="362" height="$resources_height" rx="16" fill="#192632" stroke="#2b3d4b"/>
     <text id="resources-label" x="44" y="351" font-size="19" font-weight="700">$resources_label</text>
     <text id="system-uptime" x="366" y="351" text-anchor="end" font-size="14" fill="#a8bbcb">$system_uptime</text>
     <text id="system" x="44" y="378" font-size="15" fill="#a8bbcb">$system</text>
@@ -60,14 +60,14 @@
       <rect x="44" y="457" width="$meter_width" height="6" rx="3" fill="#2c4250"/>
       <rect x="44" y="457" width="$cpu_bar" height="6" rx="3" fill="$cpu_color"/>
     </g>
-    <g id="memory" transform="translate(0 61)">
+    <g id="memory" transform="translate(0 $memory_offset)">
       <text x="44" y="428" font-size="16" font-weight="700">$memory_label</text>
       <text id="memory-value" x="366" y="428" text-anchor="end" font-size="18" font-weight="700">$memory_value</text>
       <text id="memory-detail" x="44" y="448" font-size="14" fill="#a8bbcb">$memory_detail</text>
       <rect x="44" y="457" width="$meter_width" height="6" rx="3" fill="#2c4250"/>
       <rect x="44" y="457" width="$memory_bar" height="6" rx="3" fill="$memory_color"/>
     </g>
-    <g id="disk" transform="translate(0 122)">
+    <g id="disk" transform="translate(0 $disk_offset)">
       <text x="44" y="428" font-size="16" font-weight="700">$disk_label</text>
       <text id="disk-value" x="366" y="428" text-anchor="end" font-size="18" font-weight="700">$disk_value</text>
       <text id="disk-detail" x="44" y="448" font-size="14" fill="#a8bbcb">$disk_detail</text>
@@ -87,11 +87,16 @@
       <path d="M495 333V393" stroke-width="2" stroke-dasharray="$api_dash"/>
       <text id="api-status" x="510" y="368" font-size="14" stroke="none" fill="$api_color">$api_status</text>
     </g>
-    <g id="wss-link" stroke="$wss_color">
-      <path d="M495 445V505" stroke-width="2" stroke-dasharray="$wss_dash"/>
-      <text x="510" y="480" font-size="14" stroke="none">WSS</text>
+    <g id="wss-link" stroke="$wss_color" display="$auth_display">
+      <path d="M$wss_x 445V505" stroke-width="2" stroke-dasharray="$wss_dash"/>
+      <text id="wss-name" x="544" y="$wss_label_y" font-size="12" stroke="none" fill="$wss_color">$wss_name</text>
     </g>
-    <g id="sqlite-link" stroke="$sqlite_color">
+    <g id="sudo-wss-link" stroke="$sudo_wss_color" display="$sudo_display">
+      <path d="M$sudo_wss_x 445V505" stroke-width="2" stroke-dasharray="$sudo_wss_dash"/>
+      <text id="sudo-wss-name" x="544" y="$sudo_wss_label_y" font-size="12" stroke="none"
+            fill="$sudo_wss_color">$sudo_wss_name</text>
+    </g>
+    <g id="sqlite-link" stroke="$sqlite_color" display="$auth_display">
       <path d="M558 419H579" stroke-width="2" stroke-dasharray="$sqlite_dash"/>
       <rect x="579" y="404" width="95" height="30" rx="7" fill="#182833"/>
       <text id="sqlite-name" x="626.5" y="424" text-anchor="middle" font-size="13" stroke="none">$sqlite_name</text>

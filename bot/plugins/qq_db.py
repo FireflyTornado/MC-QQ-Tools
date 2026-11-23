@@ -65,7 +65,7 @@ async def handle_db(bot: Bot, event: GroupMessageEvent, args: Message = CommandA
             if action == "rm" and status in {"frozen", "pending"}:
                 status = f"rm_{status}"
     except sqlite3.Error:
-        logger.exception("[MC-QQ-AUTH] /db 数据库操作失败")
+        logger.exception("[MCQQAuth] /db 数据库操作失败")
         status = "error"
 
     reply_key = f"commands.db.{status}"

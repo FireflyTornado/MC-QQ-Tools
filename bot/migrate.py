@@ -6,7 +6,7 @@ from database import DB_PATH, SCHEMA_VERSION, init_database
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Initialize or migrate the MC-QQ-Auth SQLite database.")
+    parser = argparse.ArgumentParser(description="Initialize or migrate the MCQQAuth SQLite database.")
     parser.add_argument("--db", type=Path, default=DB_PATH, help=f"SQLite database path (default: {DB_PATH})")
     args = parser.parse_args()
 

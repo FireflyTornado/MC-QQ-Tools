@@ -1,4 +1,4 @@
-# 授权 API
+# MC-QQ-Tools API
 
 示例面向本机开发环境，使用演示凭据。API Token 用于快照和 WebSocket，Notify Token 专用于内部 POST。远端客户端应通过受控的 HTTPS/WSS 代理接入。
 
@@ -10,7 +10,7 @@
 curl --fail http://127.0.0.1:18765/internal/health
 ```
 
-成功返回 HTTP 200 和 `{"status":"ok","minecraft_connections":0}`。`status` 是固定的存活标记，`minecraft_connections` 是当前 API 进程登记的 Minecraft 授权 WebSocket 连接数。连接数仅反映授权通道，玩家端口可达性由独立探测判断。数据库状态不参与此响应。
+成功返回 HTTP 200，例如 `{"status":"ok","auth_enabled":true,"minecraft_connections":0,"sudo_connected":null}`。`auth_enabled` 表示 API 是否已挂载授权路由，`minecraft_connections` 是当前 API 进程登记的授权 WebSocket 连接数。`sudo_connected` 为 `true` 时表示指令通道已连接，为 `false` 时表示已启用且当前离线，为 `null` 时表示指令路由未启用。玩家端口可达性由独立探测判断。健康响应无需访问数据库。
 
 ## GET /internal/mc/snapshot
 

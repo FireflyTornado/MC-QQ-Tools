@@ -46,6 +46,7 @@ final class SudoChannel implements AutoCloseable {
             }
             String token = config.getString("sudo.token", "");
             if (!config.isString("sudo.token") || token.length() > 4096 || !token.matches("[A-Za-z0-9._~+/-]+=*")
+                    || token.equals("REPLACE_WITH_MC_SUDO_MOD_TOKEN")
                     || token.equals("REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN")) {
                 throw new IllegalArgumentException("sudo.token 必须为独立的有效凭据");
             }
@@ -169,7 +170,7 @@ final class SudoChannel implements AutoCloseable {
 
     private static ScheduledExecutorService createTimer() {
         var executor = new ScheduledThreadPoolExecutor(1, task -> {
-            Thread thread = new Thread(task, "MCQQAuth-sudo");
+            Thread thread = new Thread(task, "MCQQSudo-channel");
             thread.setDaemon(true);
             return thread;
         });

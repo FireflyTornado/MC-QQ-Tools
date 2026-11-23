@@ -48,10 +48,10 @@ DEFAULTS = MappingProxyType({
     "commands.binding.pending": "当前绑定的 Minecraft ID：{mc_name}\n状态：已解封，正在核实群成员身份。",
     "commands.binding.not_bound": "你还没有绑定 Minecraft 游戏 ID。\n请使用 /绑定 玩家名",
     "commands.binding.error": "查询失败，请稍后重试",
-    "commands.ping.success": "[MC-QQ-Auth] Ping\nFastAPI Health: HTTP {status_code}\nLatency: {latency_ms} ms",
-    "commands.ping.timeout": "[MC-QQ-Auth] Ping\nFastAPI Health: Timeout\nLatency: {latency_ms} ms",
-    "commands.ping.connection_error": "[MC-QQ-Auth] Ping\nFastAPI Health: Connection failed\nLatency: {latency_ms} ms",
-    "commands.ping.error": "[MC-QQ-Auth] Ping\nFastAPI Health: Invalid HTTP response\nLatency: {latency_ms} ms",
+    "commands.ping.success": "[MC-QQ-Tools] Ping\nFastAPI Health: HTTP {status_code}\nLatency: {latency_ms} ms",
+    "commands.ping.timeout": "[MC-QQ-Tools] Ping\nFastAPI Health: Timeout\nLatency: {latency_ms} ms",
+    "commands.ping.connection_error": "[MC-QQ-Tools] Ping\nFastAPI Health: Connection failed\nLatency: {latency_ms} ms",
+    "commands.ping.error": "[MC-QQ-Tools] Ping\nFastAPI Health: Invalid HTTP response\nLatency: {latency_ms} ms",
     "commands.reconcile.success": "授权对账完成，已撤销 {count} 条离群绑定。",
     "commands.reconcile.failed": "授权对账未完成，请检查群成员名单和服务日志。",
     "commands.reconcile.busy": "授权对账正在执行，请稍后重试。",
@@ -85,21 +85,28 @@ DEFAULTS = MappingProxyType({
     "commands.db.not_bound": "未找到绑定。",
     "commands.db.error": "绑定数据库操作失败，请稍后重试。",
     "commands.help.message": (
-        "[MC-QQ-Auth] 指令帮助\n"
+        "[MC-QQ-Tools] 指令帮助\n"
         "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID\n"
         "/我的绑定 或 /binding · 查询自己的绑定\n"
         "/解绑 或 /unbind · 撤销自己的绑定\n"
-        "/认证测试 或 /ping · 检查授权 API\n"
+        "/认证测试 或 /ping · 检查 API\n"
         "/帮助 或 /help · 显示本帮助\n"
         "超级用户专用\n"
         "/信息 或 /info · 查看状态图片\n"
         "/授权对账 或 /reconcile · 核对群成员与授权\n"
         "/db · 手动添加、删除或查询绑定"
     ),
+    "commands.help.shared": (
+        "指令帮助\n"
+        "/认证测试 或 /ping · 检查 API\n"
+        "/帮助 或 /help · 显示本帮助\n"
+        "/信息 或 /info · 查看状态图片（超级用户专用）"
+    ),
+    "commands.help.sudo": "/sudo <Minecraft 指令> · 执行并回显（指定 QQ 号专用）",
     "commands.info.busy": "状态图正在生成，请稍后重试。",
     "commands.info.error": "状态图暂不可用，请稍后重试。",
-    "info.title": "MC-QQ-Auth",
-    "info.footer": "MC-QQ-Auth",
+    "info.title": "MC-QQ-Tools",
+    "info.footer": "MC-QQ-Tools",
     "info.labels.bot": "Bot",
     "info.labels.onebot": "OneBot",
     "info.labels.api": "FastAPI",
@@ -191,7 +198,7 @@ class MessageConfig:
         template = self.text(key)
         message, length = _render(template, values)
         if length > MAX_TEXT_LENGTH:
-            logger.warning("[MC-QQ-AUTH] 消息渲染后过长，使用默认文案（{}）", key)
+            logger.warning("[MC-QQ-Tools] 消息渲染后过长，使用默认文案（{}）", key)
             message, _ = _render(DEFAULTS[key], values)
         return message
 
@@ -228,7 +235,7 @@ def _render(template: str, values: Mapping[str, MessageValue]) -> tuple[Message,
 
 def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "") -> None:
     if not isinstance(raw, dict):
-        logger.warning("[MC-QQ-AUTH] 消息配置节应为映射，使用默认值（{}）", prefix or "根节点")
+        logger.warning("[MC-QQ-Tools] 消息配置节应为映射，使用默认值（{}）", prefix or "根节点")
         return
     for name, value in raw.items():
         if not isinstance(name, str) or "." in name:
@@ -238,21 +245,21 @@ def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "
         if key in SECTIONS:
             _apply_overrides(value, values, key)
         elif key not in DEFAULTS:
-            logger.warning("[MC-QQ-AUTH] 忽略未知消息配置项（{}）", prefix or "根节点")
+            logger.warning("[MC-QQ-Tools] 忽略未知消息配置项（{}）", prefix or "根节点")
         elif isinstance(DEFAULTS[key], bool):
             if type(value) is bool:
                 values[key] = value
             else:
-                logger.warning("[MC-QQ-AUTH] 消息通知开关应为布尔值，使用默认值（{}）", key)
+                logger.warning("[MC-QQ-Tools] 消息通知开关应为布尔值，使用默认值（{}）", key)
         elif not isinstance(value, str) or not value.strip() or len(value) > MAX_TEXT_LENGTH or UNSAFE_TEXT.search(value):
-            logger.warning("[MC-QQ-AUTH] 消息文案无效或过长，使用默认值（{}）", key)
+            logger.warning("[MC-QQ-Tools] 消息文案无效或过长，使用默认值（{}）", key)
         elif any(
             token not in ("{{", "}}")
             and token[1:-1] not in COMMON_FIELDS
             and token[1:-1] not in BUSINESS_FIELDS.get(key, ())
             for token in TOKENS.split(value)[1::2]
         ):
-            logger.warning("[MC-QQ-AUTH] 消息占位符无效，使用默认值（{}）", key)
+            logger.warning("[MC-QQ-Tools] 消息占位符无效，使用默认值（{}）", key)
         else:
             values[key] = value
 
@@ -269,7 +276,7 @@ def load_messages(path: Path = MESSAGE_FILE) -> MessageConfig:
         pass
     except (OSError, ValueError, OverflowError, RecursionError, yaml.YAMLError):
         # YAML errors can quote file content, so never log the exception itself.
-        logger.error("[MC-QQ-AUTH] 无法读取或解析 messages.yml，使用默认配置")
+        logger.error("[MC-QQ-Tools] 无法读取或解析 messages.yml，使用默认配置")
     else:
         _apply_overrides(raw, values)
     return MessageConfig(MappingProxyType(values))

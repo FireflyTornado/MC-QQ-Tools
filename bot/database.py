@@ -238,6 +238,15 @@ def _validate_offline_bindings(conn: sqlite3.Connection) -> None:
             raise MigrationError(f"Incompatible active binding index: {expected_name}")
 
 
+def check_schema_version() -> None:
+    """Require the current Auth schema without creating or writing a database."""
+    uri = DB_PATH.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+    if version != SCHEMA_VERSION:
+        raise MigrationError(f"SQLite schema version {version}, expected {SCHEMA_VERSION}")
+
+
 def init_database(db_path: Path | None = None) -> None:
     """Initialize or validate the authorization database in a single transaction."""
     path = DB_PATH if db_path is None else Path(db_path)
@@ -255,9 +264,9 @@ def init_database(db_path: Path | None = None) -> None:
         ))
         known_tables = CURRENT_TABLES.keys() | LEGACY_TABLES
         if tables and not known_tables.intersection(tables):
-            raise MigrationError("Database has no recognized MC-QQ-Auth tables")
+            raise MigrationError("Database has no recognized MCQQAuth tables")
         if any(tables[name] != "table" for name in known_tables.intersection(tables)):
-            raise MigrationError("An expected MC-QQ-Auth table is a view")
+            raise MigrationError("An expected MCQQAuth table is a view")
 
         if version == 0:
             if "offline_bindings" in tables and "auth_state" not in tables:

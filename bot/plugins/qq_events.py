@@ -45,7 +45,7 @@ async def send_member_notice(bot: Bot, message: Message) -> None:
         async with asyncio.timeout(5):
             await bot.send_group_msg(group_id=TARGET_GROUP_ID, message=message)
     except Exception as exc:
-        logger.warning("[MC-QQ-AUTH] 群成员提示发送失败（{}）", type(exc).__name__)
+        logger.warning("[MCQQAuth] 群成员提示发送失败（{}）", type(exc).__name__)
 
 
 # 监听成员入群
@@ -70,7 +70,7 @@ async def handle_member_join(
         bots_outside_group.discard(str(event.self_id))
         return
     logger.info(
-        "[MC-QQ-AUTH] 检测到目标群成员加入事件"
+        "[MCQQAuth] 检测到目标群成员加入事件"
     )
     messages = message_config.MESSAGES
     if messages.enabled("join"):
@@ -101,7 +101,7 @@ async def handle_member_leave(
     if event.sub_type == "kick_me" or event.user_id == event.self_id:
         membership_generation += 1
         bots_outside_group.add(str(event.self_id))
-        logger.error("[MC-QQ-AUTH] 机器人已离开目标群，群成员授权对账不可用")
+        logger.error("[MCQQAuth] 机器人已离开目标群，群成员授权对账不可用")
         return
 
     if event.sub_type not in {"leave", "kick"}:
@@ -141,12 +141,12 @@ async def process_departure(bot: Bot, event: GroupDecreaseNoticeEvent, *, retry:
             outcome, mc_name = result
         pending_departures.pop(key, None)
     except (sqlite3.Error, UnverifiedMembers, TimeoutError, OneBotV11AdapterException) as exc:
-        logger.error("[MC-QQ-AUTH] {}后的撤权暂未确认（{}）", reason, type(exc).__name__)
+        logger.error("[MCQQAuth] {}后的撤权暂未确认（{}）", reason, type(exc).__name__)
         outcome, mc_name = "failed", None
     else:
         handling = "handled"
         if outcome == "revoked":
-            logger.info("[MC-QQ-AUTH] {}，已撤销绑定", reason)
+            logger.info("[MCQQAuth] {}，已撤销绑定", reason)
     finally:
         if recent_departures.get(key) == "processing":
             recent_departures[key] = handling
@@ -269,16 +269,16 @@ async def reconcile_members(bot: Bot, *, only_pending: bool = False) -> int | No
                 deleted = await asyncio.to_thread(reconcile_checked_bindings, GROUP_ID, audit, members, checked_at)
             if deleted is None:
                 outcome = "Version changed"
-                logger.warning("[MC-QQ-AUTH] 对账期间授权版本已变化，本次对账已跳过")
+                logger.warning("[MCQQAuth] 对账期间授权版本已变化，本次对账已跳过")
             else:
                 outcome = f"OK, {deleted} revoked"
             return deleted
         except (UnverifiedMembers, TimeoutError, OneBotV11AdapterException) as exc:
             outcome = "Roster unverified"
-            logger.warning("[MC-QQ-AUTH] 群成员名单无法确认，对账已跳过（{}）", type(exc).__name__)
+            logger.warning("[MCQQAuth] 群成员名单无法确认，对账已跳过（{}）", type(exc).__name__)
         except sqlite3.Error as exc:
             outcome = "Database error"
-            logger.error("[MC-QQ-AUTH] 授权对账数据库操作失败（{}）", type(exc).__name__)
+            logger.error("[MCQQAuth] 授权对账数据库操作失败（{}）", type(exc).__name__)
         finally:
             if outcome is not None:
                 record_outcome("reconcile", outcome)
@@ -327,7 +327,7 @@ async def reconcile_on_connect(bot: Bot):
         await asyncio.sleep(MEMBER_CHECK_RETRY_DELAY)
         count = await reconcile_members(bot)
     if count is not None:
-        logger.info("[MC-QQ-AUTH] OneBot 连接后授权对账完成，已撤销 {} 条绑定", count)
+        logger.info("[MCQQAuth] OneBot 连接后授权对账完成，已撤销 {} 条绑定", count)
 
 
 reconcile = on_command(

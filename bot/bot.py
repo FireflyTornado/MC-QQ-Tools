@@ -12,12 +12,14 @@ from app_config import (
     require_token,
     target_group_id,
 )
+from component_config import check_auth_database, read_components
 
 
 def init_bot() -> None:
     config = load_config()
     group_id = target_group_id(config)
     ws_urls = onebot_ws_urls(config)
+    components = check_auth_database(read_components(config, for_api=False))
     access_token = None
     if config.get("ONEBOT_ACCESS_TOKEN"):
         access_token = require_token(config, "ONEBOT_ACCESS_TOKEN")
@@ -42,7 +44,20 @@ def init_bot() -> None:
         finally:
             nonebot.logger.enable("nonebot")
 
-        nonebot.load_plugins("plugins")
+        auth_enabled = False
+        sudo_enabled = False
+        if components.auth is not None:
+            auth_plugins = [nonebot.load_plugin(f"plugins.{name}") for name in ("qq_events", "qq_bindings", "qq_db")]
+            auth_enabled = all(plugin is not None for plugin in auth_plugins)
+        if components.sudo is not None and components.sudo_output is not None:
+            plugin = nonebot.load_plugin("plugins.qq_sudo")
+            if plugin is not None:
+                plugin.module.configure(components.sudo, components.sudo_output)
+                sudo_enabled = True
+        status = nonebot.load_plugin("plugins.status_commands")
+        if status is not None:
+            status.module.configure(auth=auth_enabled, sudo=sudo_enabled)
+        print(f"MC-QQ-Tools components: auth={int(auth_enabled)} sudo={int(sudo_enabled)}", flush=True)
 
 
 init_bot()

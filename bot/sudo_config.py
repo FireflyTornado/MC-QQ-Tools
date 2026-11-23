@@ -3,7 +3,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from app_config import ConfigError, require_token
+from app_config import ConfigError, read_switch, require_token
 
 SUDO_TIMEOUT = 30
 SUDO_SUBMIT_PATH = "/internal/mc/sudo/submit"
@@ -15,6 +15,8 @@ MAX_FOLLOWUP_FRAMES = 64
 MAX_COMMAND_LENGTH = 256
 MAX_RESULT_BYTES = 64 * 1024
 MAX_RESULT_MESSAGE_BYTES = 512 * 1024
+MOD_TOKEN_KEY = "MC_SUDO_MOD_TOKEN"
+LEGACY_MOD_TOKEN_KEY = "MC_SUDO_PLUGIN_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -55,15 +57,31 @@ def read_sudo_output_settings(config: dict[str, str | None]) -> SudoOutputSettin
 class SudoSettings:
     qq_ids: frozenset[str]
     bot_token: str
-    plugin_token: str
+    mod_token: str | None = None
 
 
-def read_sudo_settings(config: dict[str, str | None]) -> SudoSettings | None:
+def _read_mod_token(config: dict[str, str | None]) -> str:
+    legacy_token = config.get(LEGACY_MOD_TOKEN_KEY)
+    if config.get(MOD_TOKEN_KEY) is None and legacy_token is not None:
+        token = require_token(config, LEGACY_MOD_TOKEN_KEY)
+        if token == f"REPLACE_WITH_{MOD_TOKEN_KEY}":
+            raise ConfigError(f"{LEGACY_MOD_TOKEN_KEY} 必须填写实际凭据")
+        return token
+    token = require_token(config, MOD_TOKEN_KEY)
+    if legacy_token is not None and legacy_token != token:
+        raise ConfigError(f"{MOD_TOKEN_KEY} 与 {LEGACY_MOD_TOKEN_KEY} 必须使用相同的值")
+    if token == f"REPLACE_WITH_{LEGACY_MOD_TOKEN_KEY}":
+        raise ConfigError(f"{MOD_TOKEN_KEY} 必须填写实际凭据")
+    return token
+
+
+def read_sudo_qq_ids(config: dict[str, str | None]) -> frozenset[str]:
+    enabled = read_switch(config, "MC_SUDO_ENABLED", default=None)
+    if enabled is False:
+        return frozenset()
     raw_ids = config.get("MC_SUDO_QQ_IDS")
-    if raw_ids is None:
-        return None
     try:
-        ids = json.loads(raw_ids)
+        ids = json.loads(raw_ids) if raw_ids is not None else []
     except (ValueError, RecursionError):
         ids = None
     if not isinstance(ids, list) or any(
@@ -71,17 +89,25 @@ def read_sudo_settings(config: dict[str, str | None]) -> SudoSettings | None:
         for value in ids
     ):
         raise ConfigError("MC_SUDO_QQ_IDS 必须为 QQ 号字符串的 JSON 数组")
-    if not ids:
+    if enabled and not ids:
+        raise ConfigError("启用 /sudo 时，MC_SUDO_QQ_IDS 必须至少包含一个 QQ 号")
+    return frozenset(ids)
+
+
+def read_sudo_settings(config: dict[str, str | None], *, require_mod_token: bool = True) -> SudoSettings | None:
+    qq_ids = read_sudo_qq_ids(config)
+    if not qq_ids:
         return None
     bot_token = require_token(config, "MC_SUDO_BOT_TOKEN")
-    plugin_token = require_token(config, "MC_SUDO_PLUGIN_TOKEN")
-    if bot_token == plugin_token or {bot_token, plugin_token} & {
-        config.get("MC_API_TOKEN"),
-        config.get("MC_NOTIFY_TOKEN"),
-        config.get("ONEBOT_ACCESS_TOKEN"),
-    }:
+    configured_mod_tokens = {config.get(MOD_TOKEN_KEY), config.get(LEGACY_MOD_TOKEN_KEY)}
+    mod_token = _read_mod_token(config) if require_mod_token or configured_mod_tokens != {None} else None
+    reserved_tokens = {
+        token for key in ("ONEBOT_ACCESS_TOKEN", "MC_API_TOKEN", "MC_NOTIFY_TOKEN", "MC_BANLIST_TOKEN")
+        if (token := config.get(key))
+    }
+    if bot_token in configured_mod_tokens or ({bot_token} | configured_mod_tokens) & reserved_tokens:
         raise ConfigError("/sudo 凭据必须独立配置")
-    return SudoSettings(frozenset(ids), bot_token, plugin_token)
+    return SudoSettings(qq_ids, bot_token, mod_token)
 
 
 def is_single_command(command: str) -> bool:

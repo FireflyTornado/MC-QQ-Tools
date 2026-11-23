@@ -50,7 +50,7 @@ def _font_source(bold: bool) -> tuple[str, int] | None:
     if source is None:
         if bold:
             return _font_source(False)
-        logger.warning("[MC-QQ-AUTH] 未找到中文字体，状态图使用英文备用标签")
+        logger.warning("[MC-QQ-Tools] 未找到中文字体，状态图使用英文备用标签")
     return source
 
 
@@ -178,6 +178,14 @@ def render_status(
         elif api.error:
             api_status = "响应异常" if cjk else "Bad HTTP"
     ws_connected = None if api is None or api.minecraft_connections is None else api.minecraft_connections > 0
+    sudo_connected = api.sudo_connected if api is not None else None
+    both_channels = status.auth_enabled and status.sudo_enabled
+
+    def channel_label(name: str, connected: bool | None) -> str:
+        states = {True: "在线", False: "离线", None: "未知"} if cjk else {
+            True: "Online", False: "Offline", None: "Unknown",
+        }
+        return text(f"{name} · {states[connected]}", 12, 130)
 
     game = status.minecraft
     game_color = _binary_color(game.reachable if game is not None else None)
@@ -218,7 +226,7 @@ def render_status(
 
     fields = {
         "font_family": family,
-        "title": text(messages.info_text("info.title", **variables), 29, 485, "MC-QQ-Auth", strong=True),
+        "title": text(messages.info_text("info.title", **variables), 29, 485, "MC-QQ-Tools", strong=True),
         "page_label": "运行状态" if cjk else "Runtime status",
         "avatar": _avatar_uri(avatar),
         "avatar_display": "inline" if avatar is not None else "none",
@@ -226,6 +234,12 @@ def render_status(
         "nickname": text(nickname or "QQ 机器人", 23, 245, "QQ Bot", strong=True),
         "qq": text(f"QQ {qq_id or EMPTY}", 16, 245),
         "timestamp_label": "采集时间" if cjk else "Collected",
+        "auth_display": "inline" if status.auth_enabled else "none",
+        "sudo_display": "inline" if status.sudo_enabled else "none",
+        "resources_offset": 0 if status.auth_enabled else -102,
+        "resources_height": 300 if status.auth_enabled else 402,
+        "memory_offset": 61 if status.auth_enabled else 103,
+        "disk_offset": 122 if status.auth_enabled else 206,
         "bindings_label": text(label("bindings"), 19, METRIC_LABEL_WIDTH, "Active bindings"),
         "bindings_count": bindings_count,
         "bindings_size": bindings_size,
@@ -241,6 +255,12 @@ def render_status(
         "bot_uptime": text(_duration(status.bot_seconds, cjk), 13, 110),
         "api_name": text(label("api"), 16, 110, "FastAPI", strong=True),
         "api_status": text(api_status, 14, 164),
+        "wss_x": 475 if both_channels else 495,
+        "wss_label_y": 477 if both_channels else 480,
+        "wss_name": channel_label("Auth WSS", ws_connected),
+        "sudo_wss_x": 515 if both_channels else 495,
+        "sudo_wss_label_y": 499 if both_channels else 480,
+        "sudo_wss_name": channel_label("Sudo WSS", sudo_connected),
         "minecraft_title_y": 528 if game_detail else 537,
         "minecraft_detail": text(game_detail, 13, 110),
         "unnamed_bans_warning": text(unnamed_bans, 14, 174),
@@ -261,6 +281,7 @@ def render_status(
         ("onebot", _binary_color(status.connected)),
         ("api", _api_color(api)),
         ("wss", _binary_color(ws_connected)),
+        ("sudo_wss", _binary_color(sudo_connected)),
         ("sqlite", _binary_color(status.sqlite_readable)),
         ("minecraft", game_color),
     ):

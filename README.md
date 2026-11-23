@@ -1,6 +1,11 @@
-# MC-QQ-Auth
+# MC-QQ-Tools
 
-MC-QQ-Auth 面向 Minecraft Java 版离线社区服务器。玩家在指定 QQ 群绑定游戏 ID，Minecraft 插件通过 HTTPS 快照和 WSS 更新提醒获取授权名单，并据此执行游戏端准入。
+MC-QQ-Tools 为 Minecraft Java 服务器提供两套可独立启用的工具，按需共用 NapCat、Bot 和 FastAPI。
+
+| 组件 | 用途 |
+| --- | --- |
+| **MCQQAuth** 插件 | 在 QQ 群绑定游戏 ID，通过 HTTPS 快照和 WSS 同步授权名单，管理游戏服准入与封禁联动。 |
+| **MCQQSudo** 模组 | 从 QQ 群提交获准的 Minecraft 指令，在群内回显执行结果和后续输出。 |
 
 ## 功能状态
 
@@ -13,9 +18,9 @@ MC-QQ-Auth 面向 Minecraft Java 版离线社区服务器。玩家在指定 QQ �
 
 ## 系统架构与技术栈
 
-**QQ 群 → NapCat → NoneBot2 → SQLite → FastAPI → HTTPS/WSS → Minecraft 插件**
+**QQ 群 → NapCat → NoneBot2 → FastAPI → Minecraft**
 
-NapCat、Bot 和授权 API 部署在同一台主机，Minecraft 服务端在另一台主机。Bot 写入 SQLite 后通知 FastAPI，游戏端通过 HTTPS 拉取完整名单，通过 WSS 得知何时刷新。系统使用 Python 3.12、NoneBot2 / OneBot v11、FastAPI / Uvicorn、SQLite 和 Docker Compose。插件使用 Java 17、Maven 和 Spigot API 1.20.1，目标服务端为 Mohist 1.20.1。详见 [架构说明](docs/architecture.md)。
+NapCat、Bot 和 FastAPI 部署在同一台主机，Minecraft 服务端在另一台主机。MCQQAuth 使用 SQLite 保存授权数据，游戏端通过 HTTPS 获取完整名单，通过 WSS 接收刷新通知。MCQQSudo 使用独立 WSS 通道收发指令和回执。两个游戏端组件分别构建，目标服务端为 Mohist 1.20.1。详见 [架构说明](docs/architecture.md)。
 
 ## QQ 群使用方式
 
@@ -26,10 +31,10 @@ NapCat、Bot 和授权 API 部署在同一台主机，Minecraft 服务端在另�
 | `/绑定 Steve` | `/bind Steve` | 将当前 QQ 账号绑定到游戏 ID `Steve`。 |
 | `/我的绑定` | `/binding` | 查看当前绑定。 |
 | `/解绑` | `/unbind` | 解除当前绑定。 |
-| `/认证测试` | `/ping` | 查看本机授权 API 的健康检查状态码和请求耗时。 |
+| `/认证测试` | `/ping` | 查看本机 API 的健康检查状态码和请求耗时。 |
 | `/帮助` | `/help` | 查看双语指令及权限。 |
 | `/授权对账` | `/reconcile` | 超级用户专用。核对群成员并撤销已离群的绑定。 |
-| `/信息` | `/info` | 超级用户专用。发送 Bot、授权 API 和主机的状态图。 |
+| `/信息` | `/info` | 超级用户专用。查看 Bot、API、已启用组件的 WSS 连接和主机状态。 |
 | `/db` | `/db` | 超级用户专用。查看手动管理绑定的用法。 |
 | `/sudo list` | `/sudo list` | 指定 QQ 号专用。执行服务端已开放的单条命令并在群内回显。默认关闭。 |
 
@@ -37,7 +42,7 @@ NapCat、Bot 和授权 API 部署在同一台主机，Minecraft 服务端在另�
 
 `/sudo` 由 Mohist 1.20.1 服务端模组 `MCQQSudo` 执行并采集输出。一次只受理一条指令，等待执行回执最多 30 秒。管理员按命令前缀编辑默认留空的 `sudo-allowlist.txt`。群内所有成员都能看到回显。启用方法见 [QQ群管理指令](docs/deployment.md#qq群管理指令)。
 
-机器人回复、欢迎语、退群及移出通知、状态图标题和标签都可以在 `bot/messages.yml` 中自定义。入群、主动退群和被移出群的通知独立设置，默认关闭，授权与撤权照常执行。状态图左列显示当前 Bot 账号、采集时间、有效绑定数和系统资源，右列显示服务链路。采集时间使用 Bot 服务器的当地时间。默认文案与可用占位符见 [配置模板](bot/messages.example.yml)，创建配置和重启步骤见 [部署说明](docs/deployment.md#机器人文案与群通知)。
+机器人回复、欢迎语、退群及移出通知、状态图标题和标签都可以在 `bot/messages.yml` 中自定义。入群、主动退群和被移出群的通知独立设置，默认关闭，授权与撤权照常执行。状态图左列显示 Bot 账号、采集时间和系统资源，右列显示服务链路。启用授权时还会显示有效绑定数和封禁记录数。采集时间使用 Bot 服务器的当地时间。默认文案与可用占位符见 [配置模板](bot/messages.example.yml)，创建配置和重启步骤见 [部署说明](docs/deployment.md#机器人文案与群通知)。
 
 请绑定服务端实际收到的登录名。游戏名须由英文字母、数字或下划线组成，最多 16 位，支持 1 位和 2 位的短名。显示保留原有大小写，名称占用检查使用小写。
 

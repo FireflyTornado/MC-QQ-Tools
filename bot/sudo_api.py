@@ -22,7 +22,7 @@ from sudo_config import (
     is_single_command,
 )
 
-logger = logging.getLogger("uvicorn.error.mc_qq_auth.sudo")
+logger = logging.getLogger("uvicorn.error.mc_qq_tools.sudo")
 PLUGIN_RESULTS = {"ok", "rejected", "error", "busy", "expired", "partial", "scheduled"}
 FOLLOWUP_RESULTS = {"ok", "error", "cancelled", "expired", "partial"}
 MAX_MESSAGE_BYTES = 8192
@@ -112,14 +112,18 @@ async def send_command(work: PendingCommand, command: str, deadline_ms: int) -> 
         logger.warning("/sudo #%s 未能确认指令已发送", work.request_id)
 
 
+class SudoRouter(APIRouter):
+    connected: bool = False
+
+
 def sudo_router(
     settings: SudoSettings | None,
     target_group: str,
     verify_bearer: Callable[[list[str] | None, bytes], bool],
-) -> APIRouter:
-    router = APIRouter()
+) -> SudoRouter:
+    router = SudoRouter()
+    mod_token = settings.mod_token.encode("ascii") if settings is not None and settings.mod_token is not None else None
     plugin: WebSocket | None = None
-    ready = False
     pending: PendingCommand | None = None
     followups: dict[str, Followup] = {}
 
@@ -197,7 +201,7 @@ def sudo_router(
         prune_followups()
         if request_id in followups:
             return {"status": "rejected"}
-        if plugin is None or not ready:
+        if plugin is None or not router.connected:
             return {"status": "unavailable"}
 
         work = PendingCommand(request_id, plugin, asyncio.get_running_loop().create_future())
@@ -224,10 +228,10 @@ def sudo_router(
 
     @router.websocket(SUDO_WS_PATH)
     async def results(websocket: WebSocket):
-        nonlocal plugin, ready
+        nonlocal plugin
         if (
-            settings is None or plugin is not None
-            or not verify_bearer(websocket.headers.getlist("authorization"), settings.plugin_token.encode("ascii"))
+            mod_token is None or plugin is not None
+            or not verify_bearer(websocket.headers.getlist("authorization"), mod_token)
         ):
             await websocket.close(code=1008)
             return
@@ -235,7 +239,7 @@ def sudo_router(
         plugin = websocket
         try:
             await websocket.accept()
-            ready = True
+            router.connected = True
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
@@ -308,7 +312,7 @@ def sudo_router(
                             reply["status"] = "partial"
                     pending.result.set_result(reply)
         finally:
-            ready = False
+            router.connected = False
             plugin = None
             if pending is not None and pending.plugin is websocket and not pending.result.done():
                 pending.result.set_result({"status": "disconnected"})

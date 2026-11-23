@@ -4,7 +4,7 @@ umask 077
 export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
 
 readonly PROJECT=/opt/mc-qq-auth BACKUPS=/opt/mc-qq-auth-backups
-readonly REPO=FireflyTornado/MC-qq-auth-BF656
+readonly REPO=FireflyTornado/MC-QQ-Tools LEGACY_REPO=FireflyTornado/MC-qq-auth-BF656
 readonly API=mc-qq-api.service BOT=mc-qq-bot.service
 readonly DB="$PROJECT/bot/data/auth.db" PYTHON="$PROJECT/bot/.venv/bin/python"
 readonly -a PROTECTED=(bot/.env napcat/.env bot/data napcat/data bot/.venv)
@@ -46,7 +46,7 @@ finish() {
     if [[ -n $incomplete_backup && $incomplete_backup == "$BACKUPS"/auth-*.db ]]; then
         rm -f -- "$incomplete_backup"
     fi
-    if [[ -n $scratch && $scratch == /tmp/mc-qq-auth-update.* && -d $scratch && ! -L $scratch ]]; then
+    if [[ -n $scratch && $scratch == /tmp/mc-qq-tools-update.* && -d $scratch && ! -L $scratch ]]; then
         rm -rf -- "$scratch"
     fi
     exit "$status"
@@ -76,7 +76,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-for command in git id flock systemctl docker sqlite3 timeout; do
+for command in git id flock systemctl docker timeout; do
     command -v "$command" >/dev/null || die "Missing command: $command"
 done
 if [[ $mode == apply ]]; then
@@ -99,13 +99,19 @@ flock -n "$lock_fd" || die 'Another upgrade or check holds the repository lock.'
 [[ $(repo_git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}') == origin/main ]] ||
     die 'Expected main to track origin/main.'
 head=$(repo_git rev-parse --verify HEAD)
+expected_origin() {
+    local address=$1 repo
+    for repo in "$REPO" "$LEGACY_REPO"; do
+        case "$address" in
+            "https://github.com/$repo"|"https://github.com/$repo.git"|"git@github.com:$repo"|"git@github.com:$repo.git"| \
+            "ssh://git@github.com:$repo"|"ssh://git@github.com:$repo.git") return 0 ;;
+        esac
+    done
+    return 1
+}
 origin=$(repo_git remote get-url --all origin)
-case "$origin" in
-    "https://github.com/$REPO"|"https://github.com/$REPO.git"|"git@github.com:$REPO"|"git@github.com:$REPO.git"| \
-    "ssh://git@github.com/$REPO"|"ssh://git@github.com/$REPO.git") ;;
-    *) die 'Origin is not the expected GitHub repository.' ;;
-esac
-log "Worktree $PROJECT, main $head, origin $REPO."
+expected_origin "$origin" || die 'Origin is not the expected GitHub repository.'
+log "Worktree $PROJECT, main $head, origin $origin."
 clean_worktree() {
     local marker changes flags
     for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
@@ -122,17 +128,40 @@ clean_worktree
 tracked=$(repo_git ls-files -- "${PROTECTED[@]}")
 [[ -z $tracked ]] || die 'A protected runtime path is tracked in Git.'
 
-for path in bot napcat bot/data napcat/data bot/.venv; do
+for path in bot napcat napcat/data bot/.venv; do
     [[ -d $path && ! -L $path ]] || die "Expected a real directory: $path"
 done
-for path in bot/.env napcat/.env bot/data/auth.db; do
+for path in bot/.env napcat/.env; do
     [[ -f $path && -s $path && ! -L $path && -r $path ]] || die "Missing, empty or unsafe runtime file: $path"
 done
 [[ -x $PYTHON ]] || die 'Production virtual environment interpreter is unavailable.'
-for path in "$DB-wal" "$DB-shm" "$DB-journal"; do
-    [[ ! -L $path && ( ! -e $path || -f $path ) ]] || die 'Unsafe SQLite sidecar file.'
-done
-log 'Protected configuration and database files are present and nonempty.'
+unit_component_modes() {
+    local unit=$1 modes
+    modes=$("$PYTHON" -I -B deploy/service_auth_mode.py "$unit" 2>/dev/null) || return 1
+    [[ $modes =~ ^[01]\ [01]$ ]] || return 1
+    printf '%s\n' "$modes"
+}
+shared_component_modes() {
+    local api_modes bot_modes api_auth api_sudo bot_auth bot_sudo
+    api_modes=$(unit_component_modes "$API") || die "Unable to determine component modes for $API."
+    bot_modes=$(unit_component_modes "$BOT") || die "Unable to determine component modes for $BOT."
+    read -r api_auth api_sudo <<< "$api_modes"
+    read -r bot_auth bot_sudo <<< "$bot_modes"
+    [[ $api_auth == "$bot_auth" ]] || die "MC_AUTH_ENABLED differs between $API ($api_auth) and $BOT ($bot_auth)."
+    [[ $api_sudo == "$bot_sudo" ]] || die "Sudo enablement differs between $API ($api_sudo) and $BOT ($bot_sudo)."
+    printf '%s\n' "$api_modes"
+}
+component_modes=$(shared_component_modes) || exit 1
+read -r auth_enabled sudo_enabled <<< "$component_modes"
+if (( auth_enabled )); then
+    command -v sqlite3 >/dev/null || die 'Missing command: sqlite3'
+    [[ -d bot/data && ! -L bot/data ]] || die 'Expected a real directory: bot/data'
+    [[ -f $DB && -s $DB && ! -L $DB && -r $DB ]] || die 'Missing, empty or unsafe runtime file: bot/data/auth.db'
+    for path in "$DB-wal" "$DB-shm" "$DB-journal"; do
+        [[ ! -L $path && ( ! -e $path || -f $path ) ]] || die 'Unsafe SQLite sidecar file.'
+    done
+fi
+log "Protected runtime configuration present. Components (1=enabled): Auth=$auth_enabled Sudo=$sudo_enabled."
 
 cached=$(repo_git rev-parse --verify 'refs/remotes/origin/main^{commit}') || die 'Missing cached origin/main.'
 remote=$cached
@@ -200,11 +229,39 @@ changed() {
     (( result == 1 )) || die 'Unable to compare target changes.'
     return 0
 }
+db_version() {
+    local version
+    [[ -f $1 && -s $1 && ! -L $1 ]] || return 1
+    version=$(sqlite3 -readonly -batch -bail "$1" 'PRAGMA user_version;' 2>/dev/null) || return 1
+    [[ $version =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+target_schema_version() {
+    # Read the target constant without running code from a commit under review.
+    repo_git show "$target:bot/database.py" | "$PYTHON" -I -B -c '
+import ast
+import sys
+
+versions = [node.value.value for node in ast.parse(sys.stdin.buffer.read()).body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "SCHEMA_VERSION"
+            and isinstance(node.value, ast.Constant)]
+if len(versions) != 1 or type(versions[0]) is not int or not 0 < versions[0] <= 2147483647:
+    sys.exit(1)
+print(versions[0])
+' 2>/dev/null
+}
 deps=0 migration=0 units_changed=0 compose_changed=0 tool_changed=0 update_api=0 update_bot=0
 if changed requirements.txt requirements.in; then deps=1; fi
-if changed bot/database.py bot/migrate.py bot/migrations; then migration=1; fi
+if (( auth_enabled )); then
+    schema=$(db_version "$DB") || die 'Unable to read database version.'
+    target_schema=$(target_schema_version) || die 'Unable to determine target authorization schema version.'
+    (( schema <= target_schema )) || die 'Authorization database is newer than the target schema.'
+    if (( schema < target_schema )) || changed bot/database.py bot/migrate.py bot/migrations; then migration=1; fi
+    log "Authorization schema: installed=$schema target=$target_schema."
+fi
 if changed deploy/systemd; then units_changed=1; fi
-if changed deploy/update.sh; then tool_changed=1; fi
+if changed deploy/update.sh deploy/service_auth_mode.py; then tool_changed=1; fi
 if changed napcat ':(exclude)napcat/.env.example'; then compose_changed=1; fi
 if changed bot/mc_api.py; then update_api=1; fi
 if changed bot/bot.py bot/binding_service.py bot/notify_client.py bot/plugins; then update_bot=1; fi
@@ -236,9 +293,12 @@ fi
 [[ $mode == apply ]] || exit 0
 (( ! units_changed && ! compose_changed && ! tool_changed )) ||
     die 'Apply does not install unit changes, modify NapCat or replace the running updater.'
-[[ $head != "$target" ]] || die 'HEAD is already at the target. No upgrade ran. After a failed run, follow manual recovery.'
+[[ $head != "$target" ]] || (( migration )) ||
+    die 'HEAD is already at the target. No upgrade ran. After a failed run, follow manual recovery.'
 
-for required in bot/bot.py bot/mc_api.py bot/database.py bot/migrate.py requirements.txt; do
+required_files=(bot/bot.py bot/mc_api.py requirements.txt)
+if (( auth_enabled )); then required_files+=(bot/database.py bot/migrate.py); fi
+for required in "${required_files[@]}"; do
     entry=$(repo_git ls-tree "$target" -- "$required") || die "Cannot inspect target file: $required"
     [[ $entry =~ ^100(644|755)[[:space:]]blob[[:space:]] ]] || die "Missing or non-regular target file: $required"
 done
@@ -248,20 +308,35 @@ if [[ $target_entries =~ (^|$'\n')(120000|160000)\  ]]; then
 fi
 
 api_ready() {
-    local pid
+    local expected_auth=${1:-$auth_enabled} expected_sudo=${2:-$sudo_enabled} pid
     active "$API" || return 1
     pid=$(systemctl show -p MainPID --value "$API") || return 1
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
     ss -H -ltnp 'sport = :18765' |
         awk -v pid="$pid" '$4 != "127.0.0.1:18765" || index($0,"pid=" pid ",")==0 {bad=1} END {exit !(NR==1 && !bad)}' ||
         return 1
-    [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
-        http://127.0.0.1:18765/internal/health) == 200 ]] &&
-    [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
-        http://127.0.0.1:18765/internal/mc/snapshot) == 401 ]]
+    curl -q --noproxy '*' -s --max-time 3 -w '\n%{http_code}' http://127.0.0.1:18765/internal/health |
+        "$PYTHON" -I -B -c '
+import json
+import sys
+body, _, code = sys.stdin.read(8193).rpartition("\n")
+try:
+    payload = json.loads(body)
+except ValueError:
+    sys.exit(1)
+auth, sudo = (value == "1" for value in sys.argv[1:])
+sys.exit(not (code == "200" and isinstance(payload, dict)
+              and payload.get("status") == "ok" and payload.get("auth_enabled") is auth
+              and "sudo_connected" in payload
+              and (isinstance(payload["sudo_connected"], bool) if sudo else payload["sudo_connected"] is None)))
+' "$expected_auth" "$expected_sudo" 2>/dev/null || return 1
+    if (( expected_auth )); then
+        [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:18765/internal/mc/snapshot) == 401 ]]
+    fi
 }
 bot_ready() {
-    local pid invocation
+    local check_components=${1:-1} pid invocation
     active "$BOT" || return 1
     pid=$(systemctl show -p MainPID --value "$BOT") || return 1
     invocation=$(systemctl show -p InvocationID --value "$BOT") || return 1
@@ -270,7 +345,11 @@ bot_ready() {
         awk -v pid="$pid" '$1=="ESTAB" && $5=="127.0.0.1:13001" && index($0,"pid=" pid ",") {ok=1} END {exit !ok}' ||
         return 1
     timeout 4s journalctl --no-pager -q -o cat -u "$BOT" "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null |
-        awk '/Bot [0-9]+ disconnected/ {ok=0} /Bot [0-9]+ connected/ {ok=1} END {exit !ok}'
+        awk -v check="$check_components" -v expected="MC-QQ-Tools components: auth=$auth_enabled sudo=$sudo_enabled" '
+            /^MC-QQ-Tools components: auth=[01] sudo=[01]$/ && !seen {components=$0; seen=1}
+            /Bot [0-9]+ disconnected/ {ok=0}
+            /Bot [0-9]+ connected/ {ok=1}
+            END {exit !(ok && (!check || components == expected))}'
 }
 wait_ready() {
     local attempt
@@ -281,13 +360,6 @@ wait_ready() {
     return 1
 }
 
-db_version() {
-    local version
-    [[ -f $1 && -s $1 && ! -L $1 ]] || return 1
-    version=$(sqlite3 -readonly -batch -bail "$1" 'PRAGMA user_version;' 2>/dev/null) || return 1
-    [[ $version =~ ^[0-9]+$ ]] || return 1
-    printf '%s\n' "$version"
-}
 db_checked_version() {
     local result
     result=$(sqlite3 -readonly -batch -bail "$1" 'PRAGMA quick_check;' 2>/dev/null) || return 1
@@ -320,11 +392,24 @@ pip_locked() {
 
 if (( update_api || update_bot )); then
     [[ $napcat == 'running healthy' || $napcat == 'running none' ]] || die 'NapCat baseline is not running.'
-    api_ready && bot_ready || die 'API or OneBot baseline health is unverified; review locally.'
+    # A healthy API can transition from Auth disabled after its database is migrated.
+    if api_ready; then
+        :
+    elif (( auth_enabled )) && { api_ready 0 "$sudo_enabled" || api_ready 0 "$((1 - sudo_enabled))"; }; then
+        update_api=1 update_bot=1
+        log 'The API currently has authorization disabled. Both services will be restarted.'
+    else
+        die 'API or OneBot baseline health is unverified; review locally.'
+    fi
+    bot_ready 0 || die 'API or OneBot baseline health is unverified; review locally.'
+    if (( ! update_bot )) && ! bot_ready; then
+        update_bot=1
+        log 'The running Bot did not report the expected components. Bot will be restarted and verified.'
+    fi
 fi
 if (( deps )); then
     phase=wheel-download
-    scratch=$(mktemp -d /tmp/mc-qq-auth-update.XXXXXXXX) || die 'Cannot create private download directory.'
+    scratch=$(mktemp -d /tmp/mc-qq-tools-update.XXXXXXXX) || die 'Cannot create private download directory.'
     repo_git show "$target:requirements.txt" >"$scratch/requirements.txt" || die 'Cannot read target lock file.'
     # Accept only pinned package entries and the platform marker used by this project.
     awk 'BEGIN { quote=sprintf("%c",34); marker="; sys_platform == " quote "win32" quote "$" }
@@ -338,7 +423,7 @@ if (( deps )); then
     log 'Target dependency wheels downloaded before stopping services.'
 fi
 
-if (( update_api || update_bot )); then
+if (( auth_enabled && (update_api || update_bot) )); then
     phase=backup
     backup_database online
 fi
@@ -346,6 +431,8 @@ phase=preflight
 clean_worktree
 [[ $(repo_git rev-parse HEAD) == "$head" && $(repo_git symbolic-ref --short HEAD) == main ]] ||
     die 'HEAD or branch changed during preflight.'
+checked_modes=$(shared_component_modes) || exit 1
+[[ $checked_modes == "$component_modes" ]] || die 'The service component modes changed during preflight.'
 phase=stop
 if (( update_bot )); then
     systemctl stop "$BOT" >/dev/null 2>&1 || die 'Failed to stop Bot.'
@@ -364,10 +451,12 @@ if (( migration )); then
 fi
 
 phase=git-update
-repo_git merge --ff-only --no-autostash --no-overwrite-ignore "$target" >/dev/null 2>&1 ||
-    die 'Fast-forward failed. Inspect the repository locally.'
+if [[ $head != "$target" ]]; then
+    repo_git merge --ff-only --no-autostash --no-overwrite-ignore "$target" >/dev/null 2>&1 ||
+        die 'Fast-forward failed. Inspect the repository locally.'
+    log "Updated source to $target."
+fi
 [[ $(repo_git rev-parse HEAD) == "$target" ]] || die 'HEAD does not match requested target.'
-log "Updated source to $target."
 if (( deps )); then
     phase=dependencies
     pip_locked install --no-index --find-links "$scratch/wheels" --only-binary=:all: \
@@ -382,6 +471,7 @@ if (( migration )); then
     done
     "$PYTHON" -B bot/migrate.py >/dev/null 2>&1 || die 'Project SQLite migration failed.'
     version=$(db_checked_version "$DB") || die 'Post-migration quick_check or schema version failed.'
+    [[ $version == "$target_schema" ]] || die 'Post-migration schema does not match the target version.'
     log "Project migration finished. Verified SQLite schema $version."
 fi
 
@@ -393,8 +483,12 @@ if (( update_api || update_bot )); then
         log "Started $API."
     fi
     phase=health
-    wait_ready api_ready || die 'API PID, loopback listener, health 200 or snapshot 401 did not verify.'
-    log 'API health verified on loopback, including snapshot HTTP 401 without credentials.'
+    wait_ready api_ready || die 'API PID, loopback listener or component health did not verify.'
+    if (( auth_enabled )); then
+        log 'API health verified on loopback, including snapshot HTTP 401 without credentials.'
+    else
+        log 'API health verified on loopback with authorization disabled.'
+    fi
     if (( update_bot )); then
         phase=restart
         attempted_starts+=("$BOT")
@@ -402,7 +496,7 @@ if (( update_api || update_bot )); then
         log "Started $BOT."
     fi
     phase=health
-    wait_ready bot_ready || die 'Bot OneBot connection did not verify. Check journald locally.'
+    wait_ready bot_ready || die 'Bot OneBot connection or loaded components did not verify. Check journald locally.'
     api_ready || die 'API health changed after checking Bot.'
     napcat=$(napcat_status) || die 'NapCat status became unavailable.'
     [[ $napcat == 'running healthy' || $napcat == 'running none' ]] || die 'NapCat is not running or healthy.'

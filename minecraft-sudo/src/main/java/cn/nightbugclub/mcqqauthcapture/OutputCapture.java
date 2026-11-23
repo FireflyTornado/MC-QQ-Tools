@@ -286,7 +286,7 @@ public final class OutputCapture {
 
     private static final class CommandLog extends AbstractAppender {
         CommandLog() {
-            super("MCQQAuthCommandOutput", null, null, true, Property.EMPTY_ARRAY);
+            super("MCQQSudoCommandOutput", null, null, true, Property.EMPTY_ARRAY);
         }
 
         @Override

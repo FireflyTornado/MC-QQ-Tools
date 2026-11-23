@@ -1,7 +1,7 @@
 # Candidate template based on the deployment conventions.
 
 [Unit]
-Description=MC-QQ-Auth NoneBot2
+Description=MC-QQ-Tools NoneBot2
 Wants=mc-qq-api.service
 After=network.target mc-qq-api.service
 

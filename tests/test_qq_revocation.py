@@ -1157,7 +1157,7 @@ commands:
                 disconnected.set()
 
         async with await asyncio.start_server(slow_reply, "127.0.0.1", 0) as server:
-            self.enterContext(patch.object(self.sudo, "HEALTH_PORT", server.sockets[0].getsockname()[1]))
+            self.enterContext(patch.object(self.sudo, "API_PORT", server.sockets[0].getsockname()[1]))
             reply = await self.command_reply("/sudo list", message_id=48)
             self.assertTrue(reply_started.is_set())
             self.assertEqual(Message(reply).extract_plain_text(), "执行超时，结果未知。")
@@ -1648,6 +1648,23 @@ commands:
             async with self.events.reconcile_lock:
                 reply = await self.command_reply("/reconcile", user=MEMBER)
                 self.assertEqual(reply.extract_plain_text(), "自定义对账忙")
+
+    async def test_help_composes_configured_text_for_each_enabled_component(self):
+        with self.configure("""
+commands:
+  help:
+    message: "群 {group_id} · /bind"
+    shared: "机器人 {bot_qq} · /help"
+    sudo: "/sudo 自定义说明"
+"""):
+            for auth, sudo, expected in (
+                (True, False, f"群 {GROUP} · /bind"),
+                (False, True, f"机器人 {BOT} · /help\n/sudo 自定义说明"),
+                (True, True, f"群 {GROUP} · /bind\n/sudo 自定义说明"),
+            ):
+                with (self.subTest(auth=auth, sudo=sudo), patch.object(self.status, "auth_enabled", auth),
+                      patch.object(self.status, "sudo_enabled", sudo)):
+                    self.assertEqual((await self.command_reply("/help")).extract_plain_text(), expected)
 
     async def test_info_requires_superuser_and_sends_png_for_both_aliases(self):
         with (

@@ -1,6 +1,5 @@
 import json
 import platform
-import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import closing
@@ -14,13 +13,11 @@ from typing import Literal, TypeVar
 import psutil
 from mcstatus import JavaServer
 
-import database
-from app_config import ConfigError, load_config
+from app_config import API_PORT, ConfigError, load_config
 
 
 UNAVAILABLE = "Unavailable"
 HEALTH_TIMEOUT = 2
-HEALTH_PORT = 18765
 MINECRAFT_TIMEOUT = 2
 CPU_SAMPLE_INTERVAL = 0.12
 OutcomeKind = Literal["reconcile", "notify"]
@@ -48,6 +45,7 @@ class HealthResult:
     latency_ms: float
     error: str | None = None
     minecraft_connections: int | None = None
+    sudo_connected: bool | None = None
 
     @property
     def summary(self) -> str:
@@ -58,18 +56,23 @@ def check_fastapi(*, include_connections: bool = False) -> HealthResult:
     """Probe the fixed loopback health endpoint."""
     started = time.monotonic()
     try:
-        with closing(HTTPConnection("127.0.0.1", HEALTH_PORT, timeout=HEALTH_TIMEOUT)) as connection:
+        with closing(HTTPConnection("127.0.0.1", API_PORT, timeout=HEALTH_TIMEOUT)) as connection:
             connection.request("GET", "/internal/health")
             with connection.getresponse() as response:
                 status = response.status
                 latency = (time.monotonic() - started) * 1000
                 connections = None
+                sudo_connected = None
                 if status == 200 and include_connections:
                     payload = _probe(lambda: json.loads(response.read(4096)))
-                    count = payload.get("minecraft_connections") if isinstance(payload, dict) else None
-                    if type(count) is int and count >= 0:
-                        connections = count
-                return HealthResult(status, latency, minecraft_connections=connections)
+                    if isinstance(payload, dict):
+                        count = payload.get("minecraft_connections")
+                        if type(count) is int and count >= 0:
+                            connections = count
+                        sudo_state = payload.get("sudo_connected")
+                        if type(sudo_state) is bool:
+                            sudo_connected = sudo_state
+                return HealthResult(status, latency, minecraft_connections=connections, sudo_connected=sudo_connected)
     except TimeoutError:
         error = "Timeout"
     except OSError:
@@ -116,6 +119,8 @@ class RuntimeStatus:
     minecraft: MinecraftStatus | None = None
     unnamed_bans: int | None = None
     active_bans: int | None = None
+    auth_enabled: bool = True
+    sudo_enabled: bool = False
 
 
 def _probe(check: Callable[[], T]) -> T | None:
@@ -144,6 +149,10 @@ def check_minecraft() -> MinecraftStatus | None:
 
 
 def _binding_status(group_id: str) -> tuple[int, int, int, int]:
+    import sqlite3
+
+    import database
+
     uri = database.DB_PATH.resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=1)) as connection, connection:
         connection.execute("BEGIN")
@@ -200,10 +209,13 @@ def _disk() -> ResourceUsage | None:
     return _usage(disk.used, disk.total, disk.percent)
 
 
-def collect_status(group_id: str, *, connected: bool, connected_for: float | None) -> RuntimeStatus:
+def collect_status(
+    group_id: str, *, connected: bool, connected_for: float | None,
+    auth_enabled: bool = True, sudo_enabled: bool = False,
+) -> RuntimeStatus:
     api = _probe(lambda: check_fastapi(include_connections=True))
     minecraft = _probe(check_minecraft)
-    binding_status = _probe(lambda: _binding_status(group_id))
+    binding_status = _probe(lambda: _binding_status(group_id)) if auth_enabled else None
     version, count, unnamed, bans = binding_status if binding_status is not None else (None, None, None, None)
     with _outcome_lock:
         reconciliation = _format_outcome(_outcomes.get("reconcile"))
@@ -211,7 +223,7 @@ def collect_status(group_id: str, *, connected: bool, connected_for: float | Non
     return RuntimeStatus(
         connected=connected,
         api=api,
-        sqlite_readable=binding_status is not None,
+        sqlite_readable=(binding_status is not None) if auth_enabled else None,
         system_name=_probe(_system_name),
         python_version=_probe(platform.python_version),
         cpu_cores=_probe(psutil.cpu_count),
@@ -228,5 +240,7 @@ def collect_status(group_id: str, *, connected: bool, connected_for: float | Non
         minecraft=minecraft,
         unnamed_bans=unnamed,
         active_bans=bans,
+        auth_enabled=auth_enabled,
+        sudo_enabled=sudo_enabled,
         checked_at=datetime.now(UTC),
     )

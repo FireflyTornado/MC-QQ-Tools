@@ -18,6 +18,13 @@ driver = get_driver()
 connected_at: WeakKeyDictionary[Bot, float] = WeakKeyDictionary()
 info_lock = asyncio.Lock()
 LOGIN_INFO_TIMEOUT = 2
+auth_enabled = True
+sudo_enabled = False
+
+
+def configure(*, auth: bool, sudo: bool) -> None:
+    global auth_enabled, sudo_enabled
+    auth_enabled, sudo_enabled = auth, sudo
 
 
 @driver.on_bot_connect
@@ -37,7 +44,14 @@ info = on_command("信息", aliases={"info"}, rule=group_rule, permission=SUPERU
 
 @help_command.handle()
 async def handle_help(bot: Bot) -> None:
-    await help_command.finish(message_config.MESSAGES.render("commands.help.message", **message_variables(bot)))
+    variables = message_variables(bot)
+    messages = message_config.MESSAGES
+    key = "commands.help.message" if auth_enabled else "commands.help.shared"
+    reply = messages.render(key, **variables)
+    if sudo_enabled:
+        reply += MessageSegment.text("\n")
+        reply += messages.render("commands.help.sudo", **variables)
+    await help_command.finish(reply)
 
 
 @ping.handle()
@@ -58,7 +72,7 @@ async def _nickname(bot: Bot) -> str | None:
         async with asyncio.timeout(LOGIN_INFO_TIMEOUT):
             identity = await bot.get_login_info()
     except Exception as exc:
-        logger.debug("[MC-QQ-AUTH] OneBot 登录信息不可用（{}）", type(exc).__name__)
+        logger.debug("[MC-QQ-Tools] OneBot 登录信息不可用（{}）", type(exc).__name__)
         return None
     if not isinstance(identity, dict) or str(identity.get("user_id")) != bot.self_id:
         return None
@@ -72,7 +86,10 @@ async def _nickname(bot: Bot) -> str | None:
 def _status_png(qq_id: str, nickname: str | None, connected: bool, connected_for: float | None) -> bytes:
     avatar = get_avatar(qq_id)
     group_id = str(TARGET_GROUP_ID)
-    status = collect_status(group_id, connected=connected, connected_for=connected_for)
+    status = collect_status(
+        group_id, connected=connected, connected_for=connected_for,
+        auth_enabled=auth_enabled, sudo_enabled=sudo_enabled,
+    )
     return render_status(status, group_id=group_id, qq_id=qq_id, nickname=nickname, avatar=avatar)
 
 
@@ -90,6 +107,6 @@ async def handle_info(bot: Bot) -> None:
         try:
             png = await asyncio.to_thread(_status_png, qq_id, nickname, connected, connected_for)
         except Exception as exc:
-            logger.warning("[MC-QQ-AUTH] 状态图生成失败（{}）", type(exc).__name__)
+            logger.warning("[MC-QQ-Tools] 状态图生成失败（{}）", type(exc).__name__)
             await info.finish(message_config.MESSAGES.render("commands.info.error", **variables))
     await info.finish(MessageSegment.image(png, cache=False))

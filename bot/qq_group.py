@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 from unicodedata import category
 
 from nonebot import get_driver
@@ -8,7 +11,8 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.adapters.onebot.v11.exception import OneBotV11AdapterException
 from nonebot.rule import Rule
 
-from message_config import MessageConfig, MessageValue
+if TYPE_CHECKING:
+    from message_config import MessageConfig, MessageValue
 
 
 TARGET_GROUP_ID = int(get_driver().config.target_group_id)

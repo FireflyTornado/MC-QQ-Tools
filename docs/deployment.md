@@ -1,4 +1,4 @@
-# 构建与部署入口
+# MC-QQ-Tools 构建与部署
 
 ## Python 3.12 环境
 
@@ -20,7 +20,7 @@ Windows 可以用 `py -3.12 -m venv .venv` 创建环境，再通过 `.venv\Scrip
 | NoneBot 与 FastAPI | `bot/.env.example` | `bot/.env` | `bot/` |
 | NapCat Compose | `napcat/.env.example` | `napcat/.env` | `napcat/` |
 | MCQQAuth 授权插件 | `minecraft-plugin/src/main/resources/config.yml` | `plugins/MCQQAuth/config.yml` | Minecraft 服务端根目录 |
-| MCQQSudo 模组 | `minecraft-sudo/src/main/resources/config.yml` 和同目录的 `sudo-allowlist.txt` | `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt` | Minecraft 服务端根目录 |
+| MCQQSudo 模组 | `minecraft-sudo/src/main/resources/config.yml` 和同目录的 `sudo-allowlist.txt` | `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt` | Minecraft 服务端根目录 |
 
 在仓库根目录复制 Bot 配置模板，已有 `.env` 时沿用当前文件。
 
@@ -30,19 +30,25 @@ cp -n bot/.env.example bot/.env
 
 `bot/.env.example` 分为公共配置、授权与通知、远程指令三段。按需填写已启用配置的占位值。将 `TARGET_GROUP_ID=0` 改为目标群的数字编号，保留 `ONEBOT_WS_URLS` 的 JSON 数组格式。OneBot Token 要与 NapCat 的实际配置一致。授权插件的 `api.token` 对应 `MC_API_TOKEN`，`MC_NOTIFY_TOKEN` 使用独立的值。进程环境变量优先于 `bot/.env`，显式空值也会覆盖文件值。Bot 和 API 在启动时读取配置，通知客户端在发送时读取。更换凭据时应同步更新调用端并重启相应服务。
 
-在仓库根目录运行 `python bot/migrate.py` 初始化或升级默认数据库 `bot/data/auth.db`。`python bot/migrate.py --db <路径>` 可为迁移命令指定其他目标。升级已有库前先做一致性备份，迁移报错时保留原库并检查原因。
+启用授权时，在仓库根目录运行 `python bot/migrate.py` 初始化或升级默认数据库 `bot/data/auth.db`。`python bot/migrate.py --db <路径>` 可为迁移命令指定其他目标。升级已有库前先做一致性备份，迁移报错时保留原库并检查原因。
 
-数据库就绪后，可在仓库根目录用 `python bot/bot.py` 和 `python -m uvicorn --app-dir bot mc_api:app --host 127.0.0.1 --port 18765` 分别启动两个进程。在 `bot/` 中也可继续使用 `python bot.py` 和 `python -m uvicorn mc_api:app --host 127.0.0.1 --port 18765`。
+可在仓库根目录用 `python bot/bot.py` 和 `python -m uvicorn --app-dir bot mc_api:app --host 127.0.0.1 --port 18765` 分别启动两个进程。在 `bot/` 中也可继续使用 `python bot.py` 和 `python -m uvicorn mc_api:app --host 127.0.0.1 --port 18765`。
+
+Bot 和 FastAPI 使用同一组组件开关，修改后重启两个进程。未设置 `MC_AUTH_ENABLED` 时，默认启用授权。未设置 `MC_SUDO_ENABLED` 时，沿用 `MC_SUDO_QQ_IDS` 的启用方式。显式设置为 `false` 会关闭对应的命令和 API 路由。两项同时启用时，凭据配置错误会停用出错的组件，另一项仍可启动。
+
+按进程配置授权凭据时，`MC_API_TOKEN` 可只在 FastAPI 服务环境中设置。Bot 启用授权时也会校验自身环境中已配置的 `MC_API_TOKEN`。`MC_NOTIFY_TOKEN` 由 Bot 发送，由 FastAPI 校验，两边须使用相同的值。停用授权时，已配置的这两个 Token 仍须与 Sudo 凭据不同。
+
+只部署 MCQQSudo 时，在现有 `bot/.env` 中设置 `MC_AUTH_ENABLED=false` 和 `MC_SUDO_ENABLED=true`，填好公共配置和 [远程指令凭据](#qq群管理指令)，即可用上述启动命令启动 Bot 和 FastAPI。授权 Token 和 SQLite 仅在启用 MCQQAuth 时需要。只部署 MCQQAuth 时，可设置 `MC_SUDO_ENABLED=false`。
 
 通知默认发送到 `http://127.0.0.1:18765/internal/mc/notify`。可用 `MC_NOTIFY_URL` 覆盖为可信网络上的直连 HTTP(S) 地址。通知请求绕过环境代理并拒绝重定向。
 
-群成员对账在 OneBot 连接成功后自动执行。在 Bot 运行配置中填写 NoneBot 的 `SUPERUSERS` JSON 数组后，配置的超级用户可在目标群使用 `/授权对账` 或 `/reconcile` 触发对账，并用 `/信息` 或 `/info` 查看状态图。群详情交叉校验依赖当前 Compose 固定的 NapCat 所提供的 `get_group_detail_info`。名单请求失败、为空、两次名单不一致或人数校验失败时，对账跳过撤权。
+启用授权时，群成员对账在 OneBot 连接成功后自动执行。配置在 `SUPERUSERS` JSON 数组中的超级用户可在目标群使用 `/授权对账` 或 `/reconcile` 触发对账。群详情交叉校验依赖当前 Compose 固定的 NapCat 所提供的 `get_group_detail_info`。名单请求失败、为空、两次名单不一致或人数校验失败时，对账跳过撤权。
 
-`/认证测试` 和 `/ping` 访问本机 `127.0.0.1:18765/internal/health`，返回状态码与耗时。超级用户触发 `/info` 后，状态图左列显示 Bot 的完整 QQ 号、昵称、头像、采集时间、有效绑定数、封禁记录数和系统资源，右列显示服务链路。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
+`/帮助`（`/help`）、`/认证测试`（`/ping`）和 `/信息`（`/info`）是共用指令。帮助按启用的组件显示指令，`/ping` 返回本机 FastAPI 的健康接口状态码与耗时，`/info` 供 `SUPERUSERS` 查看状态图。状态图显示 Bot 账号、采集时间、系统资源和服务链路。授权启用时才读取 SQLite，显示有效绑定数和封禁记录数。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
 
 封禁记录数包括所有仍有效的游戏服封禁。存在无名 UUID 封禁时，SQLite 节点下方会显示其数量。服务器优先使用具名封禁，使 Bot 能按游戏名同步绑定状态。封禁同步所需的数据库结构在 v1 升至 v2 时一次迁移完成。Minecraft 插件在启动时上报完整封禁快照。
 
-可在 `bot/.env` 设置 `MC_STATUS_ADDRESS=play.example.org:25565`，使用 Minecraft Java 服务器列表探测游戏服，并显示服务器返回的在线人数。地址留空时显示灰色「未探测」，配置读取失败时显示黄色「配置读取失败」。服务状态图上的 WSS 来自本机 API 的授权连接数，可独立显示授权通道是否连接。
+可在 `bot/.env` 设置 `MC_STATUS_ADDRESS=play.example.org:25565`，使用 Minecraft Java 服务器列表探测游戏服，并显示服务器返回的在线人数。地址留空时显示灰色「未探测」，配置读取失败时显示黄色「配置读取失败」。状态图的 Auth WSS 和 Sudo WSS 分别显示授权与指令通道。通道在线时显示绿色，离线时显示红色，API 无法提供连接信息时显示灰色。只显示已启用组件的通道。
 
 昵称来自 OneBot 的当前登录信息。Bot 通过 HTTPS 从 `q1.qlogo.cn` 按自身 QQ 号获取头像，成功缓存 30 分钟，失败缓存 1 分钟。下载不可用时使用内置机器人图标。SQLite 状态、有效绑定数和封禁数来自同一次只读事务。FastAPI 返回 HTTP 200 时亮绿灯，非 200 响应和超时亮黄灯，连接失败亮红灯。
 
@@ -87,6 +93,9 @@ info:
 
 中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。通用变量 `{group_id}` 和 `{bot_qq}` 分别是目标群号和机器人 QQ 号，可用于所有文字文案，包括状态图的标题和标签。业务变量的含义和可用字段见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。可用变量在本次渲染时缺少实际值会显示为 `—`。指令权限继续由目标群和 `SUPERUSERS` 控制。
 
+授权启用时，帮助正文继续使用原有的 `commands.help.message`。授权关闭时使用 `commands.help.shared` 展示共用命令。启用远程指令时，帮助末尾追加 `commands.help.sudo`。请将自定义的 `/sudo` 说明写在 `commands.help.sudo`，使它随组件开关显示。
+帮助正文与 `/sudo` 说明各自校验文案长度，随后合成一条群消息发送。
+
 已有绑定时，`/绑定` 统一使用 `commands.bind.already_bound`，默认提示如需更换请先使用 `/解绑`。旧配置里的 `commands.bind.frozen` 和 `commands.bind.pending` 可以删除。`/解绑` 和 `/我的绑定` 仍可显示冻结或待核实状态。
 
 已有自定义文案时，将 `commands.bind.banned_name` 中的 `{requested_mc_name}` 改为 `{mc_name}`，并将 `commands.db` 下的 `{qq_id}` 改为 `{member_qq}`。包含旧占位符的文案会回退到该项默认值。
@@ -115,7 +124,7 @@ sudo python3.12 -m venv bot/.venv
 sudo bot/.venv/bin/python -m pip install -r requirements.txt
 ```
 
-准备好 `bot/.env` 和已初始化的 SQLite 数据库后再启动服务。unit 文件采用 `root:root`、`0644`。由 root 持有的 `bot/.env` 和数据库宜使用 `0600`，`bot/data/` 宜使用 `0700`。应用从自己的目录读取 `bot/.env`。unit 的 `UMask=0077` 限制新建文件的默认权限，已有文件权限需单独核对。
+准备好 `bot/.env` 后再启动服务。启用授权的部署还需要已初始化的 SQLite 数据库。unit 文件采用 `root:root`、`0644`。由 root 持有的 `bot/.env` 和数据库宜使用 `0600`，`bot/data/` 宜使用 `0700`。应用从自己的目录读取 `bot/.env`。unit 的 `UMask=0077` 限制新建文件的默认权限，已有文件权限需单独核对。
 
 Bot 通过 `Wants=` 请求一同启动 API，通过 `After=` 排在 API 的启动作业之后。API 启动失败时 Bot 仍可保存绑定，通知失败由现有机制处理。`Type=exec` 只确认解释器已执行，API 就绪需检查本机端口和健康接口。NapCat 仍由 Compose 独立管理。
 
@@ -206,18 +215,29 @@ sudo journalctl -u mc-qq-api.service -u mc-qq-bot.service -n 100 --no-pager
 sudo journalctl -u mc-qq-api.service -u mc-qq-bot.service -f
 ```
 
-确认 `18765` 只监听 `127.0.0.1`，健康接口返回 `{"status":"ok"}`，未授权快照返回 `401`。健康接口只检查 API 进程，数据库完整性另行核验。
+确认 `18765` 只监听 `127.0.0.1`，健康接口返回 `"status":"ok"`。授权启用时，未带凭据的快照请求返回 `401`。启用 Sudo 时，`sudo_connected` 为布尔值，`false` 表示路由已挂载且游戏服尚未连接。关闭 Sudo 时该字段为 `null`。只部署 MCQQSudo 时，健康响应应包含 `"auth_enabled":false`。Bot 启动日志中的 `MC-QQ-Tools components` 记录实际加载的组件。数据库完整性另行核验。
 
 ```sh
 sudo ss -ltnp 'sport = :18765'
 curl -fsS http://127.0.0.1:18765/internal/health
+# 授权启用时执行下一条快照检查。
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
   http://127.0.0.1:18765/internal/mc/snapshot)" = 401
 ```
 
 ### 安全升级工具
 
-`deploy/update.sh` 用于 Ubuntu 24.04 上的人工升级。从生产工作目录执行，检查和升级分别选择一条命令。
+`deploy/update.sh` 用于 Ubuntu 24.04 上的人工升级。它兼容原仓库 `FireflyTornado/MC-qq-auth-BF656` 和新仓库 `FireflyTornado/MC-QQ-Tools` 的 HTTPS 与 SSH 地址。现有部署继续使用 `/opt/mc-qq-auth`，其中的运行配置、数据库、虚拟环境和 NapCat 数据可直接沿用。
+
+首次升级到支持新名称的版本使用下方手工流程，因为这一版同时更新了升级工具和 systemd 模板。安装新版工具后可更新远程地址，再用 `--check` 核对。
+
+```sh
+cd /opt/mc-qq-auth
+git remote set-url origin https://github.com/FireflyTornado/MC-QQ-Tools.git
+sudo bash deploy/update.sh --check
+```
+
+从生产工作目录执行，检查和升级分别选择一条命令。
 
 ```sh
 cd /opt/mc-qq-auth
@@ -230,18 +250,20 @@ sudo bash deploy/update.sh --apply REVIEWED_COMMIT_SHA
 - `--check --local` 只使用缓存的 `origin/main`，不联网或更新 Git 引用，因此无法确认 GitHub 是否有新提交。两种检查模式都保持源码、虚拟环境、数据库和服务原样。
 - `--apply` 接受完整的 40 位 SHA 或至少 7 位且能唯一解析的十六进制前缀。执行前将 `REVIEWED_COMMIT_SHA` 替换为已审核的 SHA。目标必须在本次取得的 `origin/main` 历史中，并能从当前 `HEAD` 快进。管理员须先核对目标完整 SHA 与 CI 结果，再决定是否进入维护窗口。工具不会查询或替代这项审核。
 
-使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、`sqlite3`、curl 和 iproute2，以及已有的 `bot/.venv`。应先在隔离 Ubuntu 上演练。首次引入工具的提交用下方的手工流程安装。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
+使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具按 `mc-qq-api.service` 和 `mc-qq-bot.service` 各自已加载的环境判定 Auth 和 Sudo 的启用状态，进程环境优先于 `bot/.env`。任一单元的组件状态无法判定，或两边对同一个组件的启用状态不一致时，工具会中止。如果修改了 unit 或 drop-in，先运行 `systemctl daemon-reload`。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
 
 Apply 按以下顺序执行。
 
 1. 验证 Git 工作区和目标。存在未解决的 Git 操作、源码修改、非忽略的未跟踪文件或与目标冲突的忽略路径时停止。当前索引和目标都必须排除 `bot/.env`、`napcat/.env`、`bot/data/`、`napcat/data/`、`bot/.venv/`。
-2. 按差异制定操作。Bot 或 API 专属代码只重启受影响服务，依赖或共享 Python 代码变更涉及两项服务，纯文档和构建变更只更新源码。systemd unit、NapCat 运行配置或 `deploy/update.sh` 有改动时，转到下方的手工流程。
+2. 按差异制定操作。Bot 或 API 专属代码只重启受影响服务，依赖或共享 Python 代码变更涉及两项服务，纯文档和构建变更只更新源码。systemd unit、NapCat 运行配置或升级工具有改动时，转到下方的手工流程。
 3. 涉及服务时先核验现有 API、Bot 和 NapCat 的健康。依赖有变化时，先按目标锁文件从 PyPI 下载 wheel。下载失败时服务保持运行。
-4. 涉及服务时先做在线 SQLite 一致性备份，再停受影响服务。需要迁移时先停 Bot 再停 API，确认两者均为 `inactive`，并在停写后再做一份备份。停写期间管理员也要暂停其他数据库写入者。
-5. 用 `git merge --ff-only --no-autostash --no-overwrite-ignore` 合入已经审核的 SHA。涉及依赖时，停服期间从预下载的 wheel 离线安装并运行 `pip check`。涉及 SQLite 结构时调用项目的 `bot/migrate.py`，并检查活动库的 `quick_check` 和 `user_version`。
-6. 启动受影响服务，先确认 API 的进程 PID、`127.0.0.1:18765` 监听、健康 `200` 和未授权快照 `401`，再确认 Bot 的当前运行实例在 journald 中记录了 OneBot 连接，且其进程有到 `127.0.0.1:13001` 的已建立连接。NapCat 保持运行。日志级别需保留 OneBot 的连接记录。
+4. 涉及服务且启用授权时，先做在线 SQLite 一致性备份，再停受影响服务。需要迁移时先停 Bot 再停 API，确认两者均为 `inactive`，并在停写后再做一份备份。停写期间管理员也要暂停其他数据库写入者。
+5. 用 `git merge --ff-only --no-autostash --no-overwrite-ignore` 合入已经审核的 SHA。涉及依赖时，停服期间从预下载的 wheel 离线安装并运行 `pip check`。启用授权时，对比活动库的 `user_version` 与目标代码的数据库版本。需要迁移时运行 `bot/migrate.py`，确认 `quick_check` 通过且数据库版本与目标一致。只部署 MCQQSudo 时可直接升级源码和依赖。
+6. 启动受影响服务，验证 API 的进程 PID、`127.0.0.1:18765` 监听和健康 `200`。按预期启用状态核对健康响应的 `auth_enabled` 和 `sudo_connected`，启用授权时再核对未授权快照返回 `401`。最后在本次 Bot 启动的 journald 日志中核对实际加载的组件与 OneBot 连接记录，并确认进程已连接 `127.0.0.1:13001`。运行中的 Bot 缺少预期组件记录时，工具会安排重启并验证。NapCat 保持运行，日志级别需保留 OneBot 的连接记录。
 
 备份保存在仓库外的 `/opt/mc-qq-auth-backups/`。目录要求 root 所有、权限 `0700`，每份备份使用独立文件名，权限 `0600`。工具使用 SQLite `.backup`，只有非空、`quick_check` 返回 `ok` 且 `user_version` 与源一致的文件才会被报告为有效备份。中断留下的文件需重新核验后才能用于恢复。
+
+重新启用 MCQQAuth 时，先确认授权数据库版本。如果当前 API 仍以 MCQQSudo 模式健康运行，可以用 `--apply` 当前 SHA 补做待执行的迁移。服务已停止时，按下方手工流程停写、备份并执行 `bot/migrate.py`。数据库版本不符时，Bot 和 API 会暂停授权功能。已正确配置的 MCQQSudo 可以继续启动。
 
 #### 失败后的人工恢复
 
@@ -254,7 +276,7 @@ Apply 按以下顺序执行。
 | `migration` | 源码已更新，数据库可能需要确认迁移结果。保持停写，核对活动库和最近一份有效备份的结构版本与完整性。 |
 | `restart`、`health` | 工具会尝试停止本次尝试启动的服务。核对实际状态、有效 unit、端口和本机日志，再决定何时启动。 |
 
-工具不会回退 Git 或恢复数据库。回到旧源码前应确认它能读取当前数据库结构。迁移可能没有逆向步骤，恢复旧备份可能丢失随后产生的绑定。需要恢复时先停写，保全当前库及最后一份有效备份，再由管理员选择恢复点。重复 Apply 同一个已落盘的 SHA 会停止，需按实际失败阶段恢复。
+工具不会回退 Git 或恢复数据库。回到旧源码前应确认它能读取当前数据库结构。迁移可能没有逆向步骤，恢复旧备份可能丢失随后产生的绑定。需要恢复时先停写，保全当前库及最后一份有效备份，再由管理员选择恢复点。对当前 SHA 执行 Apply 只处理可识别的待执行授权迁移。其他失败按上述阶段恢复。
 
 ### NapCat 容器状态说明
 
@@ -281,7 +303,7 @@ docker inspect mc-qq-napcat --format '{{.State.Status}}'
    git ls-tree -r --name-only "$target_commit" -- .env .venv bot/.env bot/.venv bot/data bot/messages.yml napcat/.env napcat/data
    ```
 
-3. 用 SQLite `.backup` 做一致性快照。以下命令在同一个 Bash 会话中执行，要求已安装 `sqlite3` CLI。遇到任一步失败都应停在备份阶段。
+3. 启用授权时用 SQLite `.backup` 做一致性快照。以下命令在同一个 Bash 会话中执行，要求已安装 `sqlite3` CLI。遇到任一步失败都应停在备份阶段。只部署 MCQQSudo 可直接执行下一步。
 
    ```sh
    db=/opt/mc-qq-auth/bot/data/auth.db
@@ -302,7 +324,7 @@ docker inspect mc-qq-napcat --format '{{.State.Status}}'
      sudo /opt/mc-qq-auth/bot/.venv/bin/python -m pip install -r requirements.txt
    ```
 
-6. 如需迁移，先确认停写后的备份非空且完整性检查通过，再运行 `sudo /opt/mc-qq-auth/bot/.venv/bin/python bot/migrate.py`。迁移成功后确认活动数据库非空，并用 `sudo sqlite3 -readonly -batch -bail "$db" 'PRAGMA integrity_check;'` 验证返回 `ok`。
+6. 授权已启用且需要迁移时，先确认停写后的备份非空且完整性检查通过，再运行 `sudo /opt/mc-qq-auth/bot/.venv/bin/python bot/migrate.py`。迁移成功后确认活动数据库非空，并用 `sudo sqlite3 -readonly -batch -bail "$db" 'PRAGMA integrity_check;'` 验证返回 `ok`。
 7. 用生产虚拟环境执行 `python -m pip check` 和 `python -m unittest discover -s tests -v`。测试使用临时 SQLite 和合成配置。若 unit 有变更，按安装步骤验证并重新加载。
 8. 先启动 API，核对回环端口、健康与未授权响应，再启动 Bot 并检查两项服务的日志。若安装、迁移、测试或健康检查失败，停止已启动的受影响服务，核对上一版本的源码和依赖以及最后一份有效备份，再决定恢复步骤。
 
@@ -333,7 +355,7 @@ include /opt/mc-qq-auth/deploy/nginx/mc-qq-api-http.conf;
 
 ### 玩家封禁名单联动
 
-在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。从旧版本升级时，运行 `python bot/migrate.py` 将数据库从 v1 迁移到 v2，然后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。停用 Sudo 时，保留在配置中的 Sudo Token 仍须与封禁名单 Token 不同。从旧版本升级时，运行 `python bot/migrate.py` 将数据库从 v1 迁移到 v2，然后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
 
 ```yaml
 banlist-watch:
@@ -353,10 +375,10 @@ banlist-watch:
 ```dotenv
 MC_SUDO_QQ_IDS=["123456789"]
 MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
-MC_SUDO_PLUGIN_TOKEN=REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN
+MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_PLUGIN_TOKEN`，该环境变量沿用原配置键名。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。Bot 启用 Sudo 时也会校验自身环境中已配置的 Mod Token。两个键同时设置时值必须一致。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
 用 JDK 17 构建 MCQQSudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
 
@@ -364,16 +386,16 @@ MC_SUDO_PLUGIN_TOKEN=REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN
 mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
 ```
 
-产物是 `minecraft-sudo/target/MCQQSudo-0.3.0.jar`，包含指令通道和输出收集器。Forge 加载 ID 为 `mcqqsudo`。MCQQAuth 授权插件可按需安装。首次启动会创建 `config/mcqqauth-sudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。填入与 FastAPI 一致的 `MC_SUDO_PLUGIN_TOKEN` 并设置 WSS 地址，修改后重启游戏服生效。
+产物是 `minecraft-sudo/target/MCQQSudo-0.3.0.jar`，包含指令通道和输出收集器。Forge 加载 ID 为 `mcqqsudo`。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
 
 ```yaml
 sudo:
   enabled: true
   websocket-url: "wss://auth.example.org/internal/mc/sudo/ws"
-  token: "REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN"
+  token: "REPLACE_WITH_MC_SUDO_MOD_TOKEN"
 ```
 
-从早期独立模组升级时，停服后用 `MCQQSudo-0.3.0.jar` 替换旧的 `mcqqauth-sudo` JAR。已有 `config/mcqqauth-sudo/` 配置和允许清单可直接沿用。
+从早期独立模组升级时，停服后替换旧模组 JAR。若已存在 `config/mcqqauth-sudo/` 且没有 `config/mcqqsudo/`，模组继续读取旧目录。要迁移路径，可在停服后把配置和允许清单一起复制到 `config/mcqqsudo/`。两个目录同时存在时，模组以新目录为准。
 
 从插件版迁移时，先停游戏服。将旧插件配置的 `sudo` 段和值、仍需使用的 `sync.reconnect-min-ms` 和 `sync.reconnect-max-ms`、以及 `sudo-allowlist.txt` 复制到模组配置目录。如果已安装旧收集器 `mcqqauth-output-capture-0.1.0.jar`，用新模组替换它。将授权插件升级到 0.7.0，或在继续使用旧插件时设其 `sudo.enabled: false`。FastAPI 同时接收一个游戏端 `/sudo` 连接。使用已有扩展回显协议的 Bot 和 FastAPI 可直接接入新模组。
 
@@ -435,9 +457,9 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 | `MC_SUDO_FILE_LINE_CHAR_THRESHOLD` | `0` | 任意一行的字符数，0 表示关闭该判断。 |
 | `MC_SUDO_TEXT_MAX_CHARS` | `1500` | 单条输出正文的总字符数，包含换行。最小值为 1。 |
 
-TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod，之后修改这三个阈值只需重启 Bot。
+TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod。Bot 和 FastAPI 共用 Sudo 启用判定，修改这三个阈值后重启两项服务。
 
-每次提交一条纯文本命令。在机器人发出结果前，新的请求会收到忙碌提示。Bot 在同一进程内保留消息 ID 5 分钟，忙碌时拒绝的指令也会登记，以忽略 OneBot 重投。去重缓存满时，Bot 暂停接收新指令，最后一次因容量拒绝的消息再过 5 分钟才恢复接收。等待满 30 秒会回复「执行超时，结果未知」。若 API 先检测到游戏端指令连接断开且仍在等回执，Bot 会立即回复「指令通道已断开，执行结果未知」，回复后释放名额。两种情况下，已经开始的指令仍可能完成，机器人不会自动重发。Bot 和 FastAPI 日志可按请求编号关联群号、QQ 号、命令和回执。要关闭功能，可把 `MC_SUDO_QQ_IDS` 置空数组并重启 Bot 和 FastAPI，或将 Mod 的 `sudo.enabled` 改为 `false` 后重启游戏服。
+每次提交一条纯文本命令。在机器人发出结果前，新的请求会收到忙碌提示。Bot 在同一进程内保留消息 ID 5 分钟，忙碌时拒绝的指令也会登记，以忽略 OneBot 重投。去重缓存满时，Bot 暂停接收新指令，最后一次因容量拒绝的消息再过 5 分钟才恢复接收。等待满 30 秒会回复「执行超时，结果未知」。若 API 先检测到游戏端指令连接断开且仍在等回执，Bot 会立即回复「指令通道已断开，执行结果未知」，回复后释放名额。两种情况下，已经开始的指令仍可能完成，机器人不会自动重发。Bot 和 FastAPI 日志可按请求编号关联群号、QQ 号、命令和回执。可在 Bot 和 FastAPI 的配置中设 `MC_SUDO_ENABLED=false` 后重启两者。将 Mod 的 `sudo.enabled` 改为 `false` 后重启游戏服也可关闭游戏端指令通道。
 
 ## 本地测试和锁文件维护
 

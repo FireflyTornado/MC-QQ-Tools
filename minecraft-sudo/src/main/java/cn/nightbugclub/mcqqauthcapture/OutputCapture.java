@@ -21,6 +21,11 @@ public final class OutputCapture {
     private static final CommandLog LOG = new CommandLog();
     private static final StackWalker STACK = StackWalker.getInstance();
 
+    @FunctionalInterface
+    interface QueuedAction<T, E extends Exception> {
+        T run() throws E;
+    }
+
     private OutputCapture() {}
 
     public static Supplier<CompletableFuture<Boolean>> begin(Consumer<String> output) {
@@ -108,15 +113,15 @@ public final class OutputCapture {
         });
     }
 
-    static <T> T callQueuedTask(Supplier<T> task) {
+    static <T, E extends Exception> T callQueuedTask(QueuedAction<T, E> task) throws E {
         Frame previous = ACTIVE.get();
         if (previous == null) {
-            return task.get();
+            return task.run();
         }
         // Commands such as reload can pump the game queue while dispatch is still on the stack.
         ACTIVE.remove();
         try {
-            return task.get();
+            return task.run();
         } finally {
             ACTIVE.set(previous);
         }

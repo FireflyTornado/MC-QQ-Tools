@@ -5,7 +5,7 @@
   "package": "cn.nightbugclub.mcqqauthcapture.mixin",
   "server": [
     "PlayerConnectionMixin", "MessageArgumentMixin", "PlayerListMixin", "ReloadCommandMixin",
-    "EventLoopMixin", "TimerQueueMixin", "CraftTaskMixin", "CraftAsyncTaskMixin"
+    "EventLoopMixin", "TimerQueueMixin", "CraftTaskMixin", "CraftAsyncTaskMixin", "CraftFutureMixin"
   ],
   "injectors": {"defaultRequire": 1}
 }

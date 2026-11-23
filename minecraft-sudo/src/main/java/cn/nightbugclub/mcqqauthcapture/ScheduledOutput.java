@@ -2,6 +2,7 @@ package cn.nightbugclub.mcqqauthcapture;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -93,10 +94,15 @@ public final class ScheduledOutput {
     }
 
     static <T> T call(Object event, Supplier<T> callback) {
-        return call(event, callback, null);
+        return call(event, callback::get, null);
     }
 
-    private static <T> T call(Object event, Supplier<T> callback, Throwable upstreamFailure) {
+    public static <T> T callFuture(Object event, Callable<T> callback) throws Exception {
+        return call(event, callback::call, null);
+    }
+
+    private static <T, E extends Exception> T call(Object event, OutputCapture.QueuedAction<T, E> callback,
+                                                    Throwable upstreamFailure) throws E {
         boolean cancelled = isCancellation(upstreamFailure);
         ScheduledOutput owner;
         synchronized (EVENTS) {
@@ -126,7 +132,7 @@ public final class ScheduledOutput {
         }
         boolean succeeded = false;
         try {
-            T value = callback.get();
+            T value = callback.run();
             succeeded = true;
             return value;
         } finally {

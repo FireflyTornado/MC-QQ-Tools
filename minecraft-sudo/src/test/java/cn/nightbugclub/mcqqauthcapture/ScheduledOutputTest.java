@@ -3,6 +3,7 @@ package cn.nightbugclub.mcqqauthcapture;
 import org.apache.logging.log4j.LogManager;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -119,5 +120,32 @@ class ScheduledOutputTest {
         ScheduledOutput.run(stillScheduled, () -> calls.add("vanilla callback"));
         assertEquals(List.of("vanilla callback"), calls);
         assertTrue(disconnected.result().isCancelled());
+    }
+
+    @Test
+    void preservesCallableValuesAndCheckedExceptionsWhileSettlingTheirEvents() throws Exception {
+        var scheduled = new ScheduledOutput();
+        var success = new Object();
+        var failure = new Object();
+        var log = LogManager.getLogger("test.schedule.callable");
+        var close = OutputCapture.begin(ignored -> {}, scheduled);
+        ScheduledOutput.enqueueTask(success);
+        ScheduledOutput.enqueueTask(failure);
+        close.get().join();
+        assertTrue(scheduled.seal());
+
+        assertEquals("return value", ScheduledOutput.callFuture(success, () -> {
+            log.error("Callable result");
+            return "return value";
+        }));
+        assertFalse(scheduled.result().isDone());
+
+        var original = new IOException("Callable failed");
+        assertSame(original, assertThrows(IOException.class, () -> ScheduledOutput.callFuture(failure, () -> {
+            log.error("Callable error");
+            throw original;
+        })));
+        assertEquals(new SudoCommands.Result("partial", "Callable result\nCallable error\n"),
+                scheduled.result().get(2, TimeUnit.SECONDS));
     }
 }

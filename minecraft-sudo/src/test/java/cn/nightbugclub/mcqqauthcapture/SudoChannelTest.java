@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;

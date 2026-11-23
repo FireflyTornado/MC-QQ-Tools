@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Server;
@@ -245,12 +245,12 @@ class SudoCommandsTest {
     void enabledConfigurationRequiresSecureChannel() {
         var config = new YamlConfiguration();
         config.set("sudo.enabled", false);
-        assertNull(SudoChannel.Settings.read(config, "auth-token"));
+        assertNull(SudoChannel.Settings.read(config));
         config.set("sudo.enabled", true);
         config.set("sudo.token", "distinct-token");
         config.set("sudo.websocket-url", "ws://example.net/internal/mc/sudo/ws");
-        assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
+        assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config));
         config.set("sudo.websocket-url", "wss://example.net/internal/mc/sudo/ws");
-        assertNotNull(SudoChannel.Settings.read(config, "auth-token"));
+        assertNotNull(SudoChannel.Settings.read(config));
     }
 }

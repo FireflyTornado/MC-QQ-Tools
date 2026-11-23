@@ -1,13 +1,13 @@
-modLoader="lowcodefml"
+modLoader="javafml"
 loaderVersion="[47,)"
 license="All Rights Reserved"
 
 [[mods]]
 modId="mcqqauth_output_capture"
-version="0.1.0"
-displayName="MCQQAuth Output Capture"
+version="0.2.0"
+displayName="MCQQAuth Sudo"
 displayTest="IGNORE_ALL_VERSION"
-description="Captures command output for the MCQQAuth plugin on Mohist 1.20.1."
+description="Runs approved QQ commands and captures their output on Mohist 1.20.1."
 
 [[dependencies.mcqqauth_output_capture]]
 modId="minecraft"

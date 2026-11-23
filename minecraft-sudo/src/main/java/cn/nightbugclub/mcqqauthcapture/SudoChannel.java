@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -31,7 +31,7 @@ final class SudoChannel implements AutoCloseable {
     private static final Gson JSON = new Gson();
 
     record Settings(URI url, String token) {
-        static Settings read(ConfigurationSection config, String authToken) {
+        static Settings read(ConfigurationSection config) {
             Object enabled = config.get("sudo.enabled");
             if (Boolean.FALSE.equals(enabled)) {
                 return null;
@@ -41,7 +41,7 @@ final class SudoChannel implements AutoCloseable {
             }
             String token = config.getString("sudo.token", "");
             if (!config.isString("sudo.token") || token.length() > 4096 || !token.matches("[A-Za-z0-9._~+/-]+=*")
-                    || token.equals(authToken) || token.equals("REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN")) {
+                    || token.equals("REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN")) {
                 throw new IllegalArgumentException("sudo.token 必须为独立的有效凭据");
             }
             URI url;

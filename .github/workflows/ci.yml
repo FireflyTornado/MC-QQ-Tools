@@ -62,8 +62,19 @@ jobs:
       - name: Build plugin
         run: mvn -B -ntp -f minecraft-plugin/pom.xml verify
 
-      - name: Build Mohist output capture mod
-        run: mvn -B -ntp -f minecraft-output-capture/pom.xml verify
+      - name: Build Mohist sudo mod
+        run: mvn -B -ntp -f minecraft-sudo/pom.xml verify
+
+      - name: Verify sudo mod JAR entries
+        shell: bash
+        run: |
+          entries="$(jar tf minecraft-sudo/target/mcqqauth-sudo-*.jar)"
+          for entry in META-INF/mods.toml mcqqauth-output-capture.mixins.json config.yml sudo-allowlist.txt cn/nightbugclub/mcqqauthcapture/SudoMod.class; do
+            if ! grep -Fxq -- "$entry" <<< "$entries"; then
+              printf 'Missing mod JAR entry: %s\n' "$entry" >&2
+              exit 1
+            fi
+          done
 
       - name: Verify plugin JAR entries
         shell: bash

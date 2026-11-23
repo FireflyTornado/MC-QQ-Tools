@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 

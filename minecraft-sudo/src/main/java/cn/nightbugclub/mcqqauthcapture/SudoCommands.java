@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import org.bukkit.Server;
 import org.bukkit.command.CommandException;
@@ -110,26 +110,23 @@ final class SudoCommands {
             dispatchFailure = e;
         } finally {
             dispatching = false;
-            complete = session == null ? CompletableFuture.completedFuture(true) : session.finish();
+            complete = session.finish();
         }
         boolean found = dispatched;
         CommandException failure = dispatchFailure;
         return complete.completeOnTimeout(false, Math.max(0, captureDeadlineMs - System.currentTimeMillis()),
                         TimeUnit.MILLISECONDS)
-                .thenApply(captured -> commandResult(feedback.output().get(), found, failure, captured, session != null));
+                .thenApply(captured -> commandResult(feedback.output().get(), found, failure, captured));
     }
 
     private static Result commandResult(BoundedCommandOutput.Snapshot output, boolean dispatched, CommandException failure,
-                                        boolean captured, boolean extended) {
+                                        boolean captured) {
         boolean empty = output.text().isEmpty() && !output.truncated();
         if (!dispatched && empty && failure == null && captured) {
             return new Result("error", "服务端未找到该命令。");
         }
         if (failure != null && empty && captured) {
             throw failure;
-        }
-        if (dispatched && empty && !extended) {
-            return new Result("ok", "命令已返回，未收到执行者反馈。扩展输出采集模块未启用。");
         }
         return new Result(!captured ? "partial" : dispatched ? "ok" : "error", output.text(), output.truncated());
     }

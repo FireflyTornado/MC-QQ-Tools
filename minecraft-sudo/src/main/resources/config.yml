@@ -1,0 +1,10 @@
+# Server-side MCQQAuth Sudo configuration.
+sudo:
+  enabled: false
+  websocket-url: ""
+  # 填写 API 的 MC_SUDO_PLUGIN_TOKEN。
+  token: ""
+
+sync:
+  reconnect-min-ms: 1000
+  reconnect-max-ms: 30000

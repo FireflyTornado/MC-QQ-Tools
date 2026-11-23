@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import org.bukkit.Server;
 import org.bukkit.command.RemoteConsoleCommandSender;
@@ -14,13 +14,18 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 import static org.objectweb.asm.Opcodes.*;
 
 final class MohistCommandFeedback {
-    record Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output) {}
+    interface Session {
+        CompletableFuture<Boolean> finish();
+    }
+
+    record Capture(RemoteConsoleCommandSender sender, Function<ScheduledOutput, Session> beginExtendedCapture) {}
 
     private record Access(Constructor<?> constructor, Method createStack, Method getSender,
                           Method visit, Class<?> visitorType, Object handle) {}
@@ -32,29 +37,28 @@ final class MohistCommandFeedback {
         this.server = server;
     }
 
-    Capture open() {
+    Capture open(CommandOutput output) {
         try {
             if (access == null) {
                 access = resolve();
             }
-            var output = new BoundedCommandOutput();
             Access methods = access;
-            Object visitor = Proxy.newProxyInstance(methods.visitorType.getClassLoader(),
-                    new Class<?>[]{methods.visitorType}, (proxy, method, args) ->
-                            output.append((String) args[0]) ? Optional.of(Boolean.TRUE) : Optional.empty());
-            Consumer<Object> appendComponent = component -> {
-                if (!output.truncated()) {
+            Consumer<Object> appendComponent = component -> output.append(buffer -> {
+                if (!buffer.truncated()) {
+                    Object visitor = Proxy.newProxyInstance(methods.visitorType.getClassLoader(),
+                            new Class<?>[]{methods.visitorType}, (proxy, method, args) ->
+                                    buffer.append((String) args[0]) ? Optional.of(Boolean.TRUE) : Optional.empty());
                     visit(methods.visit, component, visitor);
-                    output.append("\n");
+                    buffer.append("\n");
                 }
-            };
-            Consumer<String> appendString = output::append;
+            });
+            Consumer<String> appendString = text -> output.append(buffer -> buffer.append(text));
             // The address is metadata for the sender. No socket or shared RCON session is opened.
             Object source = methods.constructor.newInstance(methods.handle,
                     new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), appendComponent, appendString);
             var sender = Objects.requireNonNull(
                     (RemoteConsoleCommandSender) methods.getSender.invoke(source, methods.createStack.invoke(source)));
-            return new Capture(sender, output::snapshot);
+            return new Capture(sender, scheduled -> begin(output, scheduled));
         } catch (ReflectiveOperationException | LinkageError | ClassCastException | NullPointerException e) {
             throw new IllegalStateException("Mohist command feedback is unavailable", e);
         }
@@ -71,9 +75,22 @@ final class MohistCommandFeedback {
         Method visit = mappedMethod(component, "visit", "m_5651_", visitor);
         Method sendComponent = mappedMethod(source, "sendSystemMessage", "m_213846_", component);
         Method sendString = source.getMethod("sendMessage", String.class);
-        Object handle = server.getClass().getMethod("getServer").invoke(server);
+        Object handle = minecraftServer(server);
         return new Access(createSource(source, minecraftServer, sendComponent, sendString),
                 createStack, getSender, visit, visitor, handle);
+    }
+
+    static Object minecraftServer(Server server) throws ReflectiveOperationException {
+        return server.getClass().getMethod("getServer").invoke(server);
+    }
+
+    private static Session begin(CommandOutput output, ScheduledOutput scheduled) {
+        try {
+            var scope = OutputCapture.begin(output::appendLine, scheduled);
+            return scope::get;
+        } catch (LinkageError | RuntimeException e) {
+            return () -> CompletableFuture.completedFuture(false);
+        }
     }
 
     private static Method mappedMethod(Class<?> source, String named, String srg, Class<?>... args)

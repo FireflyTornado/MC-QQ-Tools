@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import org.bukkit.Server;
 import org.bukkit.command.CommandException;
@@ -8,7 +8,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.function.Supplier;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 final class SudoCommands {
@@ -26,7 +28,7 @@ final class SudoCommands {
     }
 
     private final Server server;
-    private final Supplier<MohistCommandFeedback.Capture> openFeedback;
+    private final Function<CommandOutput, MohistCommandFeedback.Capture> openFeedback;
     // Reload and dispatch are serialized on the Minecraft main thread.
     private Set<String> allowed;
     private boolean dispatching;
@@ -35,7 +37,7 @@ final class SudoCommands {
         this(server, allowed, new MohistCommandFeedback(server)::open);
     }
 
-    SudoCommands(Server server, Set<String> allowed, Supplier<MohistCommandFeedback.Capture> openFeedback) {
+    SudoCommands(Server server, Set<String> allowed, Function<CommandOutput, MohistCommandFeedback.Capture> openFeedback) {
         this.server = server;
         this.allowed = Set.copyOf(allowed);
         this.openFeedback = openFeedback;
@@ -77,42 +79,77 @@ final class SudoCommands {
     }
 
     Result execute(String command) {
+        return execute(command, System.currentTimeMillis()).join();
+    }
+
+    CompletableFuture<Result> execute(String command, long captureDeadlineMs) {
+        return execute(command, captureDeadlineMs, null);
+    }
+
+    CompletableFuture<Result> execute(String command, long captureDeadlineMs, ScheduledOutput scheduled) {
         if (!validCommand(command) || allowed.stream().noneMatch(
                 prefix -> command.equals(prefix) || command.startsWith(prefix + " "))) {
-            return new Result("rejected");
+            return CompletableFuture.completedFuture(new Result("rejected"));
         }
 
         String target = label(command);
         // Configured Bukkit aliases can expand to multiple commands.
         if (server.getCommandAliases().keySet().stream().anyMatch(target::equalsIgnoreCase)) {
-            return new Result("rejected");
+            return CompletableFuture.completedFuture(new Result("rejected"));
         }
+        CommandOutput output = scheduled == null ? new CommandOutput() : scheduled.output();
         MohistCommandFeedback.Capture feedback;
         try {
-            feedback = openFeedback.get();
+            feedback = openFeedback.apply(output);
         } catch (IllegalStateException e) {
-            return new Result("error", "服务端命令反馈接口不可用，指令未执行。");
+            return CompletableFuture.completedFuture(new Result("error", "服务端命令反馈接口不可用，指令未执行。"));
         }
+        MohistCommandFeedback.Session session = feedback.beginExtendedCapture().apply(scheduled);
+        CommandException dispatchFailure = null;
+        boolean dispatched = false;
+        CompletableFuture<Boolean> complete;
         dispatching = true;
         try {
-            boolean dispatched;
-            try {
-                dispatched = server.dispatchCommand(feedback.sender(), command);
-            } catch (CommandException e) {
-                var output = feedback.output().get();
-                if (output.text().isBlank() && !output.truncated()) {
-                    throw e;
-                }
-                return new Result("error", output.text(), output.truncated());
+            dispatched = server.dispatchCommand(feedback.sender(), command);
+        } catch (RuntimeException | Error failure) {
+            if (scheduled != null) {
+                scheduled.markDispatchFailure();
             }
-            var output = feedback.output().get();
-            if (!dispatched && output.text().isBlank() && !output.truncated()) {
-                return new Result("error", "服务端未找到该命令。");
+            if (failure instanceof CommandException commandFailure) {
+                dispatchFailure = commandFailure;
+            } else {
+                throw failure;
             }
-            return new Result(dispatched ? "ok" : "error", output.text(), output.truncated());
         } finally {
             dispatching = false;
+            complete = session.finish();
         }
+        boolean found = dispatched;
+        CommandException failure = dispatchFailure;
+        return complete.completeOnTimeout(false, Math.max(0, captureDeadlineMs - System.currentTimeMillis()),
+                        TimeUnit.MILLISECONDS)
+                .thenApply(captured -> {
+                    var initial = output.finishInitial();
+                    if (scheduled == null) {
+                        output.close();
+                    }
+                    return commandResult(initial, found, failure, captured);
+                });
+    }
+
+    private static Result commandResult(BoundedCommandOutput.Snapshot output, boolean dispatched, CommandException failure,
+                                        boolean captured) {
+        boolean empty = output.text().isEmpty() && !output.truncated();
+        if (!dispatched && empty && failure == null && captured) {
+            return new Result("error", "服务端未找到该命令。");
+        }
+        if (failure != null && empty && captured) {
+            throw failure;
+        }
+        if (failure != null) {
+            return new Result("error", output.text(), output.truncated());
+        }
+        return new Result(!captured ? "partial" : dispatched ? "ok" : "error", output.text(), output.truncated());
     }
 
     private static String label(String command) {

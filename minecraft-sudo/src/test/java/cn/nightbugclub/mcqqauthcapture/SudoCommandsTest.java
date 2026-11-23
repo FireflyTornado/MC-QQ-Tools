@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Server;
@@ -21,6 +21,10 @@ import java.nio.charset.StandardCharsets;
 import java.net.SocketAddress;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -61,7 +65,7 @@ class SudoCommandsTest {
         var prefixes = SudoCommands.readAllowlist(file);
         assertEquals(Set.of("whitelist add", "example:inspect world"), prefixes);
         var commands = new SudoCommands(server, prefixes,
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                ignored -> directFeedback(console));
         when(server.dispatchCommand(console, "whitelist add Steve Alex")).thenReturn(true);
         when(server.dispatchCommand(console, "example:inspect world \"夜间 测试\"")).thenReturn(true);
         assertEquals("ok", commands.execute("whitelist add Steve Alex").status());
@@ -73,7 +77,7 @@ class SudoCommandsTest {
     @Test
     void rootPrefixIncludesExactCommandAndEverySubcommand() {
         var commands = new SudoCommands(server, Set.of("whitelist"),
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                ignored -> directFeedback(console));
         when(server.dispatchCommand(eq(console), anyString())).thenReturn(true);
         for (String input : Set.of("whitelist", "whitelist on", "whitelist remove Steve", "whitelist add Alex")) {
             assertEquals("ok", commands.execute(input).status());
@@ -94,7 +98,7 @@ class SudoCommandsTest {
                 .thenAnswer(call -> commandMap.dispatch(console, call.getArgument(1, String.class)));
 
         var commands = new SudoCommands(server, Set.of("greet", "minecraft:greet"),
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                ignored -> directFeedback(console));
         try (var bukkit = mockStatic(Bukkit.class)) {
             bukkit.when(Bukkit::getPluginManager).thenReturn(mock(PluginManager.class));
             assertEquals("ok", commands.execute("greet").status());
@@ -127,22 +131,14 @@ class SudoCommandsTest {
         assertInstanceOf(FormattedCommandAlias.class, commandMap.getCommand(alias));
 
         var commands = new SudoCommands(server, Set.of(alias),
-                () -> new MohistCommandFeedback.Capture(console, new BoundedCommandOutput()::snapshot));
+                ignored -> directFeedback(console));
         assertEquals("rejected", commands.execute(alias + " argument").status());
         verify(server, never()).dispatchCommand(any(), anyString());
     }
 
     @Test
     void returnsNativeFeedbackEvenOnDispatchFailureAndIsolatesEachRequest() {
-        var commands = new SudoCommands(server, Set.of("list"), () -> {
-            var sender = mock(RemoteConsoleCommandSender.class);
-            var output = new BoundedCommandOutput();
-            doAnswer(call -> {
-                output.append(call.getArgument(0, String.class));
-                return null;
-            }).when(sender).sendMessage(anyString());
-            return new MohistCommandFeedback.Capture(sender, output::snapshot);
-        });
+        var commands = new SudoCommands(server, Set.of("list"), output -> directFeedback(senderFor(output)));
         when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("list")))
                 .thenAnswer(call -> {
                     call.getArgument(0, RemoteConsoleCommandSender.class).sendMessage("Players:\nAlex, Steve\n");
@@ -161,12 +157,93 @@ class SudoCommandsTest {
 
     @Test
     void unavailableFeedbackDoesNotDispatch() {
-        var commands = new SudoCommands(server, Set.of("list"), () -> {
+        var commands = new SudoCommands(server, Set.of("list"), ignored -> {
             throw new IllegalStateException("No compatible feedback source");
         });
         assertEquals(new SudoCommands.Result("error", "服务端命令反馈接口不可用，指令未执行。"),
                 commands.execute("list"));
         verify(server, never()).dispatchCommand(any(), anyString());
+    }
+
+    @Test
+    void waitsForTrackedOutputWithoutBlockingTheServerThreadAndPreservesItOnTimeout() {
+        var completed = new CompletableFuture<Boolean>();
+        var commands = new SudoCommands(server, Set.of("say"), output ->
+                new MohistCommandFeedback.Capture(senderFor(output), ignored -> () -> completed));
+        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("say hello"))).thenAnswer(call -> {
+            call.getArgument(0, RemoteConsoleCommandSender.class).sendMessage("hello\n");
+            return true;
+        });
+
+        var waiting = commands.execute("say hello", System.currentTimeMillis() + 30_000);
+        assertFalse(waiting.isDone());
+        assertFalse(commands.isDispatching());
+        completed.complete(true);
+        assertEquals(new SudoCommands.Result("ok", "hello\n"), waiting.join());
+
+        var incomplete = new SudoCommands(server, Set.of("say"), output ->
+                new MohistCommandFeedback.Capture(senderFor(output), ignored -> CompletableFuture::new));
+        assertEquals(new SudoCommands.Result("partial", "hello\n"), incomplete.execute("say hello"));
+
+        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("say hello"))).thenAnswer(call -> {
+            call.getArgument(0, RemoteConsoleCommandSender.class).sendMessage("Command failed\n");
+            throw new CommandException("test failure");
+        });
+        assertEquals(new SudoCommands.Result("error", "Command failed\n"), incomplete.execute("say hello"));
+    }
+
+    @Test
+    void routesLateSenderFeedbackToItsOwnScheduledResultFromAnUntrackedWorker() throws Exception {
+        var firstSender = new AtomicReference<RemoteConsoleCommandSender>();
+        var event = new Object();
+        var commands = new SudoCommands(server, Set.of("list"), output ->
+                new MohistCommandFeedback.Capture(senderFor(output), scheduled -> {
+                    var finish = OutputCapture.begin(output::appendLine, scheduled);
+                    return finish::get;
+                }));
+        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("list first"))).thenAnswer(call -> {
+            RemoteConsoleCommandSender sender = call.getArgument(0);
+            firstSender.set(sender);
+            sender.sendMessage("首轮\n");
+            ScheduledOutput.enqueueTask(event);
+            return true;
+        });
+        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("list second"))).thenAnswer(call -> {
+            call.getArgument(0, RemoteConsoleCommandSender.class).sendMessage("另一条指令\n");
+            return true;
+        });
+
+        var scheduled = new ScheduledOutput();
+        long deadline = System.currentTimeMillis() + 30_000;
+        var initial = commands.execute("list first", deadline, scheduled).join();
+        var worker = Executors.newSingleThreadExecutor();
+        try {
+            worker.submit(() -> firstSender.get().sendMessage("首轮切换后\n")).get(2, TimeUnit.SECONDS);
+            assertTrue(scheduled.seal());
+            assertEquals(new SudoCommands.Result("ok", "首轮\n"), initial);
+            assertEquals(new SudoCommands.Result("ok", "另一条指令\n"), commands.execute("list second"));
+            worker.submit(() -> firstSender.get().sendMessage("补发等待中\n")).get(2, TimeUnit.SECONDS);
+            ScheduledOutput.run(event, () -> firstSender.get().sendMessage("已跟踪任务回复\n"));
+            assertEquals(new SudoCommands.Result("ok", "首轮切换后\n补发等待中\n已跟踪任务回复\n"),
+                    scheduled.result().get(2, TimeUnit.SECONDS));
+        } finally {
+            worker.shutdownNow();
+            scheduled.abandon();
+        }
+    }
+
+    private static MohistCommandFeedback.Capture directFeedback(RemoteConsoleCommandSender sender) {
+        return new MohistCommandFeedback.Capture(sender, ignored -> () -> CompletableFuture.completedFuture(true));
+    }
+
+    private static RemoteConsoleCommandSender senderFor(CommandOutput output) {
+        var sender = mock(RemoteConsoleCommandSender.class);
+        doAnswer(call -> {
+            String text = call.getArgument(0);
+            output.append(buffer -> buffer.append(text));
+            return null;
+        }).when(sender).sendMessage(anyString());
+        return sender;
     }
 
     @Test
@@ -224,12 +301,12 @@ class SudoCommandsTest {
     void enabledConfigurationRequiresSecureChannel() {
         var config = new YamlConfiguration();
         config.set("sudo.enabled", false);
-        assertNull(SudoChannel.Settings.read(config, "auth-token"));
+        assertNull(SudoChannel.Settings.read(config));
         config.set("sudo.enabled", true);
         config.set("sudo.token", "distinct-token");
         config.set("sudo.websocket-url", "ws://example.net/internal/mc/sudo/ws");
-        assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config, "auth-token"));
+        assertThrows(IllegalArgumentException.class, () -> SudoChannel.Settings.read(config));
         config.set("sudo.websocket-url", "wss://example.net/internal/mc/sudo/ws");
-        assertNotNull(SudoChannel.Settings.read(config, "auth-token"));
+        assertNotNull(SudoChannel.Settings.read(config));
     }
 }

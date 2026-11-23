@@ -1,4 +1,4 @@
-package cn.nightbugclub.mcqqauth;
+package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -12,6 +12,9 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -28,10 +31,12 @@ final class SudoChannel implements AutoCloseable {
     private static final int PONG_TIMEOUT_SECONDS = 15;
     private static final long TTL_MS = 30_000;
     private static final long CLOCK_SKEW_MS = 1_000;
+    private static final int MAX_FOLLOWUPS = 128;
+    private static final int MAX_FOLLOWUP_UPDATES = 63;
     private static final Gson JSON = new Gson();
 
     record Settings(URI url, String token) {
-        static Settings read(ConfigurationSection config, String authToken) {
+        static Settings read(ConfigurationSection config) {
             Object enabled = config.get("sudo.enabled");
             if (Boolean.FALSE.equals(enabled)) {
                 return null;
@@ -41,7 +46,7 @@ final class SudoChannel implements AutoCloseable {
             }
             String token = config.getString("sudo.token", "");
             if (!config.isString("sudo.token") || token.length() > 4096 || !token.matches("[A-Za-z0-9._~+/-]+=*")
-                    || token.equals(authToken) || token.equals("REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN")) {
+                    || token.equals("REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN")) {
                 throw new IllegalArgumentException("sudo.token 必须为独立的有效凭据");
             }
             URI url;
@@ -59,7 +64,11 @@ final class SudoChannel implements AutoCloseable {
         }
     }
 
-    record Request(String id, String command, long deadlineMs) {
+    record Request(String id, String command, long deadlineMs, boolean streamFollowup) {
+        Request(String id, String command, long deadlineMs) {
+            this(id, command, deadlineMs, false);
+        }
+
         static Request parse(String raw) {
             JsonObject json = JsonParser.parseString(raw).getAsJsonObject();
             var id = json.getAsJsonPrimitive("id");
@@ -69,7 +78,37 @@ final class SudoChannel implements AutoCloseable {
                     || !deadline.isNumber() || !deadline.getAsString().matches("[0-9]{1,15}")) {
                 throw new IllegalArgumentException("Invalid sudo request");
             }
-            return new Request(id.getAsString(), command.getAsString(), deadline.getAsLong());
+            var stream = json.getAsJsonPrimitive("stream_followup");
+            if (stream != null && !stream.isBoolean()) {
+                throw new IllegalArgumentException("Invalid sudo followup capability");
+            }
+            return new Request(id.getAsString(), command.getAsString(), deadline.getAsLong(),
+                    stream != null && stream.getAsBoolean());
+        }
+    }
+
+    private static final class Followup {
+        final Connection source;
+        final Request request;
+        final ScheduledOutput scheduled;
+        ScheduledFuture<?> update;
+        ScheduledFuture<?> expiry;
+        int sequence;
+
+        Followup(Connection source, Request request, ScheduledOutput scheduled) {
+            this.source = source;
+            this.request = request;
+            this.scheduled = scheduled;
+        }
+
+        void close() {
+            if (update != null) {
+                update.cancel(false);
+            }
+            if (expiry != null) {
+                expiry.cancel(false);
+            }
+            scheduled.abandon();
         }
     }
 
@@ -239,29 +278,138 @@ final class SudoChannel implements AutoCloseable {
             // Claim execution under the same lock used to invalidate queued work on disconnect.
             executing = canRun;
         }
-        SudoCommands.Result result = new SudoCommands.Result("expired");
+        if (!canRun) {
+            finish(source, request, new SudoCommands.Result("expired"));
+            return;
+        }
+        ScheduledOutput scheduled = null;
+        boolean handedOff = false;
         try {
-            if (canRun) {
-                result = commands.execute(request.command);
-            }
-        } catch (RuntimeException e) {
-            result = new SudoCommands.Result("error");
-            log.warning("/sudo #" + request.id + " 执行异常（" + e.getClass().getSimpleName() + "）");
+            var output = new ScheduledOutput();
+            scheduled = output;
+            commands.execute(request.command, request.deadlineMs - CLOCK_SKEW_MS, output)
+                    .whenComplete((result, failure) -> finishExecution(source, request, result, failure, output));
+            handedOff = true;
+        } catch (VirtualMachineError | ThreadDeath fatal) {
+            throw fatal;
+        } catch (RuntimeException | Error failure) {
+            finishExecution(source, request, null, failure, scheduled);
         } finally {
-            finish(source, request, result);
+            if (!handedOff && releaseExecution(request) && scheduled != null) {
+                scheduled.abandon();
+            }
         }
     }
 
+    private void finishExecution(Connection source, Request request, SudoCommands.Result result, Throwable failure,
+                                 ScheduledOutput scheduled) {
+        if (failure != null) {
+            if (scheduled != null) {
+                scheduled.output().finishInitial();
+            }
+            log.warning("/sudo #" + request.id + " 执行异常（" + failure.getClass().getSimpleName() + "）");
+            result = new SudoCommands.Result("error");
+        }
+        finish(source, request, result, scheduled);
+    }
+
+    private synchronized boolean releaseExecution(Request request) {
+        if (running != request) {
+            return false;
+        }
+        running = null;
+        executing = false;
+        return true;
+    }
+
     private synchronized void finish(Connection source, Request request, SudoCommands.Result result) {
-        if (running == request) {
-            running = null;
-            executing = false;
+        finish(source, request, result, null);
+    }
+
+    private synchronized void finish(Connection source, Request request, SudoCommands.Result result,
+                                     ScheduledOutput scheduled) {
+        if (releaseExecution(request)) {
+            boolean tracked = active == source && scheduled != null && scheduled.seal();
+            boolean succeeded = result.status().equals("ok");
+            boolean partial = result.status().equals("partial");
+            boolean observeSender = request.streamFollowup && scheduled != null
+                    && (succeeded || partial || scheduled.failedDuringDispatch());
+            // The legacy protocol uses its status to signal that a follow-up is available.
+            boolean scheduledStatus = succeeded || (partial && !request.streamFollowup);
+            boolean sendTracked = tracked && (scheduledStatus || request.streamFollowup);
+            if (active == source && scheduled != null && (sendTracked || observeSender)) {
+                if (source.followups.size() < MAX_FOLLOWUPS) {
+                    if (tracked && scheduledStatus) {
+                        result = new SudoCommands.Result("scheduled", result.output(), result.truncated());
+                    }
+                    int seconds = tracked ? ScheduledOutput.WAIT_SECONDS : ScheduledOutput.DIRECT_REPLY_WAIT_SECONDS;
+                    var followup = new Followup(source, request, scheduled);
+                    source.followups.add(followup);
+                    reply(source, request, result, request.streamFollowup ? seconds : 0, null, true);
+                    source.sending.thenRun(() -> startFollowup(followup, seconds));
+                } else {
+                    scheduled.abandon();
+                    if (succeeded) {
+                        result = new SudoCommands.Result("partial", result.output(), result.truncated());
+                    }
+                    reply(source, request, result);
+                }
+            } else {
+                reply(source, request, result);
+                if (scheduled != null) {
+                    scheduled.abandon();
+                }
+            }
             log.info("/sudo #" + request.id + " result=" + result.status());
-            reply(source, request, result);
+        } else if (scheduled != null) {
+            scheduled.abandon();
+        }
+    }
+
+    private synchronized void startFollowup(Followup followup, int seconds) {
+        if (!followup.source.followups.contains(followup)) {
+            return;
+        }
+        var result = followup.scheduled.result();
+        if (!result.isDone()) {
+            followup.expiry = timer.schedule(followup.scheduled::expire, seconds, SECONDS);
+            if (followup.request.streamFollowup) {
+                followup.update = timer.schedule(() -> sendUpdate(followup), 1, SECONDS);
+            }
+        }
+        result.whenCompleteAsync((later, failure) -> finishFollowup(followup, later, failure));
+    }
+
+    private synchronized void sendUpdate(Followup followup) {
+        if (!followup.source.followups.contains(followup) || followup.scheduled.result().isDone()) {
+            return;
+        }
+        var output = followup.scheduled.output().takeFollowup();
+        if (!output.text().isEmpty() || output.truncated()) {
+            reply(followup.source, followup.request, new SudoCommands.Result("ok", output.text(), output.truncated()),
+                    0, followup, false);
+        }
+        if (followup.source.followups.contains(followup) && followup.sequence < MAX_FOLLOWUP_UPDATES
+                && !output.truncated() && !followup.scheduled.result().isDone()) {
+            followup.update = timer.schedule(() -> sendUpdate(followup), 1, SECONDS);
+        }
+    }
+
+    private synchronized void finishFollowup(Followup followup, SudoCommands.Result result, Throwable failure) {
+        if (followup.source.followups.remove(followup)) {
+            followup.close();
+            if (failure == null) {
+                reply(followup.source, followup.request, result, 0, followup, true);
+            }
         }
     }
 
     private synchronized void reply(Connection source, Request request, SudoCommands.Result result) {
+        reply(source, request, result, 0, null, true);
+    }
+
+    private synchronized void reply(Connection source, Request request, SudoCommands.Result result,
+                                    int waitSeconds, Followup followup, boolean finalResult) {
         if (active != source) {
             return;
         }
@@ -272,7 +420,19 @@ final class SudoChannel implements AutoCloseable {
         if (result.truncated()) {
             response.addProperty("truncated", true);
         }
-        source.socket.sendText(JSON.toJson(response), true).whenComplete((socket, failure) -> {
+        if (waitSeconds > 0) {
+            response.addProperty("wait_seconds", waitSeconds);
+        }
+        if (followup != null) {
+            response.addProperty("followup", true);
+            if (request.streamFollowup) {
+                response.addProperty("sequence", ++followup.sequence);
+                response.addProperty("final", finalResult);
+            }
+        }
+        String frame = JSON.toJson(response);
+        source.sending = source.sending.thenCompose(ignored -> source.socket.sendText(frame, true));
+        source.sending.whenComplete((socket, failure) -> {
             if (failure != null) {
                 disconnect(source, "回执发送失败");
             }
@@ -295,12 +455,16 @@ final class SudoChannel implements AutoCloseable {
 
     private final class Connection implements WebSocket.Listener {
         private final StringBuilder message = new StringBuilder();
+        private final Set<Followup> followups = new HashSet<>();
+        private CompletableFuture<WebSocket> sending = CompletableFuture.completedFuture(null);
         private WebSocket socket;
         private ScheduledFuture<?> heartbeat;
         private long ping;
         private boolean awaitingPong;
 
         private void abort() {
+            followups.forEach(Followup::close);
+            followups.clear();
             if (heartbeat != null) {
                 heartbeat.cancel(false);
             }

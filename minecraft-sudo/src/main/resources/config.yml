@@ -1,0 +1,17 @@
+# MCQQSudo 模组配置。游戏服启动时读取。
+
+# 远程指令通道。默认关闭，启用前填写地址和凭据。
+sudo:
+  enabled: false
+  # FastAPI 的 WSS 地址，路径为 /internal/mc/sudo/ws。
+  websocket-url: ""
+  # 与 Bot 和 FastAPI 共用配置中的 MC_SUDO_PLUGIN_TOKEN 一致。
+  token: ""
+
+# 指令通道断线后的重连间隔，单位为毫秒。
+sync:
+  reconnect-min-ms: 1000
+  reconnect-max-ms: 30000
+
+# 可执行的命令前缀在同目录的 sudo-allowlist.txt 中配置。
+# 在服务端控制台执行 mcqqsudo reload 可重新读取允许清单。

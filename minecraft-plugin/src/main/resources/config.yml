@@ -1,8 +1,10 @@
-# MCQQAuth Configuration
+# MCQQAuth 授权插件配置。
 
+# 准入模式
 # 新安装使用观察模式。升级时，已有配置缺少 mode 则继续使用 ENFORCE。
 mode: OBSERVE
 
+# 观察模式下向未授权玩家显示的入服提示
 observe:
   notice:
     enabled: true
@@ -16,30 +18,28 @@ observe:
       - "请加入服务器 QQ 群，并发送 /绑定 {player} 完成绑定。"
     confirm-button: "我知道了，继续游戏"
 
+# 授权 API。通过 HTTPS 获取快照，通过 WSS 接收更新通知。
 api:
   snapshot-url: "https://auth.bf656.nightbugclub.cn/internal/mc/snapshot"
   websocket-url: "wss://auth.bf656.nightbugclub.cn/internal/mc/ws"
-  # 仅在服务器的插件配置填写后端 MC_API_TOKEN。
+  # 与后端的 MC_API_TOKEN 一致，两条连接共用此凭据。
   token: ""
   connect-timeout-ms: 5000
   request-timeout-ms: 8000
 
+# 授权通道断线后的重连间隔，单位为毫秒
 sync:
   reconnect-min-ms: 1000
   reconnect-max-ms: 30000
 
+# 原版封禁名单监听与上报
 banlist-watch:
   # 启用后监听原版玩家封禁变更。上报地址和 Token 均留空时仅记录本地日志。
   enabled: false
   upload-url: ""
   token: ""
 
-sudo:
-  enabled: false
-  websocket-url: ""
-  token: ""
-  # 指令允许清单由同目录的 sudo-allowlist.txt 管理。
-
+# 强制模式下的准入及撤权提示
 messages:
   unauthorized: "此 Minecraft 游戏 ID 未获得授权，请先在 QQ 群中绑定。"
   not-ready: "授权服务暂不可用，请稍后重新连接。"

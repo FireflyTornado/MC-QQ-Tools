@@ -5,6 +5,7 @@ import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import FastAPI
 
@@ -12,7 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
 from sudo_api import sudo_router
 from app_config import ConfigError
-from sudo_config import MAX_RESULT_BYTES, SUDO_SUBMIT_PATH, SUDO_WS_PATH, SudoSettings, is_single_command, read_sudo_output_settings
+from sudo_config import (
+    MAX_RESULT_BYTES, SUDO_FOLLOWUP_PATH, SUDO_SUBMIT_PATH, SUDO_WS_PATH,
+    SudoSettings, is_single_command, read_sudo_output_settings,
+)
 
 
 class SudoOutputSettingsTests(unittest.TestCase):
@@ -52,17 +56,20 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
             "deadline_ms": time.time_ns() // 1_000_000 + round(timeout * 1000),
             **overrides,
         }
+        return await self.http("POST", SUDO_SUBMIT_PATH, token, json.dumps(payload).encode())
+
+    async def http(self, method, path, token, body=b"", *, query=b""):
         sent = []
 
         async def send(message):
             sent.append(message)
 
         async def receive():
-            return {"type": "http.request", "body": json.dumps(payload).encode()}
+            return {"type": "http.request", "body": body}
 
         await self.app({
-            "type": "http", "method": "POST", "scheme": "http", "path": SUDO_SUBMIT_PATH,
-            "headers": [(b"authorization", f"Bearer {token}".encode())], "query_string": b"",
+            "type": "http", "method": method, "scheme": "http", "path": path,
+            "headers": [(b"authorization", f"Bearer {token}".encode())], "query_string": query,
         }, receive, send)
         return sent[0]["status"], json.loads(sent[-1]["body"])
 
@@ -136,6 +143,129 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(first.done())
             self.result(incoming, request["id"])
             self.assertEqual(await first, (200, {"status": "ok", "output": "在线玩家 0/20"}))
+
+    async def test_scheduled_reply_releases_slot_and_keeps_authenticated_followup(self):
+        async with self.connect() as (_, incoming, outgoing):
+            scheduled = asyncio.create_task(self.submit(command="schedule function demo:notice 45s"))
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"], "已预约", status="scheduled")
+            self.assertEqual(await scheduled, (200, {"status": "scheduled", "output": "已预约"}))
+            path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+            self.assertEqual((await self.http("GET", path, "plugin-token"))[0], 401)
+            followup = asyncio.create_task(self.http("GET", path, "bot-token"))
+
+            second = asyncio.create_task(self.submit(request_id="b" * 32))
+            request2 = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request2["id"], "unrelated delayed", followup=True)
+            self.result(incoming, request2["id"])
+            self.assertEqual((await second)[1]["output"], "在线玩家 0/20")
+            self.assertFalse(followup.done())
+            self.result(incoming, request["id"], "完成", followup=True)
+            self.assertEqual(await asyncio.wait_for(followup, 2), (200, {"status": "ok", "output": "完成"}))
+
+    async def test_disconnect_finishes_waiting_scheduled_result(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"], "已预约", status="scheduled")
+            await first
+            path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+            followup = asyncio.create_task(self.http("GET", path, "bot-token"))
+        self.assertEqual(await asyncio.wait_for(followup, 2), (200, {"status": "disconnected"}))
+
+    async def test_stream_replays_ordered_frames_after_cursor_and_keeps_them_on_disconnect(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.assertIs(request["stream_followup"], True)
+            self.result(incoming, request["id"], "", wait_seconds=30)
+            self.result(incoming, request["id"], "第一段\n", followup=True, sequence=1, final=False)
+            self.result(incoming, request["id"], "第一段\n", followup=True, sequence=1, final=False)
+            self.result(incoming, request["id"], "第二段\n", followup=True, sequence=2, final=False)
+            self.assertEqual(await first, (200, {"status": "ok", "output": "", "wait_seconds": 30}))
+            path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+            initial = (200, {"status": "ok", "output": "第一段\n", "sequence": 1, "final": False})
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"), initial)
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"), initial)
+        self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
+                         (200, {"status": "ok", "output": "第二段\n", "sequence": 2, "final": False}))
+        self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=2"),
+                         (200, {"status": "disconnected", "sequence": 3, "final": True}))
+        self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=3"),
+                         (200, {"status": "closed"}))
+
+    async def test_stream_retains_the_initial_error_with_or_without_followup_capacity(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"], "", status="error", wait_seconds=3600)
+            self.result(incoming, request["id"], "后台任务完成", followup=True, sequence=1, final=True)
+            self.assertEqual(await first, (200, {"status": "error", "output": "", "wait_seconds": 3600}))
+            path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                             (200, {"status": "ok", "output": "后台任务完成", "sequence": 1, "final": True}))
+
+            with patch("sudo_api.MAX_FOLLOWUPS", 0):
+                second = asyncio.create_task(self.submit(request_id="b" * 32))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "命令失败", status="error", wait_seconds=3600)
+                self.assertEqual(await second, (200, {"status": "error", "output": "命令失败"}))
+
+    async def test_slow_stream_delivery_keeps_unconfirmed_frames_until_terminal_ack(self):
+        # A group can take 18 seconds to upload any one of the 30 legal TXT frames.
+        with patch("sudo_api.time", wraps=time) as clock, patch("sudo_api.FOLLOWUP_DELIVERY_RETENTION", 300):
+            clock.monotonic.return_value = 100.0
+            async with self.connect() as (_, incoming, outgoing):
+                first = asyncio.create_task(self.submit())
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=3600)
+                output = "x" * 1800
+                for sequence in range(1, 31):
+                    self.result(incoming, request["id"], output, followup=True,
+                                sequence=sequence, final=sequence == 30)
+                await first
+                path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+
+                for after in range(30):
+                    clock.monotonic.return_value = 100.0 + after * 18
+                    status, reply = await self.http("GET", path, "bot-token", query=f"after={after}".encode())
+                    self.assertEqual(status, 200)
+                    self.assertEqual(reply, {"status": "ok", "output": output,
+                                             "sequence": after + 1, "final": after == 29})
+                clock.monotonic.return_value = 640.0
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=29"),
+                                 (200, {"status": "ok", "output": output, "sequence": 30, "final": True}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=30"),
+                                 (200, {"status": "closed"}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                                 (200, {"status": "closed"}))
+
+    async def test_followup_capacity_does_not_evict_an_unconfirmed_terminal_frame(self):
+        with patch("sudo_api.MAX_FOLLOWUPS", 1):
+            async with self.connect() as (_, incoming, outgoing):
+                first = asyncio.create_task(self.submit())
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=30)
+                self.result(incoming, request["id"], "完成", followup=True, sequence=1, final=True)
+                await first
+                path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+
+                self.assertEqual((await self.http("GET", path, "bot-token", query=b"after=2"))[0], 400)
+                second = asyncio.create_task(self.submit(request_id="b" * 32))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=30)
+                self.assertEqual(await second, (200, {"status": "partial", "output": ""}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                                 (200, {"status": "ok", "output": "完成", "sequence": 1, "final": True}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
+                                 (200, {"status": "closed"}))
+
+                third = asyncio.create_task(self.submit(request_id="c" * 32))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=30)
+                self.assertEqual(await third, (200, {"status": "ok", "output": "", "wait_seconds": 30}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                                 (200, {"status": "expired"}))
 
     async def test_timeout_releases_slot_and_late_result_is_ignored(self):
         async with self.connect() as (_, incoming, outgoing):

@@ -4,13 +4,15 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi import APIRouter, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from sudo_config import (
+    MAX_FOLLOWUP_FRAMES,
     MAX_RESULT_BYTES,
     MAX_RESULT_MESSAGE_BYTES,
+    SUDO_DIRECT_REPLY_TIMEOUT,
     SUDO_FOLLOWUP_PATH,
     SUDO_FOLLOWUP_TIMEOUT,
     SUDO_SUBMIT_PATH,
@@ -38,19 +40,53 @@ class PendingCommand:
 @dataclass
 class Followup:
     plugin: WebSocket
-    result: asyncio.Future
     expires_at: float
+    streaming: bool
+    frames: list[dict] = field(default_factory=list)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    finished: bool = False
+    output_bytes: int = 0
+
+    def publish(self, result: dict, *, final: bool = True, sequence: int | None = None) -> bool:
+        if self.finished or (sequence is not None and sequence <= len(self.frames)):
+            return True
+        if sequence != (len(self.frames) + 1 if self.streaming else None):
+            return False
+        total_bytes = self.output_bytes + len(result.get("output", "").encode("utf-8"))
+        if total_bytes > MAX_RESULT_BYTES or (not final and len(self.frames) >= MAX_FOLLOWUP_FRAMES - 1):
+            return False
+        self.output_bytes = total_bytes
+        self.frames.append(result)
+        if final:
+            self.finished = True
+            self.expires_at = time.monotonic() + 300
+        self.changed.set()
+        return True
 
     def complete(self, result: dict) -> None:
-        if not self.result.done():
-            self.expires_at = time.monotonic() + 300
-            self.result.set_result(result)
+        self.publish(result, sequence=len(self.frames) + 1 if self.streaming else None)
+
+    def read(self, after: int | None) -> dict | None:
+        if after is not None and after < len(self.frames):
+            sequence = after + 1
+            return {**self.frames[after], "sequence": sequence, "final": self.finished and sequence == len(self.frames)}
+        if not self.finished:
+            return None
+        if after is not None:
+            return {"status": "closed"}
+        result = self.frames[-1].copy()
+        if len(self.frames) > 1:
+            result["output"] = "".join(frame.get("output", "") for frame in self.frames)
+            if any(frame.get("truncated", False) for frame in self.frames):
+                result["truncated"] = True
+        return result
 
 
 async def send_command(work: PendingCommand, command: str, deadline_ms: int) -> None:
     try:
         async with asyncio.timeout(SEND_TIMEOUT):
-            await work.plugin.send_json({"id": work.request_id, "command": command, "deadline_ms": deadline_ms})
+            await work.plugin.send_json({"id": work.request_id, "command": command, "deadline_ms": deadline_ms,
+                                         "stream_followup": True})
     except WebSocketDisconnect:
         if not work.result.done():
             work.result.set_result({"status": "disconnected"})
@@ -72,22 +108,31 @@ def sudo_router(
 
     def prune_followups() -> None:
         now = time.monotonic()
-        for request_id in [key for key, item in followups.items() if item.expires_at <= now]:
-            followups.pop(request_id).complete({"status": "expired"})
+        for request_id, work in list(followups.items()):
+            if work.expires_at <= now:
+                if work.finished:
+                    del followups[request_id]
+                else:
+                    work.complete({"status": "expired"})
 
     @router.get(SUDO_FOLLOWUP_PATH + "/{request_id}")
-    async def followup(request_id: str, authorization: list[str] | None = Header(default=None)):
+    async def followup(request_id: str, after: int | None = None, authorization: list[str] | None = Header(default=None)):
         if settings is None:
             raise HTTPException(404)
         if not verify_bearer(authorization, settings.bot_token.encode("ascii")):
             raise HTTPException(401)
+        if after is not None and not 0 <= after <= MAX_FOLLOWUP_FRAMES:
+            raise HTTPException(400)
         prune_followups()
         work = followups.get(request_id)
         if work is None:
             return {"status": "expired"}
         try:
             async with asyncio.timeout(15):
-                return await asyncio.shield(work.result)
+                while (result := work.read(after)) is None:
+                    work.changed.clear()
+                    await work.changed.wait()
+                return result
         except TimeoutError:
             return {"status": "waiting"}
 
@@ -190,11 +235,21 @@ def sudo_router(
                 status, output = result.get("status"), result.get("output")
                 truncated = result.get("truncated", False)
                 is_followup = result.get("followup", False)
+                wait_seconds = result.get("wait_seconds")
+                sequence = result.get("sequence")
+                final = result.get("final", True)
                 request_id = result.get("id")
                 if (
                     type(is_followup) is not bool or not isinstance(request_id, str)
                     or not isinstance(status, str)
                     or status not in (FOLLOWUP_RESULTS if is_followup else PLUGIN_RESULTS)
+                    or ("wait_seconds" in result and (type(wait_seconds) is not int or is_followup
+                        or wait_seconds not in (SUDO_DIRECT_REPLY_TIMEOUT, SUDO_FOLLOWUP_TIMEOUT)
+                        or status not in {"ok", "partial", "scheduled"}))
+                    or ("sequence" in result and (not is_followup or type(sequence) is not int
+                        or not 1 <= sequence <= MAX_FOLLOWUP_FRAMES))
+                    or (("final" in result) != ("sequence" in result))
+                    or type(final) is not bool
                     or not isinstance(output, str) or len(output) > MAX_RESULT_BYTES
                     or any(0xD800 <= ord(char) <= 0xDFFF for char in output)
                     or len(output.encode("utf-8")) > MAX_RESULT_BYTES or type(truncated) is not bool
@@ -208,23 +263,27 @@ def sudo_router(
                     prune_followups()
                     work = followups.get(request_id)
                     if work is not None and work.plugin is websocket:
-                        work.complete(reply)
+                        if not work.publish(reply, final=final, sequence=sequence):
+                            await websocket.close(code=1007)
+                            break
                     continue
                 if (
                     pending is not None and pending.plugin is websocket and not pending.result.done()
                     and request_id == pending.request_id
                 ):
-                    if status == "scheduled":
+                    if status == "scheduled" or wait_seconds is not None:
                         prune_followups()
                         if len(followups) >= MAX_FOLLOWUPS:
-                            completed = next((key for key, item in followups.items() if item.result.done()), None)
+                            completed = next((key for key, item in followups.items() if item.finished), None)
                             if completed is not None:
                                 del followups[completed]
                         if len(followups) < MAX_FOLLOWUPS:
                             followups[request_id] = Followup(
-                                websocket, asyncio.get_running_loop().create_future(),
-                                time.monotonic() + SUDO_FOLLOWUP_TIMEOUT + SUDO_TIMEOUT,
+                                websocket, time.monotonic() + (wait_seconds or SUDO_FOLLOWUP_TIMEOUT) + SUDO_TIMEOUT,
+                                streaming=wait_seconds is not None,
                             )
+                            if wait_seconds is not None:
+                                reply["wait_seconds"] = wait_seconds
                         else:
                             reply["status"] = "partial"
                     pending.result.set_result(reply)

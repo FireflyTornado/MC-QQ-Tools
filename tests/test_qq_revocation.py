@@ -499,7 +499,7 @@ events:
         )))
         self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
         submit = self.enterContext(patch.object(
-            self.sudo, "submit", return_value=("ok", "Players:\n[CQ:at,qq=all]\n", False),
+            self.sudo, "submit", return_value=self.sudo.Reply("ok", "Players:\n[CQ:at,qq=all]\n"),
         ))
         await self.bot.handle_event(self.group_message("/sudo list", user=MEMBER))
         await self.bot.handle_event(self.group_message("/sudo list", group=OTHER_GROUP))
@@ -549,7 +549,7 @@ events:
         self.enterContext(patch.object(self.sudo, "replay_cache_blocked_until", 0.0))
         clock = self.enterContext(patch.object(self.sudo, "time", wraps=self.sudo.time))
         clock.monotonic.return_value = 100.0
-        with patch.object(self.sudo, "submit", return_value=("ok", "", False)) as submit:
+        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("ok")) as submit:
             await self.command_reply("/sudo list", message_id=50)
             clock.monotonic.return_value = 120.0
             reply = await self.command_reply("/sudo say hello", message_id=51)
@@ -583,7 +583,7 @@ events:
             await loop.create_future()
 
         with patch.object(self.sudo, "asyncio", wraps=asyncio) as command_asyncio, patch.object(
-            self.sudo, "submit", side_effect=[("unknown", "", False), ("ok", "online", False)],
+            self.sudo, "submit", side_effect=[self.sudo.Reply("unknown"), self.sudo.Reply("ok", "online")],
         ) as submit:
             command_asyncio.timeout.side_effect = [deadline, asyncio.timeout(self.sudo.SUDO_TIMEOUT)]
             command_asyncio.sleep.side_effect = wait_for_deadline
@@ -656,8 +656,8 @@ events:
         self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
         error = "Incorrect argument\nlist bad<--[HERE]\n"
         with patch.object(self.sudo, "submit", side_effect=[
-            ("error", error, False), ("ok", "", False), ("disconnected", "", False),
-            ("partial", "数据包重载中\n", False), ("partial", "", False),
+            self.sudo.Reply("error", error), self.sudo.Reply("ok"), self.sudo.Reply("disconnected"),
+            self.sudo.Reply("partial", "数据包重载中\n"), self.sudo.Reply("partial"),
         ]):
             self.assertEqual(Message(await self.command_reply("/sudo list bad", message_id=43)).extract_plain_text(),
                              error)
@@ -680,10 +680,10 @@ events:
 
         async def later(*args):
             await ready.wait()
-            return "ok", "预约完成", False
+            return self.sudo.Reply("ok", "预约完成")
 
         with patch.object(self.sudo, "submit", side_effect=[
-            ("scheduled", "已预约", False), ("ok", "在线玩家", False),
+            self.sudo.Reply("scheduled", "已预约"), self.sudo.Reply("ok", "在线玩家"),
         ]) as submit, patch.object(self.sudo, "request_result", side_effect=later) as poll:
             ack = Message(await self.command_reply("/sudo schedule function demo:notice 45s", message_id=52))
             request_id = submit.await_args.args[1]["id"]
@@ -698,6 +698,36 @@ events:
                 group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n预约完成"),
             )
 
+    async def test_sudo_empty_stream_ack_and_expiry_only_when_no_output_was_captured(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
+        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("ok", wait_seconds=30)) as submit:
+            for has_output in (False, True):
+                self.send_group.reset_mock()
+                frames = [self.sudo.Reply("expired", sequence=1)]
+                if has_output:
+                    frames = [self.sudo.Reply("ok", "进度\n", sequence=1, final=False),
+                              self.sudo.Reply("ok", "结果\n", sequence=2, final=False),
+                              self.sudo.Reply("expired", sequence=3)]
+                with patch.object(self.sudo, "request_result", side_effect=frames) as poll:
+                    ack = await self.command_reply("/sudo list", message_id=70 + has_output)
+                    self.assertEqual(Message(ack).extract_plain_text(), "正在执行...")
+                    request_id = submit.await_args.args[1]["id"]
+                    tasks = tuple(self.sudo.followup_tasks)
+                    await asyncio.wait_for(asyncio.gather(*tasks), 2)
+                    path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"
+                    self.assertEqual([call.args[2] for call in poll.await_args_list],
+                                     [f"{path}?after={cursor}" for cursor in range(len(frames))])
+                    replies = ["进度\n", "结果\n"] if has_output else ["等待期间未捕获输出"]
+                    self.assertEqual(
+                        [(call.kwargs["group_id"], Message(call.kwargs["message"]).extract_plain_text())
+                         for call in self.send_group.await_args_list],
+                        [(GROUP, f"指令后续回执 {request_id}\n{reply}") for reply in replies],
+                    )
+
     async def test_sudo_uploads_exact_utf8_and_reports_unconfirmed_upload(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
             frozenset({str(ABSENT)}), "bot-token", "plugin-token",
@@ -705,7 +735,7 @@ events:
         self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
         self.enterContext(patch.object(self.sudo, "output_settings", self.sudo.SudoOutputSettings()))
         output = "服务器反馈\r\n" * 11
-        with patch.object(self.sudo, "submit", return_value=("error", output, False)) as submit, patch.object(
+        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("error", output)) as submit, patch.object(
             self.bot, "call_api", AsyncMock(side_effect=[{"file_id": "uploaded"}, {"file_id": None}]),
         ) as api:
             await self.bot.handle_event(self.group_message("/sudo list", message_id=45))

@@ -10,8 +10,18 @@ final class BoundedCommandOutput {
     record Snapshot(String text, boolean truncated) {}
 
     private final StringBuilder text = new StringBuilder();
+    private final int contentLimit;
     private int bytes;
     private boolean truncated;
+
+    BoundedCommandOutput() {
+        this(false);
+    }
+
+    BoundedCommandOutput(boolean streaming) {
+        // A streamed prefix cannot be withdrawn to make room for the truncation notice.
+        contentLimit = streaming ? MAX_BYTES - NOTICE_BYTES : MAX_BYTES;
+    }
 
     synchronized boolean append(String part) {
         for (int offset = 0; !truncated && offset < part.length();) {
@@ -21,7 +31,7 @@ final class BoundedCommandOutput {
                 codePoint = '?';
             }
             int size = utf8Bytes(codePoint);
-            if (bytes + size <= MAX_BYTES) {
+            if (bytes + size <= contentLimit) {
                 text.appendCodePoint(codePoint);
                 bytes += size;
             } else {
@@ -38,7 +48,11 @@ final class BoundedCommandOutput {
     }
 
     synchronized Snapshot snapshot() {
-        return new Snapshot(text.toString(), truncated);
+        return snapshotFrom(0);
+    }
+
+    synchronized Snapshot snapshotFrom(int offset) {
+        return new Snapshot(text.substring(offset), truncated && offset < text.length());
     }
 
     synchronized void appendLine(String line) {

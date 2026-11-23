@@ -7,6 +7,7 @@ final class CommandOutput {
 
     private BoundedCommandOutput initial = new BoundedCommandOutput();
     private BoundedCommandOutput followup;
+    private int sentChars;
     private boolean closed;
 
     // Keep a whole message in one buffer, even if a component is visited in several pieces.
@@ -33,8 +34,17 @@ final class CommandOutput {
     }
 
     synchronized BoundedCommandOutput.Snapshot finishFollowup() {
-        var snapshot = followup == null ? EMPTY : followup.snapshot();
+        var snapshot = takeFollowup();
         close();
+        return snapshot;
+    }
+
+    synchronized BoundedCommandOutput.Snapshot takeFollowup() {
+        if (followup == null) {
+            return EMPTY;
+        }
+        var snapshot = followup.snapshotFrom(sentChars);
+        sentChars += snapshot.text().length();
         return snapshot;
     }
 
@@ -46,7 +56,7 @@ final class CommandOutput {
 
     private BoundedCommandOutput followup() {
         if (followup == null) {
-            followup = new BoundedCommandOutput();
+            followup = new BoundedCommandOutput(true);
         }
         return followup;
     }

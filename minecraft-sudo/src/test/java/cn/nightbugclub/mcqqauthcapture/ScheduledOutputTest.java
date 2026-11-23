@@ -3,6 +3,7 @@ package cn.nightbugclub.mcqqauthcapture;
 import org.apache.logging.log4j.LogManager;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -46,6 +47,22 @@ class ScheduledOutputTest {
             writeRest.complete(null);
             workers.shutdownNow();
         }
+    }
+
+    @Test
+    void streamingTruncationRetainsThePublishedPrefixAndReportsTheNoticeOnce() {
+        var output = new CommandOutput();
+        output.finishInitial();
+        String prefix = "原".repeat(10_000);
+        output.append(buffer -> buffer.append(prefix));
+        assertEquals(new BoundedCommandOutput.Snapshot(prefix, false), output.takeFollowup());
+
+        output.append(buffer -> buffer.append("😀".repeat(16_384)));
+        var next = output.takeFollowup();
+        assertTrue(next.truncated());
+        assertTrue(next.text().endsWith(BoundedCommandOutput.TRUNCATION_NOTICE));
+        assertTrue((prefix + next.text()).getBytes(StandardCharsets.UTF_8).length <= BoundedCommandOutput.MAX_BYTES);
+        assertEquals(new BoundedCommandOutput.Snapshot("", false), output.finishFollowup());
     }
 
     @Test

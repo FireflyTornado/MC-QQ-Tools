@@ -8,6 +8,7 @@ import java.util.function.Supplier;
 
 public final class ScheduledOutput {
     static final int WAIT_SECONDS = 3600;
+    static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
 
@@ -118,7 +119,15 @@ public final class ScheduledOutput {
     }
 
     CompletableFuture<SudoCommands.Result> result() {
-        return result.completeOnTimeout(new SudoCommands.Result("expired"), WAIT_SECONDS, TimeUnit.SECONDS);
+        return result;
+    }
+
+    void expire() {
+        synchronized (EVENTS) {
+            if (!result.isDone()) {
+                finish("expired");
+            }
+        }
     }
 
     void abandon() {
@@ -133,9 +142,12 @@ public final class ScheduledOutput {
 
     private void finishIfReady() {
         if (sealed && pending == 0 && scheduled && !result.isDone()) {
-            var snapshot = output.finishFollowup();
-            String status = !complete ? "partial" : ran ? "ok" : "cancelled";
-            result.complete(new SudoCommands.Result(status, snapshot.text(), snapshot.truncated()));
+            finish(!complete ? "partial" : ran ? "ok" : "cancelled");
         }
+    }
+
+    private void finish(String status) {
+        var snapshot = output.finishFollowup();
+        result.complete(new SudoCommands.Result(status, snapshot.text(), snapshot.truncated()));
     }
 }

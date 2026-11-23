@@ -2,6 +2,8 @@ package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -14,6 +16,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -146,10 +149,12 @@ class SudoChannelTest {
         }
     }
 
-    @Test
-    void acknowledgesScheduleThenReleasesSlotAndReturnsCancellation() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void acknowledgesScheduleThenReleasesSlotAndReturnsCancellation(boolean streaming) throws Exception {
         try (var fixture = new ChannelFixture()) {
             var peer = fixture.connect();
+            fixture.takeNext(20, SECONDS);
             var frames = new LinkedBlockingQueue<String>();
             doAnswer(call -> {
                 frames.add(call.getArgument(0));
@@ -162,11 +167,16 @@ class SudoChannelTest {
                 close.get().join();
                 return CompletableFuture.completedFuture(new SudoCommands.Result("ok", "queued"));
             });
-            peer.send(1);
+            peer.send(1, streaming);
             fixture.tasks.remove().run();
             var ack = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals("scheduled", ack.get("status").getAsString());
             assertEquals("queued", ack.get("output").getAsString());
+            var expiry = fixture.takeNext(3600, SECONDS);
+            assertEquals(streaming, ack.has("wait_seconds"));
+            if (streaming) {
+                assertEquals(3600, ack.get("wait_seconds").getAsInt());
+            }
 
             peer.send(2);
             fixture.tasks.remove().run();
@@ -177,6 +187,62 @@ class SudoChannelTest {
             assertEquals(ack.get("id"), followup.get("id"));
             assertEquals("cancelled", followup.get("status").getAsString());
             assertTrue(followup.get("followup").getAsBoolean());
+            assertEquals(streaming, followup.has("sequence"));
+            if (streaming) {
+                assertEquals(1, followup.get("sequence").getAsInt());
+                assertTrue(followup.get("final").getAsBoolean());
+            }
+            verify(expiry.future()).cancel(false);
+        }
+    }
+
+    @Test
+    void streamsUnregisteredSenderOutputAndFlushesTheLastBatchAtThirtySeconds() throws Exception {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            fixture.takeNext(20, SECONDS); // Heartbeat is independent of the reply window.
+            var frames = new LinkedBlockingQueue<String>();
+            var sent = new CompletableFuture<WebSocket>();
+            doAnswer(call -> {
+                frames.add(call.getArgument(0));
+                return sent;
+            }).when(peer.socket).sendText(anyString(), eq(true));
+            var output = new AtomicReference<CommandOutput>();
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
+                ScheduledOutput scheduled = call.getArgument(2);
+                output.set(scheduled.output());
+                output.get().finishInitial();
+                return CompletableFuture.completedFuture(new SudoCommands.Result("ok"));
+            });
+            peer.send(1, true);
+            fixture.tasks.remove().run();
+            var ack = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("ok", ack.get("status").getAsString());
+            assertEquals(30, ack.get("wait_seconds").getAsInt());
+            assertTrue(fixture.scheduled.isEmpty(), "Window starts once the first reply is sent");
+            sent.complete(peer.socket);
+            var expiry = fixture.takeNext(30, SECONDS);
+
+            for (int sequence = 1; sequence <= 2; sequence++) {
+                String text = "late reply " + sequence;
+                output.get().appendLine(text);
+                fixture.runNext(1, SECONDS);
+                var frame = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+                assertEquals(ack.get("id"), frame.get("id"));
+                assertEquals(sequence, frame.get("sequence").getAsInt());
+                assertEquals(false, frame.get("final").getAsBoolean());
+                assertEquals(text + "\n", frame.get("output").getAsString());
+            }
+
+            output.get().appendLine("final batch");
+            expiry.action().run();
+            var last = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("expired", last.get("status").getAsString());
+            assertEquals(3, last.get("sequence").getAsInt());
+            assertTrue(last.get("final").getAsBoolean());
+            assertEquals("final batch\n", last.get("output").getAsString());
+            output.get().appendLine("ignored after expiry");
+            assertEquals("", output.get().takeFollowup().text());
         }
     }
 
@@ -259,10 +325,14 @@ class SudoChannelTest {
         }
 
         void send(int id) {
+            send(id, false);
+        }
+
+        void send(int id, boolean streamFollowup) {
             long deadline = System.currentTimeMillis() + Duration.ofSeconds(25).toMillis();
             String message = """
-                    {"id":"%032x","command":"test%d","deadline_ms":%d}
-                    """.formatted(id, id, deadline);
+                    {"id":"%032x","command":"test%d","deadline_ms":%d,"stream_followup":%b}
+                    """.formatted(id, id, deadline, streamFollowup);
             listener.onText(socket, message, true);
         }
 

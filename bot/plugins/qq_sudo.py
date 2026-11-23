@@ -4,6 +4,7 @@ import time
 import unicodedata
 from base64 import b64encode
 from collections import OrderedDict
+from dataclasses import dataclass
 from uuid import uuid4
 
 import h11
@@ -15,7 +16,9 @@ from app_config import ConfigError, load_config
 from qq_group import group_rule
 from runtime_status import HEALTH_PORT
 from sudo_config import (
+    MAX_FOLLOWUP_FRAMES,
     MAX_RESULT_MESSAGE_BYTES,
+    SUDO_DIRECT_REPLY_TIMEOUT,
     SUDO_FOLLOWUP_PATH,
     SUDO_FOLLOWUP_TIMEOUT,
     SUDO_SUBMIT_PATH,
@@ -56,6 +59,16 @@ REPLIES = {
 }
 
 
+@dataclass(frozen=True)
+class Reply:
+    status: str
+    output: str = ""
+    truncated: bool = False
+    wait_seconds: int | None = None
+    sequence: int | None = None
+    final: bool = True
+
+
 def allowed(event: GroupMessageEvent) -> bool:
     return (
         settings is not None
@@ -81,11 +94,11 @@ def command_from(event: GroupMessageEvent) -> str | None:
     return command if is_single_command(command) else None
 
 
-async def submit(token: str, payload: dict) -> tuple[str, str, bool]:
+async def submit(token: str, payload: dict) -> Reply:
     return await request_result(token, "POST", SUDO_SUBMIT_PATH, payload)
 
 
-async def request_result(token: str, method: str, path: str, payload: dict | None = None) -> tuple[str, str, bool]:
+async def request_result(token: str, method: str, path: str, payload: dict | None = None) -> Reply:
     # Socket I/O is cancellable under the handler's total deadline.
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", HEALTH_PORT)
@@ -111,32 +124,39 @@ async def request_result(token: str, method: str, path: str, payload: dict | Non
                 if event is h11.NEED_DATA:
                     protocol.receive_data(await reader.read(8192))
                 elif isinstance(event, h11.Response) and event.status_code != 200:
-                    return ("unavailable" if event.status_code in {401, 403, 404} else "unknown"), "", False
+                    return Reply("unavailable" if event.status_code in {401, 403, 404} else "unknown")
                 elif isinstance(event, h11.Data):
                     if len(raw) + len(event.data) > MAX_RESULT_MESSAGE_BYTES:
-                        return "unknown", "", False
+                        return Reply("unknown")
                     raw.extend(event.data)
                 elif isinstance(event, h11.EndOfMessage):
                     break
                 elif isinstance(event, h11.ConnectionClosed) or event is h11.PAUSED:
-                    return "unknown", "", False
+                    return Reply("unknown")
             result = json.loads(raw)
         finally:
             # Abort immediately, including if cancellation interrupted a write or read.
             writer.transport.abort()
     except (OSError, h11.ProtocolError, ValueError, RecursionError):
-        return "unknown", "", False
+        return Reply("unknown")
     if isinstance(result, dict):
         status, output = result.get("status"), result.get("output", "")
         truncated = result.get("truncated", False)
+        wait_seconds = result.get("wait_seconds")
+        sequence = result.get("sequence")
+        final = result.get("final", True)
         if (
-            isinstance(status, str) and (status in REPLIES or (method == "GET" and status == "waiting"))
+            isinstance(status, str) and (status in REPLIES or (method == "GET" and status in {"waiting", "closed"}))
             and isinstance(output, str)
             and type(truncated) is bool
+            and (wait_seconds is None or (method == "POST" and type(wait_seconds) is int
+                 and wait_seconds in {SUDO_DIRECT_REPLY_TIMEOUT, SUDO_FOLLOWUP_TIMEOUT}))
+            and (sequence is None or (method == "GET" and type(sequence) is int and 1 <= sequence <= MAX_FOLLOWUP_FRAMES))
+            and type(final) is bool and (final or sequence is not None)
             and not any(0xD800 <= ord(char) <= 0xDFFF for char in output)
         ):
-            return status, output, truncated
-    return "unknown", "", False
+            return Reply(status, output, truncated, wait_seconds, sequence, final)
+    return Reply("unknown")
 
 
 async def upload_output(bot: Bot, group_id: int, request_id: str, output: str) -> bool:
@@ -158,12 +178,15 @@ async def upload_output(bot: Bot, group_id: int, request_id: str, output: str) -
 
 
 async def render_result(bot: Bot, group_id: int, request_id: str, status: str, output: str,
-                        truncated: bool, *, followup: bool = False) -> MessageSegment | None:
+                        truncated: bool, *, followup: bool = False, sequence: int | None = None,
+                        waiting: bool = False) -> MessageSegment | None:
     text = "".join(
         char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
     )
     if truncated or (output and not text.strip()) or output_settings.use_file(output):
         filename_id = f"{request_id}-followup" if followup else request_id
+        if sequence is not None:
+            filename_id += f"-{sequence}"
         if await upload_output(bot, group_id, filename_id, output):
             if followup:
                 text = "输出已上传为文件。"
@@ -174,8 +197,10 @@ async def render_result(bot: Bot, group_id: int, request_id: str, status: str, o
         else:
             text = f"结果文件上传失败或未确认。请求编号：{request_id}"
     if not text.strip():
+        if waiting and not output and not truncated:
+            return MessageSegment.text("正在执行...")
         text = {
-            "expired": "等待任务回传已过期。",
+            "expired": "等待期间未捕获输出",
             "ok": "已安排的任务执行完毕，服务端无输出。",
             "disconnected": "指令通道已断开，无法接收任务后续结果。",
         }.get(status, REPLIES[status]) if followup else REPLIES[status]
@@ -190,30 +215,48 @@ async def render_result(bot: Bot, group_id: int, request_id: str, status: str, o
     return MessageSegment.text(text)
 
 
-async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str) -> None:
-    status, output, truncated = "expired", "", False
+async def send_followup(bot: Bot, group_id: int, request_id: str, reply: Reply) -> None:
     try:
-        async with asyncio.timeout(SUDO_FOLLOWUP_TIMEOUT + SUDO_TIMEOUT):
-            while True:
-                try:
-                    async with asyncio.timeout(20):
-                        reply = await request_result(token, "GET", f"{SUDO_FOLLOWUP_PATH}/{request_id}")
-                except TimeoutError:
-                    reply = ("unknown", "", False)
-                if reply[0] not in {"waiting", "unknown", "unavailable"}:
-                    status, output, truncated = reply
-                    break
-                if reply[0] != "waiting":
-                    await asyncio.sleep(2)
-    except TimeoutError:
-        pass
-    try:
-        message = await render_result(bot, group_id, request_id, status, output, truncated, followup=True)
+        message = await render_result(bot, group_id, request_id, reply.status, reply.output, reply.truncated,
+                                      followup=True, sequence=reply.sequence)
         if message is not None:
             async with asyncio.timeout(UPLOAD_TIMEOUT):
                 await bot.send_group_msg(group_id=group_id, message=message)
     except Exception as exc:
         logger.warning("/sudo #{} 后续结果发送失败（{}）", request_id, type(exc).__name__)
+
+
+async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str, initial: Reply) -> None:
+    path = f"{SUDO_FOLLOWUP_PATH}/{request_id}"
+    after = 0 if initial.wait_seconds is not None else None
+    received_output = bool(initial.output or initial.truncated)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + (initial.wait_seconds or SUDO_FOLLOWUP_TIMEOUT) + SUDO_TIMEOUT
+    while (remaining := deadline - loop.time()) > 0:
+        try:
+            async with asyncio.timeout(min(20, remaining)):
+                reply = await request_result(token, "GET", path if after is None else f"{path}?after={after}")
+        except TimeoutError:
+            reply = Reply("unknown")
+        if reply.status in {"waiting", "unknown", "unavailable"}:
+            if reply.status != "waiting":
+                await asyncio.sleep(max(0, min(2, deadline - loop.time())))
+            continue
+        if reply.status == "closed":
+            return
+        if reply.sequence is not None:
+            if after is None or reply.sequence != after + 1:
+                await asyncio.sleep(max(0, min(2, deadline - loop.time())))
+                continue
+            after = reply.sequence
+        has_output = bool(reply.output or reply.truncated)
+        if has_output or not received_output or reply.status not in {"ok", "expired"}:
+            await send_followup(bot, group_id, request_id, reply)
+        received_output |= has_output
+        if reply.final:
+            return
+    if not received_output:
+        await send_followup(bot, group_id, request_id, Reply("expired"))
 
 
 @sudo.handle()
@@ -253,20 +296,23 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
         }
         try:
             async with asyncio.timeout(SUDO_TIMEOUT) as wait:
-                status, output, truncated = await submit(settings.bot_token, payload)
-                if status == "unknown":
+                reply = await submit(settings.bot_token, payload)
+                if reply.status == "unknown":
                     # A broken HTTP response cannot tell us whether the plugin executed.
                     await asyncio.sleep(max(0, wait.when() - asyncio.get_running_loop().time()))
-                    status, output, truncated = "timeout", "", False
+                    reply = Reply("timeout")
         except TimeoutError:
-            status, output, truncated = "timeout", "", False
-        logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, status)
-        message = await render_result(bot, event.group_id, request_id, status, output, truncated)
-        if status == "scheduled":
+            reply = Reply("timeout")
+        logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, reply.status)
+        waiting = reply.wait_seconds is not None or reply.status == "scheduled"
+        message = await render_result(bot, event.group_id, request_id, reply.status, reply.output, reply.truncated,
+                                      waiting=waiting)
+        if waiting:
             try:
-                await sudo.send(message)
+                if message is not None:
+                    await sudo.send(message)
             finally:
-                task = asyncio.create_task(deliver_followup(bot, event.group_id, settings.bot_token, request_id))
+                task = asyncio.create_task(deliver_followup(bot, event.group_id, settings.bot_token, request_id, reply))
                 followup_tasks.add(task)
                 task.add_done_callback(followup_tasks.discard)
         elif message is not None:

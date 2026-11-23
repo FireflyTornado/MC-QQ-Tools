@@ -57,7 +57,7 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
         }
         return await self.http("POST", SUDO_SUBMIT_PATH, token, json.dumps(payload).encode())
 
-    async def http(self, method, path, token, body=b""):
+    async def http(self, method, path, token, body=b"", *, query=b""):
         sent = []
 
         async def send(message):
@@ -68,7 +68,7 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
 
         await self.app({
             "type": "http", "method": method, "scheme": "http", "path": path,
-            "headers": [(b"authorization", f"Bearer {token}".encode())], "query_string": b"",
+            "headers": [(b"authorization", f"Bearer {token}".encode())], "query_string": query,
         }, receive, send)
         return sent[0]["status"], json.loads(sent[-1]["body"])
 
@@ -171,6 +171,27 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
             path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
             followup = asyncio.create_task(self.http("GET", path, "bot-token"))
         self.assertEqual(await asyncio.wait_for(followup, 2), (200, {"status": "disconnected"}))
+
+    async def test_stream_replays_ordered_frames_after_cursor_and_keeps_them_on_disconnect(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.assertIs(request["stream_followup"], True)
+            self.result(incoming, request["id"], "", wait_seconds=30)
+            self.result(incoming, request["id"], "第一段\n", followup=True, sequence=1, final=False)
+            self.result(incoming, request["id"], "第一段\n", followup=True, sequence=1, final=False)
+            self.result(incoming, request["id"], "第二段\n", followup=True, sequence=2, final=False)
+            self.assertEqual(await first, (200, {"status": "ok", "output": "", "wait_seconds": 30}))
+            path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+            initial = (200, {"status": "ok", "output": "第一段\n", "sequence": 1, "final": False})
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"), initial)
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"), initial)
+        self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
+                         (200, {"status": "ok", "output": "第二段\n", "sequence": 2, "final": False}))
+        self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=2"),
+                         (200, {"status": "disconnected", "sequence": 3, "final": True}))
+        self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=3"),
+                         (200, {"status": "closed"}))
 
     async def test_timeout_releases_slot_and_late_result_is_ignored(self):
         async with self.connect() as (_, incoming, outgoing):

@@ -32,6 +32,13 @@ sync:
   reconnect-min-ms: 1000
   reconnect-max-ms: 30000
 
+# 原版封禁名单监听与上报
+banlist-watch:
+  # 启用后监听原版玩家封禁变更。上报地址和 Token 均留空时仅记录本地日志。
+  enabled: false
+  upload-url: ""
+  token: ""
+
 # 强制模式下的准入及撤权提示
 messages:
   unauthorized: "此 Minecraft 游戏 ID 未获得授权，请先在 QQ 群中绑定。"

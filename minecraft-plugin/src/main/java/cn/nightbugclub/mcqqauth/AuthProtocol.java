@@ -18,13 +18,17 @@ final class AuthProtocol {
     private static final Pattern NAME_KEY = Pattern.compile("[a-z0-9_]{1,16}");
     private static final Pattern VERSION = Pattern.compile("0|[1-9][0-9]*");
 
+    static boolean validPlayerName(String name) {
+        return name != null && PLAYER_NAME.matcher(name).matches();
+    }
+
     record Snapshot(long version, Set<String> activeNames) {
         Snapshot {
             activeNames = Set.copyOf(activeNames);
         }
 
         boolean allows(String playerName) {
-            return PLAYER_NAME.matcher(playerName).matches()
+            return validPlayerName(playerName)
                     && activeNames.contains(playerName.toLowerCase(Locale.ROOT));
         }
     }
@@ -32,6 +36,31 @@ final class AuthProtocol {
     enum MessageType { CONNECTED, AUTH_UPDATED }
 
     record Notice(MessageType type, long version) {}
+
+    record BanlistCursor(long generation, long sequence) {}
+
+    static BanlistCursor banlistCursor(String json) throws IOException {
+        try (JsonReader reader = reader(json)) {
+            long generation = -1;
+            long sequence = -1;
+            Set<String> fields = new HashSet<>();
+            reader.beginObject();
+            while (reader.hasNext()) {
+                switch (field(reader, fields)) {
+                    case "generation" -> generation = version(reader);
+                    case "sequence" -> sequence = version(reader);
+                    default -> reader.skipValue();
+                }
+            }
+            endObject(reader);
+            if (generation < 0) {
+                throw invalid();
+            }
+            return new BanlistCursor(generation, sequence);
+        } catch (IllegalStateException | NumberFormatException e) {
+            throw invalid();
+        }
+    }
 
     static Snapshot snapshot(byte[] body) throws IOException {
         String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();

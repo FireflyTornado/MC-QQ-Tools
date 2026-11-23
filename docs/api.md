@@ -36,6 +36,28 @@ curl --fail http://127.0.0.1:18765/internal/mc/snapshot \
 | HTTP 503 | SQLite 不可读或查询失败，`detail` 为 `Authorization database unavailable`。 |
 | HTTP 500 | 例如数据库缺少 `auth_state` 版本单行。此类情况应检查初始化和迁移。 |
 
+## GET 和 PUT /internal/mc/banlist
+
+这两个方法使用独立的 `MC_BANLIST_TOKEN`，由唯一的游戏服上报实例通过 HTTPS 调用。未配置该凭据时接口返回 HTTP 404。`GET` 返回当前会话 `{"generation":0}`，首次上报选择返回值加一作为新会话，随机生成 32 位小写十六进制的 `client_id`，从 `sequence: 1` 开始。
+
+```json
+{
+  "generation": 1,
+  "client_id": "34f4ba1441d84d6697da8356a2d837aa5",
+  "sequence": 1,
+  "entries": {"steve": null},
+  "profiles": {
+    "cf67ce55-dcd8-4d0e-acee-7bd6a47b1512": {"name": "alex", "expires_at": 1794141600123}
+  }
+}
+```
+
+`profiles` 按 UUID 上报封禁，`name` 可为 `null`。`entries` 用于没有 UUID 的具名记录。省略 `profiles` 时，`entries` 仍代表旧格式的完整具名名单。到期时间使用 Unix 毫秒，永久封禁用 `null`。只有 UUID 的档案沿用游戏服务端已确认的名称。只要 `entries` 仍含有效的同名封禁，就保留已有的 UUID 映射。仍无法关联名称的有效封禁会记录 UUID 和到期时间，由 Minecraft 服务端按 UUID 执行。Bot 按具名记录处理绑定、冻结和解封，`/info` 状态图显示仍有效的无名封禁数量。
+
+`PUT` 在 SQLite 提交后返回 HTTP 200 和 `{"generation":1,"sequence":1}`。应用时忽略已经到期的条目，重试使用过滤前的规范化快照进行幂等确认。旧会话、跳号或同号但内容不同的快照返回 HTTP 409。上报会话和最近确认位置随数据库持久化，后端重启后可继续重试。
+
+错误凭据返回 HTTP 401。请求超过 2 MiB 返回 HTTP 413，无效快照返回 HTTP 422，SQLite 暂时不可用返回 HTTP 503。插件对网络失败、HTTP 408、429 和 5xx 退避重试。首个快照遇到明确标记为 `X-MCQQ-Banlist-Conflict: generation-claimed` 的 409 时，插件重新读取游标并重试一次。其他游标冲突会停止上报，检查只部署了一个上报实例后重启插件。
+
 ## POST /internal/mc/notify
 
 使用 `Authorization: Bearer <Notify Token>`。只允许本机或受信私网访问，公网反代应拒绝该路径。Bot 在绑定事务提交后调用它，Minecraft 插件通过 WebSocket 接收后续提醒。

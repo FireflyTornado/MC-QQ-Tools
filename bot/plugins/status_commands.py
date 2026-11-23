@@ -9,7 +9,7 @@ from nonebot.permission import SUPERUSER
 
 import message_config
 from qq_avatar import get_avatar, is_qq_id
-from qq_group import TARGET_GROUP_ID, group_rule
+from qq_group import TARGET_GROUP_ID, group_rule, message_variables
 from runtime_status import check_fastapi, collect_status
 from status_image import render_status
 
@@ -36,19 +36,20 @@ info = on_command("信息", aliases={"info"}, rule=group_rule, permission=SUPERU
 
 
 @help_command.handle()
-async def handle_help() -> None:
-    await help_command.finish(message_config.MESSAGES.render("commands.help.message"))
+async def handle_help(bot: Bot) -> None:
+    await help_command.finish(message_config.MESSAGES.render("commands.help.message", **message_variables(bot)))
 
 
 @ping.handle()
-async def handle_ping() -> None:
+async def handle_ping(bot: Bot) -> None:
     result = await asyncio.to_thread(check_fastapi)
     if result.status_code is not None:
         outcome = "success"
     else:
         outcome = {"Timeout": "timeout", "Connection failed": "connection_error"}.get(result.error, "error")
     await ping.finish(message_config.MESSAGES.render(
-        f"commands.ping.{outcome}", status_code=result.status_code, latency_ms=round(result.latency_ms),
+        f"commands.ping.{outcome}", **message_variables(bot), status_code=result.status_code,
+        latency_ms=round(result.latency_ms),
     ))
 
 
@@ -70,14 +71,16 @@ async def _nickname(bot: Bot) -> str | None:
 
 def _status_png(qq_id: str, nickname: str | None, connected: bool, connected_for: float | None) -> bytes:
     avatar = get_avatar(qq_id)
-    status = collect_status(str(TARGET_GROUP_ID), connected=connected, connected_for=connected_for)
-    return render_status(status, qq_id=qq_id, nickname=nickname, avatar=avatar)
+    group_id = str(TARGET_GROUP_ID)
+    status = collect_status(group_id, connected=connected, connected_for=connected_for)
+    return render_status(status, group_id=group_id, qq_id=qq_id, nickname=nickname, avatar=avatar)
 
 
 @info.handle()
 async def handle_info(bot: Bot) -> None:
+    variables = message_variables(bot)
     if info_lock.locked():
-        await info.finish(message_config.MESSAGES.render("commands.info.busy"))
+        await info.finish(message_config.MESSAGES.render("commands.info.busy", **variables))
     async with info_lock:
         qq_id = bot.self_id if is_qq_id(bot.self_id) else ""
         nickname = await _nickname(bot) if qq_id and driver.bots.get(qq_id) is bot else None
@@ -88,5 +91,5 @@ async def handle_info(bot: Bot) -> None:
             png = await asyncio.to_thread(_status_png, qq_id, nickname, connected, connected_for)
         except Exception as exc:
             logger.warning("[MC-QQ-AUTH] 状态图生成失败（{}）", type(exc).__name__)
-            await info.finish(message_config.MESSAGES.render("commands.info.error"))
+            await info.finish(message_config.MESSAGES.render("commands.info.error", **variables))
     await info.finish(MessageSegment.image(png, cache=False))

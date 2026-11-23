@@ -1,0 +1,184 @@
+package cn.nightbugclub.mcqqauth;
+
+import org.bukkit.BanEntry;
+import org.bukkit.BanList;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.Server;
+import org.bukkit.ban.ProfileBanList;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.profile.PlayerProfile;
+import org.bukkit.scheduler.BukkitScheduler;
+import org.bukkit.scheduler.BukkitTask;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.*;
+
+class BanListMonitorTest {
+    @TempDir
+    Path directory;
+
+    private final Plugin plugin = mock(Plugin.class);
+    private final Logger logger = mock(Logger.class);
+    private final ProfileBanList list = mock(ProfileBanList.class);
+    private final BukkitScheduler scheduler = mock(BukkitScheduler.class);
+    private final ScheduledExecutorService timer = mock(ScheduledExecutorService.class);
+    private final Clock clock = mock(Clock.class);
+    private final BlockingQueue<Runnable> mainTasks = new LinkedBlockingQueue<>();
+    private final List<Set<BanListMonitor.PlayerBan>> reports = new ArrayList<>();
+
+    @BeforeEach
+    void setUp() {
+        Server server = mock(Server.class);
+        when(plugin.getServer()).thenReturn(server);
+        when(plugin.getLogger()).thenReturn(logger);
+        when(server.getScheduler()).thenReturn(scheduler);
+        when(server.<ProfileBanList>getBanList(BanList.Type.PROFILE)).thenReturn(list);
+        when(clock.instant()).thenReturn(Instant.parse("2026-11-19T02:00:00Z"));
+        when(scheduler.runTask(eq(plugin), any(Runnable.class))).thenAnswer(call -> {
+            mainTasks.add(call.getArgument(1));
+            return mock(BukkitTask.class);
+        });
+    }
+
+    @Test
+    void fileCreationAndReplacementRefreshTheLiveListAndDuplicateWritesDoNotLogChanges() throws Exception {
+        Path banFile = directory.resolve("banned-players.json");
+        when(list.getEntries()).thenReturn(Set.of());
+        try (var monitor = new BanListMonitor(plugin, banFile, clock, reports::add)) {
+            monitor.start();
+            runQueuedRefresh();
+            verify(logger).info(contains("当前有效封禁 0 条"));
+            assertEquals(List.of(Set.of()), reports);
+
+            var playerBan = ban(null);
+            when(list.getEntries()).thenReturn(Set.of(playerBan));
+            Files.writeString(banFile, "[");
+            runQueuedRefresh();
+            verify(logger).info(contains("0 → 1"));
+
+            Files.writeString(banFile, "[]");
+            runQueuedRefresh();
+            verify(logger, times(1)).info(contains("名单已变化"));
+            assertEquals(2, reports.size());
+
+            when(list.getEntries()).thenReturn(Set.of());
+            Path replacement = Files.writeString(directory.resolve("replacement.json"), "[]");
+            Files.move(replacement, banFile, StandardCopyOption.REPLACE_EXISTING);
+            runQueuedRefresh();
+            verify(logger).info(contains("1 → 0"));
+            assertEquals(3, reports.size());
+            assertTrue(reports.get(2).isEmpty());
+        }
+    }
+
+    @Test
+    void wallClockExpirationQueuesTheMainThreadWithoutWaitingForBukkitTicks() throws Exception {
+        Instant expiration = clock.instant().plusMillis(1001);
+        var playerBan = ban(expiration);
+        when(list.getEntries()).thenReturn(Set.of(playerBan));
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"),
+                clock, reports::add, timer)) {
+            monitor.start();
+            runQueuedRefresh();
+            verify(logger).info(contains("当前有效封禁 1 条"));
+            var timeout = ArgumentCaptor.forClass(Runnable.class);
+            verify(timer).schedule(timeout.capture(), eq(1001L), eq(MILLISECONDS));
+            verify(scheduler, never()).runTaskLater(eq(plugin), any(Runnable.class), anyLong());
+
+            when(clock.instant()).thenReturn(expiration);
+            timeout.getValue().run();
+            assertEquals(1, reports.size());
+            runQueuedRefresh();
+            verify(logger).info(contains("1 → 0"));
+            assertEquals(2, reports.size());
+            assertTrue(reports.get(1).isEmpty());
+            verify(timer, times(1)).schedule(any(Runnable.class), anyLong(), eq(MILLISECONDS));
+        }
+        verify(timer).shutdownNow();
+    }
+
+    @Test
+    void failedReadDoesNotPublishAnEmptySnapshotAndQueuesOneRetry() throws Exception {
+        when(list.getEntries()).thenThrow(new IllegalStateException()).thenReturn(Set.of());
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"),
+                clock, reports::add, timer)) {
+            monitor.start();
+            runQueuedRefresh();
+            assertTrue(reports.isEmpty());
+            var retry = ArgumentCaptor.forClass(Runnable.class);
+            verify(timer).schedule(retry.capture(), eq(5_000L), eq(MILLISECONDS));
+            retry.getValue().run();
+            assertTrue(reports.isEmpty());
+            runQueuedRefresh();
+            assertEquals(List.of(Set.of()), reports);
+        }
+    }
+
+    @Test
+    void uuidOnlyBansUseLocallyKnownNamesAndUnresolvedProfilesDoNotBlockTheSnapshot() throws Exception {
+        UUID missingName = UUID.randomUUID();
+        UUID cachedName = UUID.randomUUID();
+        var offline = mock(OfflinePlayer.class);
+        when(plugin.getServer().getOfflinePlayer(cachedName)).thenReturn(offline);
+        when(offline.getName()).thenReturn("Alex");
+        var unresolved = ban(missingName, null, null);
+        var cached = ban(cachedName, null, null);
+        var named = ban(null);
+        when(list.getEntries()).thenReturn(Set.of(unresolved, cached, named));
+        try (var monitor = new BanListMonitor(plugin, directory.resolve("banned-players.json"), clock, reports::add)) {
+            monitor.start();
+            runQueuedRefresh();
+            assertEquals(3, reports.get(0).size());
+            var byId = reports.get(0).stream().collect(java.util.stream.Collectors.toMap(
+                    BanListMonitor.PlayerBan::uuid, player -> player));
+            assertNull(byId.get(missingName).name());
+            assertEquals("Alex", byId.get(cachedName).name());
+            assertTrue(reports.get(0).stream().anyMatch(player -> "Steve".equals(player.name())));
+        }
+    }
+
+    private void runQueuedRefresh() throws InterruptedException {
+        Runnable task = mainTasks.poll(5, TimeUnit.SECONDS);
+        assertNotNull(task, "Expected a refresh on the Bukkit scheduler");
+        task.run();
+    }
+
+    private static BanEntry<PlayerProfile> ban(Instant expiration) {
+        return ban(UUID.randomUUID(), "Steve", expiration);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static BanEntry<PlayerProfile> ban(UUID uuid, String name, Instant expiration) {
+        BanEntry<PlayerProfile> entry = mock(BanEntry.class);
+        PlayerProfile profile = mock(PlayerProfile.class);
+        when(profile.getUniqueId()).thenReturn(uuid);
+        when(profile.getName()).thenReturn(name);
+        when(entry.getBanTarget()).thenReturn(profile);
+        when(entry.getExpiration()).thenReturn(expiration == null ? null : Date.from(expiration));
+        return entry;
+    }
+}

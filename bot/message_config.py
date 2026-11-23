@@ -23,10 +23,12 @@ DEFAULTS = MappingProxyType({
     ),
     "events.leave.enabled": False,
     "events.leave.revoked": "成员已退出群聊。Minecraft 授权已自动撤销。",
+    "events.leave.retained": "成员已退出群聊。Minecraft 绑定仍保留。",
     "events.leave.no_binding": "成员已退出群聊。",
     "events.leave.failed": "成员已退出群聊。Minecraft 授权撤销暂未确认。",
     "events.kick.enabled": False,
     "events.kick.revoked": "成员已被移出群聊。Minecraft 授权已自动撤销。",
+    "events.kick.retained": "成员已被移出群聊。Minecraft 绑定仍保留。",
     "events.kick.no_binding": "成员已被移出群聊。",
     "events.kick.failed": "成员已被移出群聊。Minecraft 授权撤销暂未确认。",
     "commands.bind.usage": "用法：/绑定 Minecraft玩家名",
@@ -34,11 +36,16 @@ DEFAULTS = MappingProxyType({
     "commands.bind.invalid_name": "游戏 ID 格式不正确。\n请填写由英文字母、数字或下划线组成的游戏 ID，最多 16 位。",
     "commands.bind.already_bound": "你已经绑定了游戏 ID：{mc_name}\n如需更换，请先使用 /解绑",
     "commands.bind.name_taken": "该游戏 ID 已经被绑定，无法重复绑定。",
+    "commands.bind.banned_name": "游戏 ID {mc_name} 已被 Minecraft 服务器封禁，暂时无法绑定。",
     "commands.bind.error": "绑定服务发生错误，请稍后重试",
     "commands.unbind.success": "解绑成功！\n原 Minecraft ID：{mc_name}\n绑定记录已删除。",
     "commands.unbind.not_bound": "你当前没有有效的绑定记录。",
+    "commands.unbind.frozen": "你绑定的 Minecraft ID {mc_name} 处于封禁冻结状态，暂时无法解绑。",
+    "commands.unbind.pending": "你绑定的 Minecraft ID {mc_name} 已解封，正在核实群成员身份，暂时无法解绑。",
     "commands.unbind.error": "解绑失败，请稍后重试",
     "commands.binding.success": "当前绑定的 Minecraft ID：{mc_name}",
+    "commands.binding.frozen": "当前绑定的 Minecraft ID：{mc_name}\n状态：封禁冻结。",
+    "commands.binding.pending": "当前绑定的 Minecraft ID：{mc_name}\n状态：已解封，正在核实群成员身份。",
     "commands.binding.not_bound": "你还没有绑定 Minecraft 游戏 ID。\n请使用 /绑定 玩家名",
     "commands.binding.error": "查询失败，请稍后重试",
     "commands.ping.success": "[MC-QQ-Auth] Ping\nFastAPI Health: HTTP {status_code}\nLatency: {latency_ms} ms",
@@ -48,6 +55,35 @@ DEFAULTS = MappingProxyType({
     "commands.reconcile.success": "授权对账完成，已撤销 {count} 条离群绑定。",
     "commands.reconcile.failed": "授权对账未完成，请检查群成员名单和服务日志。",
     "commands.reconcile.busy": "授权对账正在执行，请稍后重试。",
+    "commands.db.usage": (
+        "/db add <QQ号> <游戏名> · 添加绑定\n"
+        "/db rm <QQ号或游戏名> · 删除有效绑定\n"
+        "/db get <QQ号或游戏名> · 查询绑定\n"
+        "纯数字有歧义时，用 qq: 或 mc: 指定类型。"
+    ),
+    "commands.db.add_usage": "用法：/db add <QQ号> <游戏名>",
+    "commands.db.rm_usage": "用法：/db rm <QQ号或游戏名>，可加 qq: 或 mc: 前缀。",
+    "commands.db.get_usage": "用法：/db get <QQ号或游戏名>，可加 qq: 或 mc: 前缀。",
+    "commands.db.invalid_qq": "QQ 号格式不正确，请输入 QQ 号的数字。",
+    "commands.db.invalid_name": "游戏名须由 1–16 位英文字母、数字或下划线组成。",
+    "commands.db.members_unverified": "暂时无法核实目标群成员，请稍后重试。",
+    "commands.db.not_member": "QQ {member_qq} 当前不在目标群，无法添加绑定。",
+    "commands.db.success": "已添加绑定：{member_qq} ↔ {mc_name}〔有效〕",
+    "commands.db.already_same": "已绑定：{member_qq} ↔ {mc_name}〔有效〕",
+    "commands.db.already_bound": "QQ {member_qq} 已有绑定：{mc_name}〔有效〕。",
+    "commands.db.already_frozen": "{member_qq} ↔ {mc_name}〔封禁冻结〕，请先在游戏服解封。",
+    "commands.db.already_pending": "{member_qq} ↔ {mc_name}〔待核实群成员〕，可用 /授权对账 触发检查。",
+    "commands.db.name_taken": "游戏名 {mc_name} 已被其他绑定占用。",
+    "commands.db.banned_name": "游戏名 {mc_name} 已被游戏服封禁，暂时无法绑定。",
+    "commands.db.active": "{member_display} ↔ {mc_name}〔有效〕",
+    "commands.db.frozen": "{member_display} ↔ {mc_name}〔封禁冻结〕",
+    "commands.db.pending": "{member_display} ↔ {mc_name}〔待核实群成员〕",
+    "commands.db.removed": "已删除有效绑定：{member_qq} ↔ {mc_name}",
+    "commands.db.rm_frozen": "{member_qq} ↔ {mc_name} 因游戏服封禁被冻结。请先在游戏服解封，待绑定恢复后重试。",
+    "commands.db.rm_pending": "{member_qq} ↔ {mc_name} 正在等待群成员核实，可用 /授权对账 触发检查。",
+    "commands.db.ambiguous": "按 QQ 号和游戏名查到了两条不同绑定，请用 qq: 或 mc: 指定类型。",
+    "commands.db.not_bound": "未找到绑定。",
+    "commands.db.error": "绑定数据库操作失败，请稍后重试。",
     "commands.help.message": (
         "[MC-QQ-Auth] 指令帮助\n"
         "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID\n"
@@ -57,7 +93,8 @@ DEFAULTS = MappingProxyType({
         "/帮助 或 /help · 显示本帮助\n"
         "超级用户专用\n"
         "/信息 或 /info · 查看状态图片\n"
-        "/授权对账 或 /reconcile · 核对群成员与授权"
+        "/授权对账 或 /reconcile · 核对群成员与授权\n"
+        "/db · 手动添加、删除或查询绑定"
     ),
     "commands.info.busy": "状态图正在生成，请稍后重试。",
     "commands.info.error": "状态图暂不可用，请稍后重试。",
@@ -77,25 +114,53 @@ DEFAULTS = MappingProxyType({
     "info.labels.disk": "磁盘",
     "info.labels.auth_version": "Authorization version",
     "info.labels.bindings": "有效绑定",
+    "info.labels.bans": "封禁记录",
     "info.labels.last_reconcile": "Last member reconciliation",
     "info.labels.last_notice": "Last authorization notice",
 })
 SECTIONS = {key.rsplit(".", depth)[0] for key in DEFAULTS for depth in range(1, key.count(".") + 1)}
 
-FIELDS = {
-    "events.join.message": {"member"},
+COMMON_FIELDS = {"group_id", "bot_qq"}
+MEMBER_FIELDS = {"member_qq", "member_name", "member_display"}
+BUSINESS_FIELDS = {
+    "events.join.message": MEMBER_FIELDS | {"member"},
+    **{
+        f"events.{event}.{outcome}": MEMBER_FIELDS | {"mc_name"}
+        for event in ("leave", "kick")
+        for outcome in ("revoked", "retained")
+    },
+    **{
+        f"events.{event}.{outcome}": MEMBER_FIELDS
+        for event in ("leave", "kick")
+        for outcome in ("no_binding", "failed")
+    },
     "commands.bind.success": {"mc_name"},
     "commands.bind.already_bound": {"mc_name"},
+    "commands.bind.banned_name": {"mc_name"},
     "commands.unbind.success": {"mc_name"},
+    "commands.unbind.frozen": {"mc_name"},
+    "commands.unbind.pending": {"mc_name"},
     "commands.binding.success": {"mc_name"},
+    "commands.binding.frozen": {"mc_name"},
+    "commands.binding.pending": {"mc_name"},
     "commands.ping.success": {"status_code", "latency_ms"},
     "commands.ping.timeout": {"latency_ms"},
     "commands.ping.connection_error": {"latency_ms"},
     "commands.ping.error": {"latency_ms"},
     "commands.reconcile.success": {"count"},
+    "commands.db.not_member": MEMBER_FIELDS,
+    "commands.db.members_unverified": MEMBER_FIELDS,
+    **{
+        f"commands.db.{status}": MEMBER_FIELDS | {"mc_name"}
+        for status in (
+            "active", "frozen", "pending", "success", "already_same", "already_bound", "already_frozen",
+            "already_pending", "name_taken", "banned_name", "removed", "rm_frozen", "rm_pending",
+        )
+    },
 }
 TOKENS = re.compile(r"(\{\{|\}\}|\{[a-z_]+\}|[{}])")
 UNSAFE_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")
+MessageValue = str | int | MessageSegment | None
 
 
 @dataclass(frozen=True)
@@ -110,21 +175,32 @@ class MessageConfig:
         assert isinstance(value, str)
         return value
 
-    def info_text(self, key: str) -> str:
-        return self.text(key).replace("{{", "{").replace("}}", "}")
-
-    def render(self, key: str, **values: str | int | MessageSegment | None) -> Message:
+    def uses_fields(self, key: str, *fields: str, values: Mapping[str, MessageValue] | None = None) -> bool:
+        """Check the configured template and, when its values overflow, the default template."""
         template = self.text(key)
-        message = _render(template, values)
-        if message is None:
-            logger.warning("[MC-QQ-AUTH] 消息变量缺失或渲染后过长，使用默认文案（{}）", key)
-            return _render(DEFAULTS[key], values, use_default=True)
+        if _uses_fields(template, fields):
+            return True
+        default = DEFAULTS[key]
+        return (values is not None and isinstance(default, str) and _uses_fields(default, fields)
+                and _render(template, values)[1] > MAX_TEXT_LENGTH)
+
+    def info_text(self, key: str, **values: str | int | None) -> str:
+        return self.render(key, **values).extract_plain_text()
+
+    def render(self, key: str, **values: MessageValue) -> Message:
+        template = self.text(key)
+        message, length = _render(template, values)
+        if length > MAX_TEXT_LENGTH:
+            logger.warning("[MC-QQ-AUTH] 消息渲染后过长，使用默认文案（{}）", key)
+            message, _ = _render(DEFAULTS[key], values)
         return message
 
 
-def _render(
-    template: str, values: Mapping[str, str | int | MessageSegment | None], *, use_default: bool = False,
-) -> Message | None:
+def _uses_fields(template: str, fields: tuple[str, ...]) -> bool:
+    return any(token[1:-1] in fields for token in TOKENS.split(template)[1::2])
+
+
+def _render(template: str, values: Mapping[str, MessageValue]) -> tuple[Message, int]:
     message = Message()
     text: list[str] = []
     length = 0
@@ -134,8 +210,6 @@ def _render(
                 part = part[0]
             else:
                 value = values.get(part[1:-1])
-                if value is None and not use_default:
-                    return None
                 if isinstance(value, MessageSegment):
                     if text:
                         message.append(MessageSegment.text("".join(text)))
@@ -147,11 +221,9 @@ def _render(
         if part:
             text.append(part)
             length += len(part)
-    if length > MAX_TEXT_LENGTH and not use_default:
-        return None
     if text:
         message.append(MessageSegment.text("".join(text)))
-    return message
+    return message, length
 
 
 def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "") -> None:
@@ -175,7 +247,9 @@ def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "
         elif not isinstance(value, str) or not value.strip() or len(value) > MAX_TEXT_LENGTH or UNSAFE_TEXT.search(value):
             logger.warning("[MC-QQ-AUTH] 消息文案无效或过长，使用默认值（{}）", key)
         elif any(
-            token not in ("{{", "}}") and token[1:-1] not in FIELDS.get(key, ())
+            token not in ("{{", "}}")
+            and token[1:-1] not in COMMON_FIELDS
+            and token[1:-1] not in BUSINESS_FIELDS.get(key, ())
             for token in TOKENS.split(value)[1::2]
         ):
             logger.warning("[MC-QQ-AUTH] 消息占位符无效，使用默认值（{}）", key)

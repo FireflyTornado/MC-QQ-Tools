@@ -17,6 +17,8 @@ from runtime_status import HealthResult, ResourceUsage, RuntimeStatus
 
 WIDTH, HEIGHT = 720, 640
 LEFT_CONTENT_WIDTH = 322
+METRIC_CONTENT_WIDTH = 143
+METRIC_LABEL_WIDTH = 151
 MINT, YELLOW, RED, GRAY = "#7ae7c2", "#f5ce79", "#ff8c91", "#8a9aa8"
 STROKE_DASHES = {MINT: "none", YELLOW: "8 3", RED: "5 4", GRAY: "2 4"}
 EMPTY = "—"
@@ -127,13 +129,15 @@ def _avatar_uri(avatar: Image.Image | None) -> str:
 
 
 def render_status(
-    status: RuntimeStatus, *, qq_id: str = "", nickname: str | None = None, avatar: Image.Image | None = None,
+    status: RuntimeStatus, *, group_id: str | None = None, qq_id: str = "", nickname: str | None = None,
+    avatar: Image.Image | None = None,
 ) -> bytes:
     cjk = _font_source(False) is not None
     regular = _font_source(False) if cjk else _latin_source(False)
     bold = (_font_source(True) if cjk else _latin_source(True)) or regular
     family = _font(regular, 16).getname()[0] if regular is not None else "sans-serif"
     messages = message_config.MESSAGES
+    variables = {"group_id": group_id, "bot_qq": qq_id or None}
 
     def text(value: str, size: int, width: int, fallback: str | None = None, *, strong: bool = False) -> str:
         if not cjk and fallback is not None and not value.isascii():
@@ -141,7 +145,14 @@ def render_status(
         return _fit(value, _font(bold if strong else regular, size), width)
 
     def label(key: str) -> str:
-        return messages.info_text(f"info.labels.{key}")
+        return messages.info_text(f"info.labels.{key}", **variables)
+
+    def metric(value: int | None) -> tuple[str, int]:
+        count = str(value) if value is not None else EMPTY
+        max_size = 58
+        width = _font(bold, max_size).getlength(count)
+        size = max(15, min(max_size, int(METRIC_CONTENT_WIDTH * max_size / max(1, width))))
+        return text(count, size, METRIC_CONTENT_WIDTH, strong=True), size
 
     onebot_name = label("connection_uptime")
     if onebot_name == message_config.DEFAULTS["info.labels.connection_uptime"]:
@@ -196,20 +207,18 @@ def render_status(
         system = f"{os_label} {system}"
     python = status.python_version or EMPTY
 
-    count = str(status.active_bindings) if status.active_bindings is not None else EMPTY
-    max_count_size, max_count_width = 58, 168
-    count_width = _font(bold, max_count_size).getlength(count)
-    count_size = max(15, min(max_count_size, int(max_count_width * max_count_size / max(1, count_width))))
-    count_text = text(count, count_size, max_count_width, strong=True)
-    count_width = _font(bold, count_size).getlength(count_text)
-    bindings_label_width = int(LEFT_CONTENT_WIDTH - count_width - 18)
+    bindings_count, bindings_size = metric(status.active_bindings)
+    bans_count, bans_size = metric(status.active_bans)
     cores = status.cpu_cores if status.cpu_cores is not None else EMPTY
     local_time = status.checked_at.astimezone()
     offset = local_time.strftime("%z")
+    unnamed_bans = ""
+    if status.unnamed_bans:
+        unnamed_bans = f"无名 UUID 封禁：{status.unnamed_bans} 条" if cjk else f"Unnamed UUID bans: {status.unnamed_bans}"
 
     fields = {
         "font_family": family,
-        "title": text(messages.info_text("info.title"), 29, 485, "MC-QQ-Auth", strong=True),
+        "title": text(messages.info_text("info.title", **variables), 29, 485, "MC-QQ-Auth", strong=True),
         "page_label": "运行状态" if cjk else "Runtime status",
         "avatar": _avatar_uri(avatar),
         "avatar_display": "inline" if avatar is not None else "none",
@@ -217,9 +226,12 @@ def render_status(
         "nickname": text(nickname or "QQ 机器人", 23, 245, "QQ Bot", strong=True),
         "qq": text(f"QQ {qq_id or EMPTY}", 16, 245),
         "timestamp_label": "采集时间" if cjk else "Collected",
-        "bindings_label": text(label("bindings"), 19, bindings_label_width, "Active bindings"),
-        "bindings_count": count_text,
-        "bindings_size": count_size,
+        "bindings_label": text(label("bindings"), 19, METRIC_LABEL_WIDTH, "Active bindings"),
+        "bindings_count": bindings_count,
+        "bindings_size": bindings_size,
+        "bans_label": text(label("bans"), 19, METRIC_LABEL_WIDTH, "Ban records"),
+        "bans_count": bans_count,
+        "bans_size": bans_size,
         "services_label": "服务状态" if cjk else "Services",
         "system_uptime": system_uptime,
         "onebot_name": text(onebot_name, 14, 78 if onebot_uptime else 164, "OneBot"),
@@ -231,6 +243,8 @@ def render_status(
         "api_status": text(api_status, 14, 164),
         "minecraft_title_y": 528 if game_detail else 537,
         "minecraft_detail": text(game_detail, 13, 110),
+        "unnamed_bans_warning": text(unnamed_bans, 14, 174),
+        "unnamed_bans_display": "inline" if unnamed_bans else "none",
         "sqlite_name": text(label("database"), 13, 79, "SQLite"),
         "resources_label": resources_label,
         "system": text(f"{system} · {label('python')} {python}", 15, LEFT_CONTENT_WIDTH,

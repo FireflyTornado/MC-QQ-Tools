@@ -30,7 +30,10 @@ NapCat、Bot 和授权 API 部署在同一台主机，Minecraft 服务端在另�
 | `/帮助` | `/help` | 查看双语指令及权限。 |
 | `/授权对账` | `/reconcile` | 超级用户专用。核对群成员并撤销已离群的绑定。 |
 | `/信息` | `/info` | 超级用户专用。发送 Bot、授权 API 和主机的状态图。 |
+| `/db` | `/db` | 超级用户专用。查看手动管理绑定的用法。 |
 | `/sudo list` | `/sudo list` | 指定 QQ 号专用。执行服务端已开放的单条命令并在群内回显。默认关闭。 |
+
+`/db add 123456789 Steve` 为目标群成员添加绑定。`/db get 123456789` 或 `/db get Steve` 可按 QQ 号或游戏名查看绑定及其状态。查询结果优先显示群名片，群名片为空时显示 QQ 昵称，两者都取不到时照常显示 QQ 号。`/db rm Steve` 或 `/db rm 123456789` 仅删除有效绑定。封禁冻结时须先在游戏服解封，等待成员核实后再试。纯数字同时匹配两条绑定时，用 `qq:123456789` 或 `mc:123456789` 指定查询或删除目标。结果在目标群回显。
 
 `/sudo` 由 Mohist 1.20.1 服务端模组 `MCQQSudo` 执行并采集输出。一次只受理一条指令，等待执行回执最多 30 秒。管理员按命令前缀编辑默认留空的 `sudo-allowlist.txt`。群内所有成员都能看到回显。启用方法见 [QQ群管理指令](docs/deployment.md#qq群管理指令)。
 
@@ -59,7 +62,7 @@ TARGET_GROUP_ID=1 MC_API_TOKEN=demo-api-token MC_NOTIFY_TOKEN=demo-notify-token 
 
 另开一个终端运行 `curl --fail http://127.0.0.1:18765/internal/health` 检查进程。需要接入 NapCat、配置 Bot 或编译插件时，按 [部署与构建说明](docs/deployment.md) 操作。
 
-## Minecraft 授权插件 0.5.3
+## Minecraft 授权插件 0.7.0
 
 - `OBSERVE` 同步授权名单并记录入服判断。只有成功入服且确认未授权的玩家才会收到可关闭的 QQ 绑定公告。授权服务故障和撤权均允许玩家继续游玩。
 - `ENFORCE` 对新登录执行白名单检查，在服务未就绪时拒绝准入，并按已确认的新名单移出失去授权的在线玩家。

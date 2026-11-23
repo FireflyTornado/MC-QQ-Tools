@@ -282,23 +282,44 @@ final class SudoChannel implements AutoCloseable {
             finish(source, request, new SudoCommands.Result("expired"));
             return;
         }
-        var scheduled = new ScheduledOutput();
+        ScheduledOutput scheduled = null;
+        boolean handedOff = false;
         try {
-            commands.execute(request.command, request.deadlineMs - CLOCK_SKEW_MS, scheduled)
-                    .whenComplete((result, failure) -> finishExecution(source, request, result, failure, scheduled));
-        } catch (RuntimeException e) {
-            finishExecution(source, request, null, e, scheduled);
+            var output = new ScheduledOutput();
+            scheduled = output;
+            commands.execute(request.command, request.deadlineMs - CLOCK_SKEW_MS, output)
+                    .whenComplete((result, failure) -> finishExecution(source, request, result, failure, output));
+            handedOff = true;
+        } catch (VirtualMachineError | ThreadDeath fatal) {
+            throw fatal;
+        } catch (RuntimeException | Error failure) {
+            finishExecution(source, request, null, failure, scheduled);
+        } finally {
+            if (!handedOff && releaseExecution(request) && scheduled != null) {
+                scheduled.abandon();
+            }
         }
     }
 
     private void finishExecution(Connection source, Request request, SudoCommands.Result result, Throwable failure,
                                  ScheduledOutput scheduled) {
         if (failure != null) {
-            scheduled.output().finishInitial();
+            if (scheduled != null) {
+                scheduled.output().finishInitial();
+            }
             log.warning("/sudo #" + request.id + " 执行异常（" + failure.getClass().getSimpleName() + "）");
             result = new SudoCommands.Result("error");
         }
         finish(source, request, result, scheduled);
+    }
+
+    private synchronized boolean releaseExecution(Request request) {
+        if (running != request) {
+            return false;
+        }
+        running = null;
+        executing = false;
+        return true;
     }
 
     private synchronized void finish(Connection source, Request request, SudoCommands.Result result) {
@@ -307,9 +328,7 @@ final class SudoChannel implements AutoCloseable {
 
     private synchronized void finish(Connection source, Request request, SudoCommands.Result result,
                                      ScheduledOutput scheduled) {
-        if (running == request) {
-            running = null;
-            executing = false;
+        if (releaseExecution(request)) {
             boolean tracked = active == source && scheduled != null && scheduled.seal();
             boolean succeeded = result.status().equals("ok");
             boolean partial = result.status().equals("partial");

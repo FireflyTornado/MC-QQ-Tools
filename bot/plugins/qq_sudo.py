@@ -44,6 +44,7 @@ REPLAY_WINDOW = 300
 MAX_RECENT = 1024
 replay_cache_blocked_until = 0.0
 UPLOAD_TIMEOUT = 20
+FOLLOWUP_UPLOAD_ATTEMPTS = 3
 FOLLOWUP_RETRY_DELAY = 1
 TRACKED_FOLLOWUP_TIMEOUT_NOTICE = "等待任务回传超时。"
 REPLIES = {
@@ -173,9 +174,9 @@ async def request_result(token: str, method: str, path: str, payload: dict | Non
     return Reply("unknown")
 
 
-async def upload_output(bot: Bot, group_id: int, request_id: str, output: str) -> bool:
+async def upload_output(bot: Bot, group_id: int, request_id: str, output: str, *, timeout: float) -> bool:
     try:
-        async with asyncio.timeout(UPLOAD_TIMEOUT):
+        async with asyncio.timeout(timeout):
             result = await bot.call_api(
                 "upload_group_file",
                 group_id=str(group_id),
@@ -191,35 +192,56 @@ async def upload_output(bot: Bot, group_id: int, request_id: str, output: str) -
     return False
 
 
-async def render_result(bot: Bot, group_id: int, request_id: str, status: str, output: str,
-                        truncated: bool, *, followup: bool = False, sequence: int | None = None,
+async def upload_followup(bot: Bot, group_id: int, filename_id: str, output: str) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + UPLOAD_TIMEOUT
+    for attempt in range(FOLLOWUP_UPLOAD_ATTEMPTS):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        if await upload_output(bot, group_id, filename_id, output, timeout=remaining):
+            return True
+        if attempt + 1 < FOLLOWUP_UPLOAD_ATTEMPTS:
+            delay = FOLLOWUP_RETRY_DELAY * 2 ** attempt
+            await asyncio.sleep(max(0, min(delay, deadline - loop.time())))
+    return False
+
+
+async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, *, followup: bool = False,
                         waiting: bool = False, terminal_notice: str | None = None,
                         initial_failure_pending: bool = False) -> RenderedReply:
+    status, output = reply.status, reply.output
     text = "".join(
         char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
     )
     output_in_file = False
     output_in_message = bool(text.strip())
     failed_with_followup = status == "error" and waiting
-    if truncated or (output and not text.strip()) or output_settings.use_file(output):
+    if reply.truncated or (output and not text.strip()) or output_settings.use_file(output):
         output_in_message = False
         filename_id = f"{request_id}-followup" if followup else request_id
-        if sequence is not None:
-            filename_id += f"-{sequence}"
-        if await upload_output(bot, group_id, filename_id, output):
-            output_in_file = True
+        if reply.sequence is not None:
+            filename_id += f"-{reply.sequence}"
+        if followup:
+            output_in_file = await upload_followup(bot, group_id, filename_id, output)
+        else:
+            output_in_file = await upload_output(bot, group_id, filename_id, output, timeout=UPLOAD_TIMEOUT)
+        if output_in_file:
             if followup:
                 text = "输出已上传为文件。"
             elif not failed_with_followup and status not in {"partial", "scheduled"}:
                 return RenderedReply(None, output_in_file=True)
             else:
                 text = ""
-        elif followup:
-            return RenderedReply(None)
         else:
             text = f"结果文件上传失败或未确认。请求编号：{request_id}"
+            if followup and reply.final and terminal_notice is None:
+                terminal_notice = {
+                    "ok": "已安排的任务执行完毕。",
+                    "expired": "等待后续回传超时。",
+                }.get(status, FOLLOWUP_REPLIES[status])
     if not text.strip():
-        if waiting and not failed_with_followup and not output and not truncated:
+        if waiting and not failed_with_followup and not output and not reply.truncated:
             return RenderedReply(MessageSegment.text("正在执行..."))
         text = terminal_notice or (FOLLOWUP_REPLIES if followup else REPLIES)[status]
     elif terminal_notice is not None or failed_with_followup or status in {"partial", "scheduled"}:
@@ -241,19 +263,16 @@ async def send_followup(bot: Bot, group_id: int, request_id: str, reply: Reply, 
                         *, terminal_notice: str | None = None, initial_failure_pending: bool = False) -> bool:
     loop = asyncio.get_running_loop()
     delay = FOLLOWUP_RETRY_DELAY
-    message = None
+    rendered = await render_result(bot, group_id, request_id, reply, followup=True, terminal_notice=terminal_notice,
+                                   initial_failure_pending=initial_failure_pending)
+    assert rendered.message is not None  # Follow-up files always have a text receipt.
+    # File retries have their own budget. Keep the full text delivery window after rendering.
+    deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
     while (remaining := deadline - loop.time()) > 0:
         try:
             async with asyncio.timeout(min(UPLOAD_TIMEOUT, remaining)):
-                if message is None:
-                    rendered = await render_result(bot, group_id, request_id, reply.status, reply.output,
-                                                   reply.truncated, followup=True, sequence=reply.sequence,
-                                                   terminal_notice=terminal_notice,
-                                                   initial_failure_pending=initial_failure_pending)
-                    message = rendered.message
-                if message is not None:
-                    await bot.send_group_msg(group_id=group_id, message=message)
-                    return True
+                await bot.send_group_msg(group_id=group_id, message=rendered.message)
+                return True
         except Exception as exc:
             logger.warning("/sudo #{} 后续结果 {} 发送失败（{}）", request_id, reply.sequence, type(exc).__name__)
         await asyncio.sleep(max(0, min(delay, deadline - loop.time())))
@@ -267,6 +286,7 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
     path = f"{SUDO_FOLLOWUP_PATH}/{request_id}"
     after = 0 if initial.wait_seconds is not None else None
     tracked_task = initial.status == "scheduled" or initial.wait_seconds == SUDO_FOLLOWUP_TIMEOUT
+    reported_output = delivered_output
     loop = asyncio.get_running_loop()
     deadline = loop.time() + (initial.wait_seconds or SUDO_FOLLOWUP_TIMEOUT) + SUDO_TIMEOUT
     while (remaining := deadline - loop.time()) > 0:
@@ -290,22 +310,21 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
             if reply.status == "expired":
                 terminal_notice = TRACKED_FOLLOWUP_TIMEOUT_NOTICE
             elif reply.status == "ok" and not has_output:
-                terminal_notice = "已安排的任务执行完毕。" if delivered_output else FOLLOWUP_REPLIES["ok"]
-        if (terminal_notice is not None or initial_failure_pending or has_output or not delivered_output
+                terminal_notice = "已安排的任务执行完毕。" if reported_output else FOLLOWUP_REPLIES["ok"]
+        if (terminal_notice is not None or initial_failure_pending or has_output or not reported_output
                 or reply.status not in {"ok", "expired"}):
-            # A frame fetched near the end of capture still gets time to retry delivery.
-            deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
             if not await send_followup(bot, group_id, request_id, reply, deadline, terminal_notice=terminal_notice,
                                        initial_failure_pending=initial_failure_pending):
                 return
             deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
-            delivered_output |= has_output
+            # A confirmed file failure notice also tells the group that output existed.
+            reported_output |= has_output
             initial_failure_pending = False
         if reply.sequence is not None:
             after = reply.sequence
         if reply.final:
             return
-    if tracked_task or initial_failure_pending or not delivered_output:
+    if tracked_task or initial_failure_pending or not reported_output:
         await send_followup(bot, group_id, request_id, Reply("expired"), loop.time() + SUDO_TIMEOUT,
                             terminal_notice=TRACKED_FOLLOWUP_TIMEOUT_NOTICE if tracked_task else None,
                             initial_failure_pending=initial_failure_pending)
@@ -357,8 +376,7 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
             reply = Reply("timeout")
         logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, reply.status)
         waiting = reply.wait_seconds is not None or reply.status == "scheduled"
-        rendered = await render_result(bot, event.group_id, request_id, reply.status, reply.output, reply.truncated,
-                                       waiting=waiting)
+        rendered = await render_result(bot, event.group_id, request_id, reply, waiting=waiting)
         if waiting:
             delivered_output = rendered.output_in_file
             initial_failure_pending = reply.status == "error"

@@ -25,6 +25,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -127,6 +128,44 @@ class SudoChannelTest {
             verify(fixture.commands).execute(eq("test3"), anyLong(), any(ScheduledOutput.class));
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
+        }
+    }
+
+    @Test
+    void synchronousLinkageErrorReportsFailureAndReleasesTheSlot() {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class)))
+                    .thenThrow(new LinkageError("Plugin dependency unavailable"));
+            peer.send(1);
+            fixture.tasks.remove().run();
+            assertEquals("error", peer.status());
+
+            peer.send(2);
+            fixture.tasks.remove().run();
+            assertEquals("ok", peer.status());
+        }
+    }
+
+    @Test
+    void fatalErrorDoesNotLeaveTheSlotClaimedAfterAReconnect() {
+        try (var fixture = new ChannelFixture()) {
+            var original = fixture.connect();
+            var reconnected = new AtomicReference<Peer>();
+            var fatal = new InternalError("Simulated VM failure");
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
+                original.disconnect();
+                reconnected.set(fixture.openNext(1000));
+                reconnected.get().send(2);
+                assertEquals("busy", reconnected.get().status());
+                assertTrue(fixture.tasks.isEmpty());
+                throw fatal;
+            });
+            original.send(1);
+            assertEquals(fatal, assertThrows(InternalError.class, fixture.tasks.remove()::run));
+            reconnected.get().send(3);
+            fixture.tasks.remove().run();
+            assertEquals("ok", reconnected.get().status());
         }
     }
 

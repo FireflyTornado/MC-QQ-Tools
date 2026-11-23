@@ -856,6 +856,59 @@ events:
         for call in self.send_group.await_args_list:
             self.assertEqual(call.kwargs["message"], MessageSegment.text(f"指令后续回执 {request_id}\n输出已上传为文件。"))
 
+    async def test_sudo_followup_falls_back_to_text_before_advancing_to_the_terminal_frame(self):
+        request_id = "d" * 32
+        path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"
+        output = "报告\n" * 11
+        self.send_group.side_effect = [RuntimeError("OneBot temporarily unavailable"), {"message_id": 1},
+                                       {"message_id": 2}]
+
+        async def next_frame(token, method, url):
+            if url == f"{path}?after=0":
+                return self.sudo.Reply("ok", output, sequence=1, final=False)
+            self.assertEqual(url, f"{path}?after=1")
+            self.assertEqual(self.send_group.await_count, 2)
+            return self.sudo.Reply("ok", sequence=2)
+
+        with patch.object(self.sudo, "request_result", side_effect=next_frame) as poll, \
+             patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0), \
+             patch.object(self.sudo, "output_settings", self.sudo.SudoOutputSettings()), \
+             patch.object(self.bot, "call_api", AsyncMock(side_effect=RuntimeError("File upload forbidden"))) as upload:
+            await asyncio.wait_for(self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id,
+                                   self.sudo.Reply("scheduled", wait_seconds=3600), delivered_output=False), 2)
+
+        self.assertEqual(upload.await_count, self.sudo.FOLLOWUP_UPLOAD_ATTEMPTS)
+        self.assertEqual([call.args[2] for call in poll.await_args_list], [f"{path}?after=0", f"{path}?after=1"])
+        heading = f"指令后续回执 {request_id}\n"
+        notice = f"{heading}结果文件上传失败或未确认。请求编号：{request_id}"
+        self.assertEqual([call.kwargs for call in self.send_group.await_args_list], [
+            {"group_id": GROUP, "message": MessageSegment.text(text)}
+            for text in (notice, notice, f"{heading}已安排的任务执行完毕。")
+        ])
+
+    async def test_sudo_followup_sends_terminal_notice_after_upload_time_runs_out(self):
+        request_id = "e" * 32
+
+        async def stalled_upload(*args, **kwargs):
+            await asyncio.Future()
+
+        for status, notice in (("ok", "已安排的任务执行完毕。"), ("expired", "等待任务回传超时。")):
+            with self.subTest(status=status):
+                self.send_group.reset_mock()
+                frame = self.sudo.Reply(status, "部分报告", truncated=True, sequence=1)
+                with patch.object(self.sudo, "request_result", return_value=frame) as poll, \
+                     patch.object(self.sudo, "UPLOAD_TIMEOUT", 0.05), \
+                     patch.object(self.bot, "call_api", AsyncMock(side_effect=stalled_upload)) as upload:
+                    await asyncio.wait_for(self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id,
+                                           self.sudo.Reply("scheduled", wait_seconds=3600), delivered_output=True), 2)
+                poll.assert_awaited_once()
+                upload.assert_awaited_once()
+                self.send_group.assert_awaited_once_with(
+                    group_id=GROUP,
+                    message=MessageSegment.text(f"指令后续回执 {request_id}\n"
+                                                f"结果文件上传失败或未确认。请求编号：{request_id}\n{notice}"),
+                )
+
     async def test_sudo_uploads_exact_utf8_and_reports_unconfirmed_upload(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
             frozenset({str(ABSENT)}), "bot-token", "plugin-token",

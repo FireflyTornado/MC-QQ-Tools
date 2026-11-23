@@ -28,6 +28,8 @@ FOLLOWUP_RESULTS = {"ok", "error", "cancelled", "expired", "partial"}
 MAX_MESSAGE_BYTES = 8192
 SEND_TIMEOUT = 3
 MAX_FOLLOWUPS = 128
+FOLLOWUP_DELIVERY_RETENTION = SUDO_FOLLOWUP_TIMEOUT + 2 * SUDO_TIMEOUT
+FOLLOWUP_CONFIRMATION_RETENTION = 300
 
 
 @dataclass
@@ -46,6 +48,7 @@ class Followup:
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     finished: bool = False
     output_bytes: int = 0
+    delivered_sequence: int = 0
 
     def publish(self, result: dict, *, final: bool = True, sequence: int | None = None) -> bool:
         if self.finished or (sequence is not None and sequence <= len(self.frames)):
@@ -59,14 +62,28 @@ class Followup:
         self.frames.append(result)
         if final:
             self.finished = True
-            self.expires_at = time.monotonic() + 300
+            self.expires_at = time.monotonic() + FOLLOWUP_DELIVERY_RETENTION
         self.changed.set()
         return True
 
     def complete(self, result: dict) -> None:
         self.publish(result, sequence=len(self.frames) + 1 if self.streaming else None)
 
+    def confirm_delivery(self, after: int | None) -> None:
+        if not self.finished or self.delivered_sequence:
+            return
+        if after == len(self.frames):
+            self.delivered_sequence = len(self.frames)
+            self.frames.clear()
+            self.output_bytes = 0
+            self.expires_at = time.monotonic() + FOLLOWUP_CONFIRMATION_RETENTION
+        else:
+            # A poll may fetch a frame that still needs a lengthy QQ delivery attempt.
+            self.expires_at = time.monotonic() + FOLLOWUP_DELIVERY_RETENTION
+
     def read(self, after: int | None) -> dict | None:
+        if self.delivered_sequence:
+            return {"status": "closed"}
         if after is not None and after < len(self.frames):
             sequence = after + 1
             return {**self.frames[after], "sequence": sequence, "final": self.finished and sequence == len(self.frames)}
@@ -127,11 +144,14 @@ def sudo_router(
         work = followups.get(request_id)
         if work is None:
             return {"status": "expired"}
+        if after is not None and after > (work.delivered_sequence or len(work.frames)):
+            raise HTTPException(400)
         try:
             async with asyncio.timeout(15):
                 while (result := work.read(after)) is None:
                     work.changed.clear()
                     await work.changed.wait()
+                work.confirm_delivery(after)
                 return result
         except TimeoutError:
             return {"status": "waiting"}
@@ -274,9 +294,9 @@ def sudo_router(
                     if status == "scheduled" or wait_seconds is not None:
                         prune_followups()
                         if len(followups) >= MAX_FOLLOWUPS:
-                            completed = next((key for key, item in followups.items() if item.finished), None)
-                            if completed is not None:
-                                del followups[completed]
+                            delivered = next((key for key, item in followups.items() if item.delivered_sequence), None)
+                            if delivered is not None:
+                                del followups[delivered]
                         if len(followups) < MAX_FOLLOWUPS:
                             followups[request_id] = Followup(
                                 websocket, time.monotonic() + (wait_seconds or SUDO_FOLLOWUP_TIMEOUT) + SUDO_TIMEOUT,

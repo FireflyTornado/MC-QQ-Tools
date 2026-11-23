@@ -241,9 +241,11 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
                     "expired": "等待后续回传超时。",
                 }.get(status, FOLLOWUP_REPLIES[status])
     if not text.strip():
-        if waiting and not failed_with_followup and not output and not reply.truncated:
+        if waiting and status in {"ok", "scheduled"} and not output and not reply.truncated:
             return RenderedReply(MessageSegment.text("正在执行..."))
         text = terminal_notice or (FOLLOWUP_REPLIES if followup else REPLIES)[status]
+        if waiting and status == "partial" and not output and not reply.truncated:
+            text += "\n后续输出仍会补发。"
     elif terminal_notice is not None or failed_with_followup or status in {"partial", "scheduled"}:
         if not text.endswith("\n"):
             text += "\n"
@@ -279,6 +281,20 @@ async def send_followup(bot: Bot, group_id: int, request_id: str, reply: Reply, 
         delay = min(delay * 2, 15)
     logger.warning("/sudo #{} 后续结果 {} 投递到期，未确认发送", request_id, reply.sequence)
     return False
+
+
+async def confirm_followup(token: str, request_id: str, sequence: int) -> None:
+    # Reading after the terminal sequence acknowledges delivery, even for a quiet terminal frame.
+    path = f"{SUDO_FOLLOWUP_PATH}/{request_id}?after={sequence}"
+    try:
+        async with asyncio.timeout(SUDO_TIMEOUT):
+            while True:
+                reply = await request_result(token, "GET", path)
+                if reply.status in {"closed", "expired"}:
+                    return
+                await asyncio.sleep(2)
+    except TimeoutError:
+        logger.warning("/sudo #{} 未能确认补发终帧清理", request_id)
 
 
 async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str, initial: Reply,
@@ -323,6 +339,8 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
         if reply.sequence is not None:
             after = reply.sequence
         if reply.final:
+            if reply.sequence is not None or after is None:
+                await confirm_followup(token, request_id, reply.sequence or 1)
             return
     if tracked_task or initial_failure_pending or not reported_output:
         await send_followup(bot, group_id, request_id, Reply("expired"), loop.time() + SUDO_TIMEOUT,

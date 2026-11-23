@@ -84,6 +84,8 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         self.bot = Bot(nonebot.get_adapter(Adapter), str(BOT))
         self.send_group = self.enterContext(patch.object(self.bot, "send_group_msg", new_callable=AsyncMock))
         self.reply = self.enterContext(patch.object(self.bot, "send", new_callable=AsyncMock))
+        self._confirm_sudo_followup = self.sudo.confirm_followup
+        self.confirm_sudo_followup = self.enterContext(patch.object(self.sudo, "confirm_followup", new_callable=AsyncMock))
         self.driver.bots[self.bot.self_id] = self.bot
         self.addCleanup(self.driver.bots.pop, self.bot.self_id, None)
         self.addCleanup(self.events.recent_departures.clear)
@@ -721,12 +723,55 @@ events:
                     path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"
                     self.assertEqual([call.args[2] for call in poll.await_args_list],
                                      [f"{path}?after={cursor}" for cursor in range(len(frames))])
+                    self.confirm_sudo_followup.assert_awaited_with("bot-token", request_id, len(frames))
                     replies = ["进度\n", "结果\n"] if has_output else ["等待期间未捕获输出"]
                     self.assertEqual(
                         [(call.kwargs["group_id"], Message(call.kwargs["message"]).extract_plain_text())
                          for call in self.send_group.await_args_list],
                         [(GROUP, f"指令后续回执 {request_id}\n{reply}") for reply in replies],
                     )
+
+    async def test_sudo_empty_partial_reply_warns_immediately_and_keeps_delivering(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
+        frames = [self.sudo.Reply("ok", "迟到的输出", sequence=1, final=False),
+                  self.sudo.Reply("expired", sequence=2)]
+        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("partial", wait_seconds=30)) as submit, \
+             patch.object(self.sudo, "request_result", side_effect=frames):
+            ack = Message(await self.command_reply("/sudo reload", message_id=77)).extract_plain_text()
+            request_id = submit.await_args.args[1]["id"]
+            self.assertEqual(ack, "命令已返回，输出采集不完整。\n后续输出仍会补发。")
+            await asyncio.wait_for(asyncio.gather(*self.sudo.followup_tasks), 2)
+        self.send_group.assert_awaited_once_with(
+            group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n迟到的输出"),
+        )
+        self.confirm_sudo_followup.assert_awaited_once_with("bot-token", request_id, 2)
+
+    async def test_sudo_acknowledges_the_terminal_cursor_only_if_qq_delivery_succeeds(self):
+        request_id = "f" * 32
+        path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"
+        initial = self.sudo.Reply("scheduled", wait_seconds=3600)
+        final = self.sudo.Reply("ok", "最终结果", sequence=1)
+
+        async def receive_or_ack(token, method, url):
+            if url == f"{path}?after=0":
+                return final
+            self.assertEqual(url, f"{path}?after=1")
+            self.send_group.assert_awaited_once()
+            return self.sudo.Reply("closed")
+
+        with patch.object(self.sudo, "confirm_followup", self._confirm_sudo_followup), \
+             patch.object(self.sudo, "request_result", side_effect=receive_or_ack) as poll:
+            await self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id, initial, delivered_output=False)
+        self.assertEqual([call.args[2] for call in poll.await_args_list], [f"{path}?after=0", f"{path}?after=1"])
+
+        with patch.object(self.sudo, "request_result", return_value=final), \
+             patch.object(self.sudo, "send_followup", return_value=False):
+            await self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id, initial, delivered_output=False)
+        self.confirm_sudo_followup.assert_not_awaited()
 
     async def test_sudo_reports_initial_failure_and_delivers_later_success(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(

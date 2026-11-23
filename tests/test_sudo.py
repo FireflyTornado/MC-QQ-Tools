@@ -211,6 +211,62 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
                 self.result(incoming, request["id"], "命令失败", status="error", wait_seconds=3600)
                 self.assertEqual(await second, (200, {"status": "error", "output": "命令失败"}))
 
+    async def test_slow_stream_delivery_keeps_unconfirmed_frames_until_terminal_ack(self):
+        # A group can take 18 seconds to upload any one of the 30 legal TXT frames.
+        with patch("sudo_api.time", wraps=time) as clock, patch("sudo_api.FOLLOWUP_DELIVERY_RETENTION", 300):
+            clock.monotonic.return_value = 100.0
+            async with self.connect() as (_, incoming, outgoing):
+                first = asyncio.create_task(self.submit())
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=3600)
+                output = "x" * 1800
+                for sequence in range(1, 31):
+                    self.result(incoming, request["id"], output, followup=True,
+                                sequence=sequence, final=sequence == 30)
+                await first
+                path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+
+                for after in range(30):
+                    clock.monotonic.return_value = 100.0 + after * 18
+                    status, reply = await self.http("GET", path, "bot-token", query=f"after={after}".encode())
+                    self.assertEqual(status, 200)
+                    self.assertEqual(reply, {"status": "ok", "output": output,
+                                             "sequence": after + 1, "final": after == 29})
+                clock.monotonic.return_value = 640.0
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=29"),
+                                 (200, {"status": "ok", "output": output, "sequence": 30, "final": True}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=30"),
+                                 (200, {"status": "closed"}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                                 (200, {"status": "closed"}))
+
+    async def test_followup_capacity_does_not_evict_an_unconfirmed_terminal_frame(self):
+        with patch("sudo_api.MAX_FOLLOWUPS", 1):
+            async with self.connect() as (_, incoming, outgoing):
+                first = asyncio.create_task(self.submit())
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=30)
+                self.result(incoming, request["id"], "完成", followup=True, sequence=1, final=True)
+                await first
+                path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+
+                self.assertEqual((await self.http("GET", path, "bot-token", query=b"after=2"))[0], 400)
+                second = asyncio.create_task(self.submit(request_id="b" * 32))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=30)
+                self.assertEqual(await second, (200, {"status": "partial", "output": ""}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                                 (200, {"status": "ok", "output": "完成", "sequence": 1, "final": True}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
+                                 (200, {"status": "closed"}))
+
+                third = asyncio.create_task(self.submit(request_id="c" * 32))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "", wait_seconds=30)
+                self.assertEqual(await third, (200, {"status": "ok", "output": "", "wait_seconds": 30}))
+                self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                                 (200, {"status": "expired"}))
+
     async def test_timeout_releases_slot_and_late_result_is_ignored(self):
         async with self.connect() as (_, incoming, outgoing):
             first = asyncio.create_task(self.submit(timeout=0.15))

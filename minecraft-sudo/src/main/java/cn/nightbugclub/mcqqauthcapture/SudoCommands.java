@@ -139,6 +139,9 @@ final class SudoCommands {
         if (failure != null && empty && captured) {
             throw failure;
         }
+        if (failure != null) {
+            return new Result("error", output.text(), output.truncated());
+        }
         return new Result(!captured ? "partial" : dispatched ? "ok" : "error", output.text(), output.truncated());
     }
 

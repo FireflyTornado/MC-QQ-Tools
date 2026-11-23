@@ -5,6 +5,7 @@ import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import FastAPI
 
@@ -192,6 +193,23 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
                          (200, {"status": "disconnected", "sequence": 3, "final": True}))
         self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=3"),
                          (200, {"status": "closed"}))
+
+    async def test_stream_retains_the_initial_error_with_or_without_followup_capacity(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"], "", status="error", wait_seconds=3600)
+            self.result(incoming, request["id"], "后台任务完成", followup=True, sequence=1, final=True)
+            self.assertEqual(await first, (200, {"status": "error", "output": "", "wait_seconds": 3600}))
+            path = f"{SUDO_FOLLOWUP_PATH}/{request['id']}"
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"),
+                             (200, {"status": "ok", "output": "后台任务完成", "sequence": 1, "final": True}))
+
+            with patch("sudo_api.MAX_FOLLOWUPS", 0):
+                second = asyncio.create_task(self.submit(request_id="b" * 32))
+                request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.result(incoming, request["id"], "命令失败", status="error", wait_seconds=3600)
+                self.assertEqual(await second, (200, {"status": "error", "output": "命令失败"}))
 
     async def test_timeout_releases_slot_and_late_result_is_ignored(self):
         async with self.connect() as (_, incoming, outgoing):

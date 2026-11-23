@@ -245,7 +245,7 @@ def sudo_router(
                     or status not in (FOLLOWUP_RESULTS if is_followup else PLUGIN_RESULTS)
                     or ("wait_seconds" in result and (type(wait_seconds) is not int or is_followup
                         or wait_seconds not in (SUDO_DIRECT_REPLY_TIMEOUT, SUDO_FOLLOWUP_TIMEOUT)
-                        or status not in {"ok", "partial", "scheduled"}))
+                        or status not in {"ok", "partial", "scheduled", "error"}))
                     or ("sequence" in result and (not is_followup or type(sequence) is not int
                         or not 1 <= sequence <= MAX_FOLLOWUP_FRAMES))
                     or (("final" in result) != ("sequence" in result))
@@ -284,7 +284,7 @@ def sudo_router(
                             )
                             if wait_seconds is not None:
                                 reply["wait_seconds"] = wait_seconds
-                        else:
+                        elif status != "error":
                             reply["status"] = "partial"
                     pending.result.set_result(reply)
         finally:

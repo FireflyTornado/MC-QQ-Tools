@@ -728,6 +728,64 @@ events:
                         [(GROUP, f"指令后续回执 {request_id}\n{reply}") for reply in replies],
                     )
 
+    async def test_sudo_reports_initial_failure_and_delivers_later_success(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
+        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("error", wait_seconds=3600)) as submit, \
+             patch.object(self.sudo, "request_result", return_value=self.sudo.Reply("ok", "后台完成", sequence=1)):
+            ack = Message(await self.command_reply("/sudo list", message_id=73)).extract_plain_text()
+            request_id = submit.await_args.args[1]["id"]
+            self.assertEqual(ack, f"服务端执行失败或无法确认结果。\n后台任务的结果会继续补发。请求编号：{request_id}")
+            await asyncio.wait_for(asyncio.gather(*self.sudo.followup_tasks), 2)
+            self.send_group.assert_awaited_once_with(
+                group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n后台完成"),
+            )
+
+    async def test_sudo_retries_the_same_followup_before_advancing_the_cursor(self):
+        request_id = "a" * 32
+        path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"
+
+        async def next_frame(token, method, url):
+            if url == f"{path}?after=0":
+                return self.sudo.Reply("ok", "报告链接", sequence=1, final=False)
+            self.assertEqual(url, f"{path}?after=1")
+            self.assertEqual(self.send_group.await_count, 2)
+            return self.sudo.Reply("expired", sequence=2)
+
+        self.send_group.side_effect = [RuntimeError("OneBot unavailable"), {"message_id": 10}]
+        with patch.object(self.sudo, "request_result", side_effect=next_frame) as poll, \
+             patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0):
+            await asyncio.wait_for(self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id,
+                                   self.sudo.Reply("ok", wait_seconds=30), delivered_output=False), 2)
+        self.assertEqual([call.args[2] for call in poll.await_args_list], [f"{path}?after=0", f"{path}?after=1"])
+        message = MessageSegment.text(f"指令后续回执 {request_id}\n报告链接")
+        self.assertEqual(self.send_group.await_count, 2)
+        for call in self.send_group.await_args_list:
+            self.assertEqual(call.kwargs, {"group_id": GROUP, "message": message})
+
+    async def test_sudo_followup_retries_upload_and_reuses_a_confirmed_file(self):
+        request_id = "b" * 32
+        path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"
+        output = "报告\n" * 11
+        self.send_group.side_effect = [RuntimeError("OneBot unavailable"), {"message_id": 11}]
+        with patch.object(self.sudo, "request_result", return_value=self.sudo.Reply("ok", output, sequence=1)) as poll, \
+             patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0), \
+             patch.object(self.sudo, "output_settings", self.sudo.SudoOutputSettings()), \
+             patch.object(self.bot, "call_api", AsyncMock(side_effect=[{"file_id": None}, {"file_id": "uploaded"}])) as upload:
+            await asyncio.wait_for(self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id,
+                                   self.sudo.Reply("ok", wait_seconds=30), delivered_output=False), 2)
+        poll.assert_awaited_once_with("bot-token", "GET", f"{path}?after=0")
+        self.assertEqual(upload.await_count, 2)
+        for call in upload.await_args_list:
+            self.assertEqual(call.args, ("upload_group_file",))
+            self.assertEqual(call.kwargs["name"], f"sudo-{request_id}-followup-1.txt")
+        self.assertEqual(self.send_group.await_count, 2)
+        for call in self.send_group.await_args_list:
+            self.assertEqual(call.kwargs["message"], MessageSegment.text(f"指令后续回执 {request_id}\n输出已上传为文件。"))
+
     async def test_sudo_uploads_exact_utf8_and_reports_unconfirmed_upload(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
             frozenset({str(ABSENT)}), "bot-token", "plugin-token",

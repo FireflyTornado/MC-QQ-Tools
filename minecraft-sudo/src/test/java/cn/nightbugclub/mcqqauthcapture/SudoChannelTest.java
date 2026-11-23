@@ -1,6 +1,8 @@
 package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.JsonParser;
+import org.apache.logging.log4j.LogManager;
+import org.bukkit.command.CommandException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -193,6 +195,39 @@ class SudoChannelTest {
                 assertTrue(followup.get("final").getAsBoolean());
             }
             verify(expiry.future()).cancel(false);
+        }
+    }
+
+    @Test
+    void reportsInitialCommandFailureAndStillSendsTheTrackedTaskResult() throws Exception {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            var frames = new LinkedBlockingQueue<String>();
+            when(peer.socket.sendText(anyString(), eq(true))).thenAnswer(call -> {
+                frames.add(call.getArgument(0));
+                return CompletableFuture.completedFuture(peer.socket);
+            });
+            var task = new Object();
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
+                var close = OutputCapture.begin(ignored -> {}, call.getArgument(2));
+                ScheduledOutput.enqueueTask(task);
+                close.get().join();
+                return CompletableFuture.failedFuture(new CommandException("Command failed after registering a task"));
+            });
+            peer.send(1, true);
+            fixture.tasks.remove().run();
+            var ack = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("error", ack.get("status").getAsString());
+            assertEquals("", ack.get("output").getAsString());
+            assertEquals(3600, ack.get("wait_seconds").getAsInt());
+
+            ScheduledOutput.run(task, () -> LogManager.getLogger("test.channel").error("Task finished"));
+            var followup = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals(ack.get("id"), followup.get("id"));
+            assertEquals("ok", followup.get("status").getAsString());
+            assertEquals(1, followup.get("sequence").getAsInt());
+            assertTrue(followup.get("final").getAsBoolean());
+            assertEquals("Task finished\n", followup.get("output").getAsString());
         }
     }
 

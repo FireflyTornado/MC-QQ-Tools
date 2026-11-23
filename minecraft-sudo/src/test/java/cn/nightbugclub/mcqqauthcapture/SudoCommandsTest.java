@@ -184,6 +184,12 @@ class SudoCommandsTest {
         var incomplete = new SudoCommands(server, Set.of("say"), output ->
                 new MohistCommandFeedback.Capture(senderFor(output), ignored -> CompletableFuture::new));
         assertEquals(new SudoCommands.Result("partial", "hello\n"), incomplete.execute("say hello"));
+
+        when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("say hello"))).thenAnswer(call -> {
+            call.getArgument(0, RemoteConsoleCommandSender.class).sendMessage("Command failed\n");
+            throw new CommandException("test failure");
+        });
+        assertEquals(new SudoCommands.Result("error", "Command failed\n"), incomplete.execute("say hello"));
     }
 
     @Test

@@ -44,6 +44,7 @@ REPLAY_WINDOW = 300
 MAX_RECENT = 1024
 replay_cache_blocked_until = 0.0
 UPLOAD_TIMEOUT = 20
+FOLLOWUP_RETRY_DELAY = 1
 REPLIES = {
     "ok": "命令已返回，服务端无输出。",
     "rejected": "该指令或参数未获服务端许可。",
@@ -67,6 +68,13 @@ class Reply:
     wait_seconds: int | None = None
     sequence: int | None = None
     final: bool = True
+
+
+@dataclass(frozen=True)
+class RenderedReply:
+    message: MessageSegment | None
+    output_in_file: bool = False
+    output_in_message: bool = False
 
 
 def allowed(event: GroupMessageEvent) -> bool:
@@ -179,57 +187,77 @@ async def upload_output(bot: Bot, group_id: int, request_id: str, output: str) -
 
 async def render_result(bot: Bot, group_id: int, request_id: str, status: str, output: str,
                         truncated: bool, *, followup: bool = False, sequence: int | None = None,
-                        waiting: bool = False) -> MessageSegment | None:
+                        waiting: bool = False) -> RenderedReply:
     text = "".join(
         char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
     )
+    output_in_file = False
+    output_in_message = bool(text.strip())
+    failed_with_followup = status == "error" and waiting
     if truncated or (output and not text.strip()) or output_settings.use_file(output):
+        output_in_message = False
         filename_id = f"{request_id}-followup" if followup else request_id
         if sequence is not None:
             filename_id += f"-{sequence}"
         if await upload_output(bot, group_id, filename_id, output):
+            output_in_file = True
             if followup:
                 text = "输出已上传为文件。"
-            elif status not in {"partial", "scheduled"}:
-                return None
+            elif not failed_with_followup and status not in {"partial", "scheduled"}:
+                return RenderedReply(None, output_in_file=True)
             else:
                 text = ""
+        elif followup:
+            return RenderedReply(None)
         else:
             text = f"结果文件上传失败或未确认。请求编号：{request_id}"
     if not text.strip():
-        if waiting and not output and not truncated:
-            return MessageSegment.text("正在执行...")
+        if waiting and not failed_with_followup and not output and not truncated:
+            return RenderedReply(MessageSegment.text("正在执行..."))
         text = {
             "expired": "等待期间未捕获输出",
             "ok": "已安排的任务执行完毕，服务端无输出。",
             "disconnected": "指令通道已断开，无法接收任务后续结果。",
         }.get(status, REPLIES[status]) if followup else REPLIES[status]
-    elif status in {"partial", "scheduled"}:
+    elif failed_with_followup or status in {"partial", "scheduled"}:
         if not text.endswith("\n"):
             text += "\n"
         text += REPLIES[status]
     if status == "scheduled":
         text += f" 请求编号：{request_id}"
+    if failed_with_followup:
+        text += f"\n后台任务的结果会继续补发。请求编号：{request_id}"
     if followup:
         text = f"指令后续回执 {request_id}\n{text}"
-    return MessageSegment.text(text)
+    return RenderedReply(MessageSegment.text(text), output_in_file, output_in_message)
 
 
-async def send_followup(bot: Bot, group_id: int, request_id: str, reply: Reply) -> None:
-    try:
-        message = await render_result(bot, group_id, request_id, reply.status, reply.output, reply.truncated,
-                                      followup=True, sequence=reply.sequence)
-        if message is not None:
-            async with asyncio.timeout(UPLOAD_TIMEOUT):
-                await bot.send_group_msg(group_id=group_id, message=message)
-    except Exception as exc:
-        logger.warning("/sudo #{} 后续结果发送失败（{}）", request_id, type(exc).__name__)
+async def send_followup(bot: Bot, group_id: int, request_id: str, reply: Reply, deadline: float) -> bool:
+    loop = asyncio.get_running_loop()
+    delay = FOLLOWUP_RETRY_DELAY
+    message = None
+    while (remaining := deadline - loop.time()) > 0:
+        try:
+            async with asyncio.timeout(min(UPLOAD_TIMEOUT, remaining)):
+                if message is None:
+                    rendered = await render_result(bot, group_id, request_id, reply.status, reply.output,
+                                                   reply.truncated, followup=True, sequence=reply.sequence)
+                    message = rendered.message
+                if message is not None:
+                    await bot.send_group_msg(group_id=group_id, message=message)
+                    return True
+        except Exception as exc:
+            logger.warning("/sudo #{} 后续结果 {} 发送失败（{}）", request_id, reply.sequence, type(exc).__name__)
+        await asyncio.sleep(max(0, min(delay, deadline - loop.time())))
+        delay = min(delay * 2, 15)
+    logger.warning("/sudo #{} 后续结果 {} 投递到期，未确认发送", request_id, reply.sequence)
+    return False
 
 
-async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str, initial: Reply) -> None:
+async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str, initial: Reply,
+                           *, delivered_output: bool) -> None:
     path = f"{SUDO_FOLLOWUP_PATH}/{request_id}"
     after = 0 if initial.wait_seconds is not None else None
-    received_output = bool(initial.output or initial.truncated)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + (initial.wait_seconds or SUDO_FOLLOWUP_TIMEOUT) + SUDO_TIMEOUT
     while (remaining := deadline - loop.time()) > 0:
@@ -244,19 +272,23 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
             continue
         if reply.status == "closed":
             return
-        if reply.sequence is not None:
-            if after is None or reply.sequence != after + 1:
-                await asyncio.sleep(max(0, min(2, deadline - loop.time())))
-                continue
-            after = reply.sequence
+        if reply.sequence is not None and (after is None or reply.sequence != after + 1):
+            await asyncio.sleep(max(0, min(2, deadline - loop.time())))
+            continue
         has_output = bool(reply.output or reply.truncated)
-        if has_output or not received_output or reply.status not in {"ok", "expired"}:
-            await send_followup(bot, group_id, request_id, reply)
-        received_output |= has_output
+        if has_output or not delivered_output or reply.status not in {"ok", "expired"}:
+            # A frame fetched near the end of capture still gets time to retry delivery.
+            deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
+            if not await send_followup(bot, group_id, request_id, reply, deadline):
+                return
+            deadline = max(deadline, loop.time() + SUDO_TIMEOUT)
+            delivered_output |= has_output
+        if reply.sequence is not None:
+            after = reply.sequence
         if reply.final:
             return
-    if not received_output:
-        await send_followup(bot, group_id, request_id, Reply("expired"))
+    if not delivered_output:
+        await send_followup(bot, group_id, request_id, Reply("expired"), loop.time() + SUDO_TIMEOUT)
 
 
 @sudo.handle()
@@ -305,15 +337,18 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
             reply = Reply("timeout")
         logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, reply.status)
         waiting = reply.wait_seconds is not None or reply.status == "scheduled"
-        message = await render_result(bot, event.group_id, request_id, reply.status, reply.output, reply.truncated,
-                                      waiting=waiting)
+        rendered = await render_result(bot, event.group_id, request_id, reply.status, reply.output, reply.truncated,
+                                       waiting=waiting)
         if waiting:
+            delivered_output = rendered.output_in_file
             try:
-                if message is not None:
-                    await sudo.send(message)
+                if rendered.message is not None:
+                    await sudo.send(rendered.message)
+                    delivered_output |= rendered.output_in_message
             finally:
-                task = asyncio.create_task(deliver_followup(bot, event.group_id, settings.bot_token, request_id, reply))
+                task = asyncio.create_task(deliver_followup(bot, event.group_id, settings.bot_token, request_id, reply,
+                                                           delivered_output=delivered_output))
                 followup_tasks.add(task)
                 task.add_done_callback(followup_tasks.discard)
-        elif message is not None:
-            await sudo.finish(message)
+        elif rendered.message is not None:
+            await sudo.finish(rendered.message)

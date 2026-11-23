@@ -311,10 +311,15 @@ final class SudoChannel implements AutoCloseable {
             running = null;
             executing = false;
             boolean tracked = active == source && scheduled != null && scheduled.seal();
-            boolean observeSender = request.streamFollowup && (result.status().equals("ok") || result.status().equals("partial"));
-            if (active == source && scheduled != null && (tracked || observeSender)) {
+            boolean succeeded = result.status().equals("ok");
+            boolean partial = result.status().equals("partial");
+            boolean observeSender = request.streamFollowup && (succeeded || partial);
+            // The legacy protocol uses its status to signal that a follow-up is available.
+            boolean scheduledStatus = succeeded || (partial && !request.streamFollowup);
+            boolean sendTracked = tracked && (scheduledStatus || request.streamFollowup);
+            if (active == source && scheduled != null && (sendTracked || observeSender)) {
                 if (source.followups.size() < MAX_FOLLOWUPS) {
-                    if (tracked) {
+                    if (tracked && scheduledStatus) {
                         result = new SudoCommands.Result("scheduled", result.output(), result.truncated());
                     }
                     int seconds = tracked ? ScheduledOutput.WAIT_SECONDS : ScheduledOutput.DIRECT_REPLY_WAIT_SECONDS;
@@ -324,7 +329,9 @@ final class SudoChannel implements AutoCloseable {
                     source.sending.thenRun(() -> startFollowup(followup, seconds));
                 } else {
                     scheduled.abandon();
-                    result = new SudoCommands.Result("partial", result.output(), result.truncated());
+                    if (succeeded) {
+                        result = new SudoCommands.Result("partial", result.output(), result.truncated());
+                    }
                     reply(source, request, result);
                 }
             } else {

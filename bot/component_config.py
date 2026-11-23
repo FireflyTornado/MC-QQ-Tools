@@ -1,9 +1,9 @@
 import logging
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app_config import ConfigError, read_switch, require_token
-from sudo_config import SudoSettings, read_sudo_settings
+from sudo_config import SudoOutputSettings, SudoSettings, read_sudo_output_settings, read_sudo_settings
 
 
 logger = logging.getLogger("mc_qq_tools")
@@ -19,6 +19,7 @@ class AuthSettings:
 class ComponentSettings:
     auth: AuthSettings | None
     sudo: SudoSettings | None
+    sudo_output: SudoOutputSettings | None = None
 
 
 def read_auth_settings(config: dict[str, str | None]) -> AuthSettings | None:
@@ -36,13 +37,17 @@ def read_components(config: dict[str, str | None]) -> ComponentSettings:
     sudo = None
     auth_error = None
     sudo_error = None
+    sudo_output = None
     try:
         auth = read_auth_settings(config)
     except ConfigError as exc:
         auth_error = exc
     try:
         sudo = read_sudo_settings(config, auth_tokens=(auth.api_token, auth.notify_token) if auth else ())
+        if sudo is not None:
+            sudo_output = read_sudo_output_settings(config)
     except ConfigError as exc:
+        sudo = None
         sudo_error = exc
 
     if auth is None and sudo is None and (error := auth_error or sudo_error):
@@ -51,7 +56,26 @@ def read_components(config: dict[str, str | None]) -> ComponentSettings:
         logger.error("MCQQAuth 已关闭：%s", auth_error)
     if sudo_error:
         logger.error("/sudo 已关闭：%s", sudo_error)
-    return ComponentSettings(auth, sudo)
+    return ComponentSettings(auth, sudo, sudo_output)
+
+
+def check_auth_database(components: ComponentSettings) -> ComponentSettings:
+    if components.auth is None:
+        return components
+
+    import sqlite3
+
+    from database import check_schema_version
+
+    try:
+        check_schema_version()
+    except (OSError, sqlite3.Error) as exc:
+        message = "MCQQAuth 数据库不可用或版本不符，请在停写并备份后执行 bot/migrate.py。"
+        if components.sudo is None:
+            raise ConfigError(message) from None
+        logger.error("MCQQAuth 已关闭：%s（%s）", message, type(exc).__name__)
+        return replace(components, auth=None)
+    return components
 
 
 def read_banlist_token(

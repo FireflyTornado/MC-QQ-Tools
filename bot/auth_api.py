@@ -11,10 +11,10 @@ from fastapi import (
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import ClientDisconnect
 
+import database
 from api_security import require_bearer, verify_bearer
 from banlist_sync import GenerationClaimed, UploadConflict, read_generation, store_upload
 from component_config import AuthSettings
-from database import DB_PATH, MAX_AUTH_VERSION
 
 
 WS_SEND_TIMEOUT = 3
@@ -25,8 +25,8 @@ MAX_BANLIST_BYTES = 2 * 1024 * 1024
 logger = logging.getLogger("mc_qq_tools.auth")
 
 
-UploadNumber = Annotated[int, Field(strict=True, ge=1, le=MAX_AUTH_VERSION)]
-Expiration = Annotated[int, Field(strict=True, ge=0, le=MAX_AUTH_VERSION)]
+UploadNumber = Annotated[int, Field(strict=True, ge=1, le=database.MAX_AUTH_VERSION)]
+Expiration = Annotated[int, Field(strict=True, ge=0, le=database.MAX_AUTH_VERSION)]
 
 
 class BanlistProfile(BaseModel):
@@ -58,7 +58,7 @@ class AuthApi:
         self.notify_token = settings.notify_token.encode("ascii")
         self.banlist_token = banlist_token
         self.target_group = target_group
-        self.db_path = DB_PATH
+        self.db_path = database.DB_PATH
         # Routes close their own sockets. Broadcasts only mark failed connections.
         self.connections: dict[WebSocket, BroadcastConnection] = {}
         self.broadcast_lock = asyncio.Lock()

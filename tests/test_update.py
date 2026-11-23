@@ -12,12 +12,51 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy" / "update.sh"
 ORIGIN = "https://github.com/FireflyTornado/MC-qq-auth-BF656.git"
 NEW_ORIGIN = "https://github.com/FireflyTornado/MC-QQ-Tools.git"
 API = "mc-qq-api.service"
 BOT = "mc-qq-bot.service"
+
+
+class ServiceAuthModeTests(unittest.TestCase):
+    def test_probe_replays_unit_environment_in_systemd(self):
+        from deploy import service_auth_mode
+
+        path = "/org/freedesktop/systemd1/unit/mc_2dqq_2dapi_2eservice"
+        properties = {
+            "Environment": ["MC_AUTH_ENABLED=false", r'TEST_VALUE=a"b\c'],
+            "EnvironmentFiles": [["/etc/base.env", False], ["/etc/optional.env", True]],
+            "PassEnvironment": ["MC_AUTH_ENABLED", "AUTH_SWITCH"],
+            "UnsetEnvironment": ["TEST_VALUE=secret"],
+            "User": "root",
+            "Group": "",
+        }
+
+        def run(command, **kwargs):
+            if command[0] == "busctl":
+                if command[3] == "call":
+                    self.assertEqual(command[-3:], ["LoadUnit", "s", API])
+                    data = [path]
+                else:
+                    self.assertEqual(command[5], path)
+                    data = properties[command[-1]]
+                return subprocess.CompletedProcess(command, 0, json.dumps({"data": data}))
+            self.assertEqual(command[0], "systemd-run")
+            self.assertIn("--property=PassEnvironment=MC_AUTH_ENABLED AUTH_SWITCH", command)
+            prefix = "--property=EnvironmentFile="
+            private_file, *environment_files = [arg.removeprefix(prefix) for arg in command if arg.startswith(prefix)]
+            self.assertEqual(environment_files, ["/etc/base.env", "-/etc/optional.env"])
+            expected = 'MC_AUTH_ENABLED="false"\n' + r'TEST_VALUE="a\"b\\c"' + "\n"
+            self.assertEqual(Path(private_file).read_text(encoding="utf-8"), expected)
+            self.assertNotIn("secret", " ".join(command))
+            self.assertEqual(json.loads(kwargs["input"]), properties["UnsetEnvironment"])
+            return subprocess.CompletedProcess(command, 0, "1\n")
+
+        with patch.object(service_auth_mode.subprocess, "run", side_effect=run):
+            self.assertEqual(service_auth_mode.service_auth_mode(API), "1")
 
 
 def local_path(value):
@@ -93,14 +132,18 @@ def mock_command(name, args):
         return 0
     if name == "curl":
         is_health = args[-1].endswith("/health")
-        if "sudo-only" in faults:
-            assert is_health and "-o" not in args
-            print(json.dumps({"status": "ok", "auth_enabled": "auth-mismatch" in faults}))
-            print("200", end="")
-        elif "health" in faults and f"start:{API}" in events.read_text(encoding="utf-8"):
+        api_restarted = f"start:{API}" in events.read_text(encoding="utf-8")
+        auth = "auth-mismatch" in faults or (
+            "sudo-only" not in faults and ("enable-auth" not in faults or api_restarted)
+        )
+        if "health" in faults and api_restarted:
             print("503", end="")
+        elif is_health:
+            if "-o" not in args:
+                print(json.dumps({"status": "ok", "auth_enabled": auth}))
+            print("200", end="")
         else:
-            print("200" if is_health else "401", end="")
+            print("401" if auth else "404", end="")
         return 0
     if name == "sqlite3":
         assert "sudo-only" not in faults
@@ -121,6 +164,11 @@ def mock_command(name, args):
                 print(conn.execute(operation).fetchone()[0])
             return 0
     if name == "python":
+        if args == ["-I", "-B", "deploy/service_auth_mode.py", API]:
+            if "service-probe-fails" in faults:
+                return 1
+            print(int("sudo-only" not in faults))
+            return 0
         if args[:3] == ["-I", "-B", "-c"]:
             exec(args[3], {"__name__": "__main__"})
             return 0
@@ -181,7 +229,7 @@ class UpdateTests(unittest.TestCase):
             "requirements.in": "example==1.0\n",
             "bot/bot.py": "# baseline\n", "bot/mc_api.py": "# baseline\n",
             "bot/app_config.py": (SOURCE.parents[1] / "bot/app_config.py").read_text(encoding="utf-8"),
-            "bot/database.py": "# baseline\n", "bot/migrate.py": "# baseline\n",
+            "bot/database.py": "SCHEMA_VERSION = 1\n", "bot/migrate.py": "# baseline\n",
             "bot/migrations/001.sql": "-- initial\n", "napcat/compose.yaml": "services: {}\n",
             "deploy/systemd/mc-qq-api.service": "# baseline\n",
         }.items():
@@ -272,6 +320,8 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
                 self.write(file, "example==2.0\n")
             else:
                 self.write(file, (file.read_text(encoding="utf-8") if file.exists() else "") + "# synthetic change\n")
+        if "bot/migrations/001.sql" in paths:
+            self.write(self.upstream / "bot/database.py", "SCHEMA_VERSION = 2\n")
         return self.commit_upstream()
 
     def run_tool(self, *args, faults=(), okay=False):
@@ -470,6 +520,29 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         self.assertEqual(self.observed(), ["fetch", f"stop:{BOT}", f"stop:{API}", "merge", f"start:{API}", f"start:{BOT}"])
         self.assertFalse(self.db.parent.exists())
         self.assertFalse(self.backups.exists())
+
+    def test_api_unit_mode_overrides_updater_and_dotenv_before_database_checks(self):
+        self.env["MC_AUTH_ENABLED"] = "false"
+        self.write(self.repo / "bot/.env", "MC_AUTH_ENABLED=false\n")
+        self.db.unlink()
+        out = self.run_tool("--check", "--local")
+        self.assertIn("Missing, empty or unsafe runtime file: bot/data/auth.db", out)
+        self.assertEqual(self.observed(), [])
+        out = self.run_tool("--check", "--local", faults=("service-probe-fails",))
+        self.assertIn("Unable to determine MC_AUTH_ENABLED for the installed API unit", out)
+
+    def test_reenabling_auth_runs_a_deferred_migration_at_the_same_commit(self):
+        target = self.incoming("bot/migrations/001.sql")
+        out = self.run_tool("--apply", target, faults=("sudo-only",), okay=True)
+        self.assertIn("migration=0", out)
+        self.assertNotIn("migrate", self.observed())
+        self.events.write_text("", encoding="utf-8")
+
+        out = self.run_tool("--apply", target, faults=("enable-auth",), okay=True)
+        self.assertIn("Authorization schema: installed=1 target=2", out)
+        self.assertIn("Verified SQLite schema 2", out)
+        self.assertEqual(self.observed(), ["fetch", "backup:online", f"stop:{BOT}", f"stop:{API}",
+                                          "backup:stopped", "migrate", f"start:{API}", f"start:{BOT}"])
 
 
 if __name__ == "__main__":

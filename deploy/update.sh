@@ -135,13 +135,13 @@ for path in bot/.env napcat/.env; do
     [[ -f $path && -s $path && ! -L $path && -r $path ]] || die "Missing, empty or unsafe runtime file: $path"
 done
 [[ -x $PYTHON ]] || die 'Production virtual environment interpreter is unavailable.'
-auth_enabled=$("$PYTHON" -I -B -c '
-import sys
-sys.path.insert(0, "bot")
-from app_config import load_config, read_switch
-print(int(read_switch(load_config(), "MC_AUTH_ENABLED", default=True)))
-' 2>/dev/null) || die 'Unable to determine MC_AUTH_ENABLED from deployment configuration.'
-[[ $auth_enabled == 0 || $auth_enabled == 1 ]] || die 'Unexpected MC_AUTH_ENABLED result.'
+api_auth_mode() {
+    local enabled
+    enabled=$("$PYTHON" -I -B deploy/service_auth_mode.py "$API" 2>/dev/null) || return 1
+    [[ $enabled == 0 || $enabled == 1 ]] || return 1
+    printf '%s\n' "$enabled"
+}
+auth_enabled=$(api_auth_mode) || die 'Unable to determine MC_AUTH_ENABLED for the installed API unit.'
 if (( auth_enabled )); then
     command -v sqlite3 >/dev/null || die 'Missing command: sqlite3'
     [[ -d bot/data && ! -L bot/data ]] || die 'Expected a real directory: bot/data'
@@ -218,11 +218,39 @@ changed() {
     (( result == 1 )) || die 'Unable to compare target changes.'
     return 0
 }
+db_version() {
+    local version
+    [[ -f $1 && -s $1 && ! -L $1 ]] || return 1
+    version=$(sqlite3 -readonly -batch -bail "$1" 'PRAGMA user_version;' 2>/dev/null) || return 1
+    [[ $version =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+target_schema_version() {
+    # Read the target constant without running code from a commit under review.
+    repo_git show "$target:bot/database.py" | "$PYTHON" -I -B -c '
+import ast
+import sys
+
+versions = [node.value.value for node in ast.parse(sys.stdin.buffer.read()).body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "SCHEMA_VERSION"
+            and isinstance(node.value, ast.Constant)]
+if len(versions) != 1 or type(versions[0]) is not int or not 0 < versions[0] <= 2147483647:
+    sys.exit(1)
+print(versions[0])
+' 2>/dev/null
+}
 deps=0 migration=0 units_changed=0 compose_changed=0 tool_changed=0 update_api=0 update_bot=0
 if changed requirements.txt requirements.in; then deps=1; fi
-if (( auth_enabled )) && changed bot/database.py bot/migrate.py bot/migrations; then migration=1; fi
+if (( auth_enabled )); then
+    schema=$(db_version "$DB") || die 'Unable to read database version.'
+    target_schema=$(target_schema_version) || die 'Unable to determine target authorization schema version.'
+    (( schema <= target_schema )) || die 'Authorization database is newer than the target schema.'
+    if (( schema < target_schema )) || changed bot/database.py bot/migrate.py bot/migrations; then migration=1; fi
+    log "Authorization schema: installed=$schema target=$target_schema."
+fi
 if changed deploy/systemd; then units_changed=1; fi
-if changed deploy/update.sh; then tool_changed=1; fi
+if changed deploy/update.sh deploy/service_auth_mode.py; then tool_changed=1; fi
 if changed napcat ':(exclude)napcat/.env.example'; then compose_changed=1; fi
 if changed bot/mc_api.py; then update_api=1; fi
 if changed bot/bot.py bot/binding_service.py bot/notify_client.py bot/plugins; then update_bot=1; fi
@@ -254,7 +282,8 @@ fi
 [[ $mode == apply ]] || exit 0
 (( ! units_changed && ! compose_changed && ! tool_changed )) ||
     die 'Apply does not install unit changes, modify NapCat or replace the running updater.'
-[[ $head != "$target" ]] || die 'HEAD is already at the target. No upgrade ran. After a failed run, follow manual recovery.'
+[[ $head != "$target" ]] || (( migration )) ||
+    die 'HEAD is already at the target. No upgrade ran. After a failed run, follow manual recovery.'
 
 required_files=(bot/bot.py bot/mc_api.py requirements.txt)
 if (( auth_enabled )); then required_files+=(bot/database.py bot/migrate.py); fi
@@ -268,14 +297,14 @@ if [[ $target_entries =~ (^|$'\n')(120000|160000)\  ]]; then
 fi
 
 api_ready() {
-    local pid
+    local expected_auth=${1:-$auth_enabled} pid
     active "$API" || return 1
     pid=$(systemctl show -p MainPID --value "$API") || return 1
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
     ss -H -ltnp 'sport = :18765' |
         awk -v pid="$pid" '$4 != "127.0.0.1:18765" || index($0,"pid=" pid ",")==0 {bad=1} END {exit !(NR==1 && !bad)}' ||
         return 1
-    if (( auth_enabled )); then
+    if (( expected_auth )); then
         [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
             http://127.0.0.1:18765/internal/health) == 200 ]] &&
         [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
@@ -316,13 +345,6 @@ wait_ready() {
     return 1
 }
 
-db_version() {
-    local version
-    [[ -f $1 && -s $1 && ! -L $1 ]] || return 1
-    version=$(sqlite3 -readonly -batch -bail "$1" 'PRAGMA user_version;' 2>/dev/null) || return 1
-    [[ $version =~ ^[0-9]+$ ]] || return 1
-    printf '%s\n' "$version"
-}
 db_checked_version() {
     local result
     result=$(sqlite3 -readonly -batch -bail "$1" 'PRAGMA quick_check;' 2>/dev/null) || return 1
@@ -355,7 +377,16 @@ pip_locked() {
 
 if (( update_api || update_bot )); then
     [[ $napcat == 'running healthy' || $napcat == 'running none' ]] || die 'NapCat baseline is not running.'
-    api_ready && bot_ready || die 'API or OneBot baseline health is unverified; review locally.'
+    # A running Sudo-only API can be upgraded to an Auth-enabled API after migration.
+    if api_ready; then
+        :
+    elif (( auth_enabled )) && api_ready 0; then
+        update_api=1 update_bot=1
+        log 'The API currently has authorization disabled. Both services will be restarted.'
+    else
+        die 'API or OneBot baseline health is unverified; review locally.'
+    fi
+    bot_ready || die 'API or OneBot baseline health is unverified; review locally.'
 fi
 if (( deps )); then
     phase=wheel-download
@@ -381,6 +412,7 @@ phase=preflight
 clean_worktree
 [[ $(repo_git rev-parse HEAD) == "$head" && $(repo_git symbolic-ref --short HEAD) == main ]] ||
     die 'HEAD or branch changed during preflight.'
+[[ $(api_auth_mode) == "$auth_enabled" ]] || die 'The API authorization mode changed during preflight.'
 phase=stop
 if (( update_bot )); then
     systemctl stop "$BOT" >/dev/null 2>&1 || die 'Failed to stop Bot.'
@@ -399,10 +431,12 @@ if (( migration )); then
 fi
 
 phase=git-update
-repo_git merge --ff-only --no-autostash --no-overwrite-ignore "$target" >/dev/null 2>&1 ||
-    die 'Fast-forward failed. Inspect the repository locally.'
+if [[ $head != "$target" ]]; then
+    repo_git merge --ff-only --no-autostash --no-overwrite-ignore "$target" >/dev/null 2>&1 ||
+        die 'Fast-forward failed. Inspect the repository locally.'
+    log "Updated source to $target."
+fi
 [[ $(repo_git rev-parse HEAD) == "$target" ]] || die 'HEAD does not match requested target.'
-log "Updated source to $target."
 if (( deps )); then
     phase=dependencies
     pip_locked install --no-index --find-links "$scratch/wheels" --only-binary=:all: \
@@ -417,6 +451,7 @@ if (( migration )); then
     done
     "$PYTHON" -B bot/migrate.py >/dev/null 2>&1 || die 'Project SQLite migration failed.'
     version=$(db_checked_version "$DB") || die 'Post-migration quick_check or schema version failed.'
+    [[ $version == "$target_schema" ]] || die 'Post-migration schema does not match the target version.'
     log "Project migration finished. Verified SQLite schema $version."
 fi
 

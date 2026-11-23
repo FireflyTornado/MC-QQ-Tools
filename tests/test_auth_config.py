@@ -89,6 +89,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             )
         env_file = root / ".env"
         env_file.write_text("TARGET_GROUP_ID=00" + GROUP_ID + "\n", encoding="utf-8")
+        self.enterContext(patch.object(database, "DB_PATH", db_path))
         with patch.object(app_config, "ENV_FILE", env_file), patch.dict(
             os.environ, {
                 "MC_API_TOKEN": API_TOKEN, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN, "MC_BANLIST_TOKEN": BANLIST_TOKEN,
@@ -97,7 +98,6 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             self.app = importlib.import_module("mc_api").app
         self.api = self.app.state.auth
         self.addCleanup(sys.modules.pop, "mc_api", None)
-        self.api.db_path = db_path
 
     async def request(self, path, authorization=(), method="GET", body=b""):
         sent = []
@@ -113,6 +113,33 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         )
         headers = dict(sent[0]["headers"])
         return sent[0]["status"], headers, json.loads(sent[-1]["body"])
+
+    async def test_invalid_sudo_output_setting_only_disables_sudo(self):
+        with self.assertLogs("mc_qq_tools", "ERROR") as logs:
+            self.app = sys.modules["mc_api"].create_app({
+                **ENV, "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_MOD_TOKEN": "mod-token",
+                "MC_SUDO_QQ_IDS": '["123"]', "MC_SUDO_TEXT_MAX_CHARS": "invalid",
+            })
+        self.assertIn("MC_SUDO_TEXT_MAX_CHARS", logs.output[0])
+        self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
+        self.assertEqual((await self.request(SUDO_SUBMIT_PATH, method="POST"))[0], 404)
+        self.assertIsNone((await self.request("/internal/health"))[2]["sudo_connected"])
+
+    async def test_stale_auth_database_stays_closed_while_sudo_keeps_its_routes(self):
+        with closing(sqlite3.connect(database.DB_PATH)) as conn:
+            conn.execute("PRAGMA user_version = 1")
+        create_app = sys.modules["mc_api"].create_app
+        with self.assertRaisesRegex(app_config.ConfigError, "bot/migrate.py"):
+            create_app(ENV)
+        with self.assertLogs("mc_qq_tools", "ERROR"):
+            self.app = create_app({
+                **ENV, "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_MOD_TOKEN": "mod-token",
+                "MC_SUDO_QQ_IDS": '["123"]',
+            })
+        self.assertEqual((await self.request(SNAPSHOT_PATH))[0], 404)
+        self.assertEqual((await self.request(SUDO_SUBMIT_PATH, method="POST"))[0], 401)
+        with closing(sqlite3.connect(database.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
 
     async def test_snapshot_keeps_contract_and_accepts_standard_bearer_syntax(self):
         for header in (bearer(API_TOKEN), f"\tbEaReR   {API_TOKEN} \t".encode("ascii")):
@@ -134,7 +161,6 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             **ENV, "MC_SUDO_ENABLED": "true", "MC_SUDO_QQ_IDS": '["123"]',
             "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_MOD_TOKEN": "mod-token",
         })
-        self.app.state.auth.db_path = self.api.db_path
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer("bot-token")]))[0], 401)
         payload = json.dumps({
@@ -151,7 +177,6 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             **ENV, "MC_SUDO_ENABLED": "true", "MC_SUDO_QQ_IDS": '["123"]',
             "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_PLUGIN_TOKEN": "mod-token",
         })
-        self.app.state.auth.db_path = self.api.db_path
 
         async def check_channels(auth_connections, sudo_connected):
             status, _, health = await self.request("/internal/health")
@@ -862,13 +887,17 @@ class ConfigTests(unittest.TestCase):
             "component_config.py", "database.py", "mc_api.py",
             "notify_client.py", "qq_avatar.py", "qq_group.py", "runtime_status.py", "status_image.py",
             "status_card.svg", "message_config.py", "sudo_api.py", "sudo_config.py",
-            "plugins/qq_bindings.py", "plugins/qq_db.py", "plugins/qq_events.py", "plugins/status_commands.py",
+            "plugins/qq_bindings.py", "plugins/qq_db.py", "plugins/qq_events.py", "plugins/qq_sudo.py",
+            "plugins/status_commands.py",
         ):
             shutil.copyfile(BOT_DIR / rel, project / rel)
+        database.init_database(project / "data" / "auth.db")
         onebot_token = "76543210123456"
         (project / ".env").write_text(
             self.env_file.read_text(encoding="utf-8")
-            + 'DRIVER=~websockets\nLOG_LEVEL=TRACE\nONEBOT_WS_URLS=["ws://127.0.0.1:13001/"]\n',
+            + 'DRIVER=~websockets\nLOG_LEVEL=TRACE\nONEBOT_WS_URLS=["ws://127.0.0.1:13001/"]\n'
+              'MC_SUDO_BOT_TOKEN=bot-token\nMC_SUDO_MOD_TOKEN=mod-token\nMC_SUDO_QQ_IDS=["123"]\n'
+              'MC_SUDO_TEXT_MAX_CHARS=invalid\n',
             encoding="utf-8",
         )
         decoy = self.root / "elsewhere"
@@ -908,6 +937,7 @@ assert mc_api.app.state.auth.banlist_token is None
                 "ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_WS_URLS", "ONEBOT_V11_WS_URLS",
                 "MC_AUTH_ENABLED", "MC_BANLIST_TOKEN", "MC_SUDO_ENABLED",
                 "MC_SUDO_QQ_IDS", "MC_SUDO_BOT_TOKEN", "MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN",
+                "MC_SUDO_TEXT_MAX_CHARS",
             }
         }
         env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, PYTHONUTF8="1")
@@ -919,6 +949,7 @@ assert mc_api.app.state.auth.banlist_token is None
             if token in result.stdout or token in result.stderr:
                 self.fail("Bot startup exposed a synthetic credential")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MC_SUDO_TEXT_MAX_CHARS", result.stderr)
 
     def test_sudo_only_boots_without_auth_files_and_delivers_a_delayed_reply(self):
         project = self.root / "sudo-only"

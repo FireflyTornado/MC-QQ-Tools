@@ -92,6 +92,7 @@ info:
 中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。通用变量 `{group_id}` 和 `{bot_qq}` 分别是目标群号和机器人 QQ 号，可用于所有文字文案，包括状态图的标题和标签。业务变量的含义和可用字段见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。可用变量在本次渲染时缺少实际值会显示为 `—`。指令权限继续由目标群和 `SUPERUSERS` 控制。
 
 授权启用时，帮助正文继续使用原有的 `commands.help.message`。授权关闭时使用 `commands.help.shared` 展示共用命令。启用远程指令时，帮助末尾追加 `commands.help.sudo`。请将自定义的 `/sudo` 说明写在 `commands.help.sudo`，使它随组件开关显示。
+帮助正文与 `/sudo` 说明各自校验文案长度，随后合成一条群消息发送。
 
 已有绑定时，`/绑定` 统一使用 `commands.bind.already_bound`，默认提示如需更换请先使用 `/解绑`。旧配置里的 `commands.bind.frozen` 和 `commands.bind.pending` 可以删除。`/解绑` 和 `/我的绑定` 仍可显示冻结或待核实状态。
 
@@ -247,18 +248,20 @@ sudo bash deploy/update.sh --apply REVIEWED_COMMIT_SHA
 - `--check --local` 只使用缓存的 `origin/main`，不联网或更新 Git 引用，因此无法确认 GitHub 是否有新提交。两种检查模式都保持源码、虚拟环境、数据库和服务原样。
 - `--apply` 接受完整的 40 位 SHA 或至少 7 位且能唯一解析的十六进制前缀。执行前将 `REVIEWED_COMMIT_SHA` 替换为已审核的 SHA。目标必须在本次取得的 `origin/main` 历史中，并能从当前 `HEAD` 快进。管理员须先核对目标完整 SHA 与 CI 结果，再决定是否进入维护窗口。工具不会查询或替代这项审核。
 
-使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具从 `bot/.env` 和进程环境读取 `MC_AUTH_ENABLED`。只部署 MCQQSudo 时，确保升级进程与服务采用相同的开关设置。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
+使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具按已加载的 `mc-qq-api.service` 环境读取 `MC_AUTH_ENABLED`，进程环境优先于 `bot/.env`。如果修改了 unit 或 drop-in，先运行 `systemctl daemon-reload`。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
 
 Apply 按以下顺序执行。
 
 1. 验证 Git 工作区和目标。存在未解决的 Git 操作、源码修改、非忽略的未跟踪文件或与目标冲突的忽略路径时停止。当前索引和目标都必须排除 `bot/.env`、`napcat/.env`、`bot/data/`、`napcat/data/`、`bot/.venv/`。
-2. 按差异制定操作。Bot 或 API 专属代码只重启受影响服务，依赖或共享 Python 代码变更涉及两项服务，纯文档和构建变更只更新源码。systemd unit、NapCat 运行配置或 `deploy/update.sh` 有改动时，转到下方的手工流程。
+2. 按差异制定操作。Bot 或 API 专属代码只重启受影响服务，依赖或共享 Python 代码变更涉及两项服务，纯文档和构建变更只更新源码。systemd unit、NapCat 运行配置或升级工具有改动时，转到下方的手工流程。
 3. 涉及服务时先核验现有 API、Bot 和 NapCat 的健康。依赖有变化时，先按目标锁文件从 PyPI 下载 wheel。下载失败时服务保持运行。
 4. 涉及服务且启用授权时，先做在线 SQLite 一致性备份，再停受影响服务。需要迁移时先停 Bot 再停 API，确认两者均为 `inactive`，并在停写后再做一份备份。停写期间管理员也要暂停其他数据库写入者。
-5. 用 `git merge --ff-only --no-autostash --no-overwrite-ignore` 合入已经审核的 SHA。涉及依赖时，停服期间从预下载的 wheel 离线安装并运行 `pip check`。授权已启用且涉及 SQLite 结构时，运行 `bot/migrate.py` 并检查活动库的 `quick_check` 和 `user_version`。只部署 MCQQSudo 时可直接升级源码和依赖。
+5. 用 `git merge --ff-only --no-autostash --no-overwrite-ignore` 合入已经审核的 SHA。涉及依赖时，停服期间从预下载的 wheel 离线安装并运行 `pip check`。启用授权时，对比活动库的 `user_version` 与目标代码的数据库版本。需要迁移时运行 `bot/migrate.py`，确认 `quick_check` 通过且数据库版本与目标一致。只部署 MCQQSudo 时可直接升级源码和依赖。
 6. 启动受影响服务，验证 API 的进程 PID、`127.0.0.1:18765` 监听和健康 `200`。启用授权时再核对未授权快照返回 `401`。只部署 MCQQSudo 时核对健康响应中 `auth_enabled=false`，游戏服暂时停机也可进行这项检查。最后确认 Bot 在 journald 中记录了 OneBot 连接，且其进程已连接 `127.0.0.1:13001`。NapCat 保持运行，日志级别需保留 OneBot 的连接记录。
 
 备份保存在仓库外的 `/opt/mc-qq-auth-backups/`。目录要求 root 所有、权限 `0700`，每份备份使用独立文件名，权限 `0600`。工具使用 SQLite `.backup`，只有非空、`quick_check` 返回 `ok` 且 `user_version` 与源一致的文件才会被报告为有效备份。中断留下的文件需重新核验后才能用于恢复。
+
+重新启用 MCQQAuth 时，先确认授权数据库版本。如果当前 API 仍以 MCQQSudo 模式健康运行，可以用 `--apply` 当前 SHA 补做待执行的迁移。服务已停止时，按下方手工流程停写、备份并执行 `bot/migrate.py`。数据库版本不符时，Bot 和 API 会暂停授权功能。已正确配置的 MCQQSudo 可以继续启动。
 
 #### 失败后的人工恢复
 
@@ -271,7 +274,7 @@ Apply 按以下顺序执行。
 | `migration` | 源码已更新，数据库可能需要确认迁移结果。保持停写，核对活动库和最近一份有效备份的结构版本与完整性。 |
 | `restart`、`health` | 工具会尝试停止本次尝试启动的服务。核对实际状态、有效 unit、端口和本机日志，再决定何时启动。 |
 
-工具不会回退 Git 或恢复数据库。回到旧源码前应确认它能读取当前数据库结构。迁移可能没有逆向步骤，恢复旧备份可能丢失随后产生的绑定。需要恢复时先停写，保全当前库及最后一份有效备份，再由管理员选择恢复点。重复 Apply 同一个已落盘的 SHA 会停止，需按实际失败阶段恢复。
+工具不会回退 Git 或恢复数据库。回到旧源码前应确认它能读取当前数据库结构。迁移可能没有逆向步骤，恢复旧备份可能丢失随后产生的绑定。需要恢复时先停写，保全当前库及最后一份有效备份，再由管理员选择恢复点。对当前 SHA 执行 Apply 只处理可识别的待执行授权迁移。其他失败按上述阶段恢复。
 
 ### NapCat 容器状态说明
 
@@ -452,7 +455,7 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 | `MC_SUDO_FILE_LINE_CHAR_THRESHOLD` | `0` | 任意一行的字符数，0 表示关闭该判断。 |
 | `MC_SUDO_TEXT_MAX_CHARS` | `1500` | 单条输出正文的总字符数，包含换行。最小值为 1。 |
 
-TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod，之后修改这三个阈值只需重启 Bot。
+TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod。Bot 和 FastAPI 共用 Sudo 启用判定，修改这三个阈值后重启两项服务。
 
 每次提交一条纯文本命令。在机器人发出结果前，新的请求会收到忙碌提示。Bot 在同一进程内保留消息 ID 5 分钟，忙碌时拒绝的指令也会登记，以忽略 OneBot 重投。去重缓存满时，Bot 暂停接收新指令，最后一次因容量拒绝的消息再过 5 分钟才恢复接收。等待满 30 秒会回复「执行超时，结果未知」。若 API 先检测到游戏端指令连接断开且仍在等回执，Bot 会立即回复「指令通道已断开，执行结果未知」，回复后释放名额。两种情况下，已经开始的指令仍可能完成，机器人不会自动重发。Bot 和 FastAPI 日志可按请求编号关联群号、QQ 号、命令和回执。可在 Bot 和 FastAPI 的配置中设 `MC_SUDO_ENABLED=false` 后重启两者。将 Mod 的 `sudo.enabled` 改为 `false` 后重启游戏服也可关闭游戏端指令通道。
 

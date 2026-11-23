@@ -2,12 +2,12 @@ from fastapi import FastAPI
 
 from api_security import verify_bearer
 from app_config import load_config, target_group_id
-from component_config import read_banlist_token, read_components
+from component_config import check_auth_database, read_banlist_token, read_components
 
 
 def create_app(config: dict[str, str | None]) -> FastAPI:
     group_id = str(target_group_id(config))
-    components = read_components(config)
+    components = check_auth_database(read_components(config))
     app = FastAPI(
         title="MC-QQ-Tools API",
         docs_url=None,

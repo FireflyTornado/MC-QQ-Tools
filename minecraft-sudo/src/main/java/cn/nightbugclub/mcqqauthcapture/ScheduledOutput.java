@@ -9,7 +9,9 @@ import java.util.function.Supplier;
 public final class ScheduledOutput {
     static final int WAIT_SECONDS = 3600;
     private static final int MAX_EVENTS = 512;
-    private static final Map<Object, ScheduledOutput> EVENTS = new IdentityHashMap<>();
+    private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
+
+    private record Event(ScheduledOutput owner, String cancellation) {}
 
     private final BoundedCommandOutput output = new BoundedCommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
@@ -20,6 +22,14 @@ public final class ScheduledOutput {
     private boolean complete = true;
 
     public static void enqueue(Object event) {
+        enqueue(event, "已取消一项预约函数。");
+    }
+
+    public static void enqueueTask(Object task) {
+        enqueue(task, "已取消一项后台任务。");
+    }
+
+    private static void enqueue(Object event, String cancellation) {
         ScheduledOutput owner = OutputCapture.scheduledOutput();
         if (owner == null) {
             return;
@@ -33,17 +43,18 @@ public final class ScheduledOutput {
                 owner.complete = false;
                 return;
             }
-            EVENTS.put(event, owner);
+            EVENTS.put(event, new Event(owner, cancellation));
             owner.pending++;
         }
     }
 
     public static void cancel(Object event) {
         synchronized (EVENTS) {
-            ScheduledOutput owner = EVENTS.remove(event);
-            if (owner != null) {
+            Event registered = EVENTS.remove(event);
+            if (registered != null) {
+                ScheduledOutput owner = registered.owner();
                 owner.pending--;
-                owner.output.appendLine("已取消一项预约函数。");
+                owner.output.appendLine(registered.cancellation());
                 owner.finishIfReady();
             }
         }
@@ -52,7 +63,8 @@ public final class ScheduledOutput {
     public static void run(Object event, Runnable callback) {
         ScheduledOutput owner;
         synchronized (EVENTS) {
-            owner = EVENTS.remove(event);
+            Event registered = EVENTS.remove(event);
+            owner = registered == null ? null : registered.owner();
             if (owner != null) {
                 owner.ran = true;
             }
@@ -108,7 +120,9 @@ public final class ScheduledOutput {
     void abandon() {
         result.cancel(false);
         synchronized (EVENTS) {
-            EVENTS.values().removeIf(owner -> owner == this);
+            if (scheduled) {
+                EVENTS.values().removeIf(event -> event.owner() == this);
+            }
         }
     }
 

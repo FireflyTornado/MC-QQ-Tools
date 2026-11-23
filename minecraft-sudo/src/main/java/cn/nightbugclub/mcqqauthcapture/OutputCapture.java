@@ -6,8 +6,10 @@ import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.Property;
 
+import java.io.ByteArrayOutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.nio.charset.Charset;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -17,6 +19,7 @@ import java.util.function.Supplier;
 public final class OutputCapture {
     private static final ThreadLocal<Frame> ACTIVE = new ThreadLocal<>();
     private static final CommandLog LOG = new CommandLog();
+    private static final StackWalker STACK = StackWalker.getInstance();
 
     private OutputCapture() {}
 
@@ -28,10 +31,10 @@ public final class OutputCapture {
         attachLogCollector();
         var session = new Session(output, scheduled);
         Frame previous = ACTIVE.get();
-        ACTIVE.set(new Frame(session));
+        var frame = new Frame(session);
+        ACTIVE.set(frame);
         return () -> {
-            restore(previous);
-            session.finish(true);
+            finishFrame(frame, previous, true);
             return session.completed;
         };
     }
@@ -39,6 +42,19 @@ public final class OutputCapture {
     static ScheduledOutput scheduledOutput() {
         Frame frame = ACTIVE.get();
         return frame == null ? null : frame.session.scheduled;
+    }
+
+    static void consoleBytes(boolean error, byte[] bytes, int offset, int length, Charset charset) {
+        Frame frame = ACTIVE.get();
+        if (frame == null || frame.session.completed.isDone() || length == 0) {
+            return;
+        }
+        // Console appenders may write back through System.out with follow=true.
+        boolean fromLog4j = STACK.walk(stack -> stack.anyMatch(call ->
+                call.getClassName().startsWith("org.apache.logging.log4j.core.appender.")));
+        if (!fromLog4j) {
+            frame.console(error, charset).append(frame.session, bytes, offset, length);
+        }
     }
 
     public static <T> Consumer<T> track(Consumer<T> callback) {
@@ -72,15 +88,15 @@ public final class OutputCapture {
                 return callback.apply(value);
             }
             Frame previous = ACTIVE.get();
-            ACTIVE.set(new Frame(session));
+            var frame = new Frame(session);
+            ACTIVE.set(frame);
             boolean success = false;
             try {
                 R result = callback.apply(value);
                 success = true;
                 return result;
             } finally {
-                restore(previous);
-                session.finish(success);
+                finishFrame(frame, previous, success);
             }
         };
     }
@@ -137,6 +153,15 @@ public final class OutputCapture {
         }
     }
 
+    private static void finishFrame(Frame frame, Frame previous, boolean success) {
+        try {
+            frame.flushConsole();
+        } finally {
+            restore(previous);
+            frame.session.finish(success);
+        }
+    }
+
     private static synchronized void attachLogCollector() {
         var context = (LoggerContext) LogManager.getContext(false);
         var root = context.getRootLogger();
@@ -149,9 +174,63 @@ public final class OutputCapture {
     private static final class Frame {
         final Session session;
         String broadcast;
+        private ConsoleLine stdout;
+        private ConsoleLine stderr;
 
         Frame(Session session) {
             this.session = session;
+        }
+
+        ConsoleLine console(boolean error, Charset charset) {
+            if (error) {
+                if (stderr == null) {
+                    stderr = new ConsoleLine(charset);
+                }
+                return stderr;
+            }
+            if (stdout == null) {
+                stdout = new ConsoleLine(charset);
+            }
+            return stdout;
+        }
+
+        void flushConsole() {
+            if (stdout != null) {
+                stdout.flush(session, false);
+            }
+            if (stderr != null) {
+                stderr.flush(session, false);
+            }
+        }
+    }
+
+    private static final class ConsoleLine {
+        private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        private final Charset charset;
+
+        ConsoleLine(Charset charset) {
+            this.charset = charset;
+        }
+
+        void append(Session session, byte[] input, int offset, int length) {
+            for (int index = offset; index < offset + length; index++) {
+                int value = input[index];
+                if (value == '\n') {
+                    flush(session, true);
+                } else if (bytes.size() < BoundedCommandOutput.MAX_BYTES) {
+                    bytes.write(value);
+                } else {
+                    session.incomplete();
+                }
+            }
+        }
+
+        void flush(Session session, boolean newline) {
+            if (bytes.size() != 0 || newline) {
+                String text = bytes.toString(charset);
+                bytes.reset();
+                session.append(newline && text.endsWith("\r") ? text.substring(0, text.length() - 1) : text);
+            }
         }
     }
 

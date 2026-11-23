@@ -695,7 +695,7 @@ events:
             await asyncio.wait_for(task, 2)
             poll.assert_awaited_once_with("bot-token", "GET", f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}")
             self.send_group.assert_awaited_once_with(
-                group_id=GROUP, message=MessageSegment.text(f"预约指令后续回执 {request_id}\n预约完成"),
+                group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n预约完成"),
             )
 
     async def test_sudo_uploads_exact_utf8_and_reports_unconfirmed_upload(self):

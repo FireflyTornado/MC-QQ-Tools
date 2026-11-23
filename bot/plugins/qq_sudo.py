@@ -51,8 +51,8 @@ REPLIES = {
     "expired": "指令已过期，未执行。",
     "timeout": "执行超时，结果未知。",
     "partial": "命令已返回，输出采集不完整。",
-    "scheduled": "预约已受理，函数执行后将补发结果。",
-    "cancelled": "预约函数已取消。",
+    "scheduled": "任务已安排，执行后将补发结果。",
+    "cancelled": "已安排的任务已取消。",
 }
 
 
@@ -175,9 +175,9 @@ async def render_result(bot: Bot, group_id: int, request_id: str, status: str, o
             text = f"结果文件上传失败或未确认。请求编号：{request_id}"
     if not text.strip():
         text = {
-            "expired": "等待预约函数回传已过期。",
-            "ok": "预约函数已执行，服务端无输出。",
-            "disconnected": "指令通道已断开，无法接收预约函数后续结果。",
+            "expired": "等待任务回传已过期。",
+            "ok": "已安排的任务执行完毕，服务端无输出。",
+            "disconnected": "指令通道已断开，无法接收任务后续结果。",
         }.get(status, REPLIES[status]) if followup else REPLIES[status]
     elif status in {"partial", "scheduled"}:
         if not text.endswith("\n"):
@@ -186,7 +186,7 @@ async def render_result(bot: Bot, group_id: int, request_id: str, status: str, o
     if status == "scheduled":
         text += f" 请求编号：{request_id}"
     if followup:
-        text = f"预约指令后续回执 {request_id}\n{text}"
+        text = f"指令后续回执 {request_id}\n{text}"
     return MessageSegment.text(text)
 
 
@@ -213,7 +213,7 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str)
             async with asyncio.timeout(UPLOAD_TIMEOUT):
                 await bot.send_group_msg(group_id=group_id, message=message)
     except Exception as exc:
-        logger.warning("/sudo #{} 预约结果发送失败（{}）", request_id, type(exc).__name__)
+        logger.warning("/sudo #{} 后续结果发送失败（{}）", request_id, type(exc).__name__)
 
 
 @sudo.handle()

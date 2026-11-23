@@ -359,11 +359,25 @@ Mod 为每条命令创建独立的远程执行者反馈缓冲，并采集本次�
 
 Mod 的 `sync.reconnect-min-ms` 和 `sync.reconnect-max-ms` 分别默认为 1000 和 30000 毫秒。`/sudo` 通道在握手成功或收到匹配的 Pong 后等待 20 秒发送 Ping，Pong 超时为 15 秒。心跳超时后按配置退避重连。
 
-Mod 在当前请求的等待窗口内收集已关联的回调。回调超时会返回已收集内容并提示采集不完整。第三方自建线程和不经过 Log4j 的控制台写入暂未接入。
+Mod 在当前请求的等待窗口内收集已关联的原版回调。回调超时会返回已收集内容并提示采集不完整。Mod 同时镜像原版和 JVM 标准 `System.out`、`System.err` 的直接写入，并保留 Mohist 已转发至 Log4j 的行。持有旧输出流引用、直接写文件描述符、子进程及第三方自行替换的输出流需要各自的接入方式。
 
 原版 `/schedule function` 实际入队后，群里先收到预约回执及请求编号，可以继续提交其他指令。函数执行后的输出会按同一编号补发，超过文本阈值时发为 TXT。可以用包含 `say 预约回显测试` 的数据包函数试验 `/sudo schedule function demo:notice 45s`，再用 `schedule clear demo:notice` 或重新预约验证取消和替换。一个请求安排多个函数时，后续回执在相关函数全部执行或取消后发出。
 
-预约回显最多跟踪一小时，状态保存在内存中。指令连接断开会结束本次回传，服务重启后按新的请求开始跟踪。原版定时事件继续按游戏服规则执行。启用预约补发时需同时部署包含此功能的 Mod、FastAPI 和 Bot。
+通过 Mohist 的 Bukkit 调度器提交的一次性同步、异步或延迟任务也会关联到正在执行的 `/sudo` 请求。任务执行或取消后复用后续回执。可用测试插件安排一项异步任务和一项延迟任务，验证普通请求在等待期间仍能执行，并用任务取消验证回执。周期任务继续按 Bukkit 的原有规则运行。
+
+插件用自有线程、线程池或回调时，可以将 Mod JAR 作为编译期依赖，在提交点使用 `cn.nightbugclub.mcqqauthcapture.CommandOutputContext.wrap(Runnable)` 或 `wrap(Consumer<T>)`。每次包装绑定一次调用，普通玩家或控制台触发的任务仍按原逻辑执行。若提交失败或任务在开始前取消，请调用包装对象的 `close()` 解除回传等待。此方法只解除关联，实际取消仍由插件的调度器处理。
+
+```java
+var task = CommandOutputContext.wrap(() -> runBackgroundWork());
+try {
+    executor.execute(task);
+} catch (RejectedExecutionException failure) {
+    task.close();
+    throw failure;
+}
+```
+
+延后任务回显最多跟踪一小时，状态保存在内存中。指令连接断开会结束本次回传，服务重启后按新的请求开始跟踪。游戏服仍按原有规则执行任务。启用后续回执时需同时部署包含此功能的 Mod、FastAPI 和 Bot。
 
 可在 `bot/.env` 中调整输出发送方式。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
 

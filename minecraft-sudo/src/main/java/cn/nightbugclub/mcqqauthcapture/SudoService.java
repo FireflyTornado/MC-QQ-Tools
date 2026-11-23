@@ -20,6 +20,7 @@ final class SudoService {
     private final Logger log;
     private SudoChannel channel;
     private SudoCommands commands;
+    private ConsoleOutput consoleOutput;
 
     SudoService(Path directory, Logger log) {
         this.directory = directory;
@@ -56,6 +57,11 @@ final class SudoService {
                 log.warning(reloadFailure(e));
             }
             channel = new SudoChannel(settings, commands, executor::execute, log, minMs, maxMs);
+            try {
+                consoleOutput = ConsoleOutput.install();
+            } catch (SecurityException denied) {
+                log.warning("/sudo 无法接入 JVM 标准输出和错误流。");
+            }
             channel.start();
         } catch (IOException | InvalidConfigurationException | SecurityException e) {
             stop();
@@ -73,6 +79,10 @@ final class SudoService {
         if (channel != null) {
             channel.close();
             channel = null;
+        }
+        if (consoleOutput != null) {
+            consoleOutput.close();
+            consoleOutput = null;
         }
         commands = null;
     }

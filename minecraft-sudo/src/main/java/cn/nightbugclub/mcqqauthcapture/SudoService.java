@@ -48,7 +48,7 @@ final class SudoService {
                 throw new IllegalStateException("Mohist server executor is unavailable");
             }
             var feedback = new MohistCommandFeedback(server);
-            feedback.open();
+            feedback.open(new CommandOutput());
             commands = new SudoCommands(server, Set.of(), feedback::open);
             try {
                 int count = commands.reloadAllowlist(directory.resolve(SudoCommands.ALLOWLIST_FILE));

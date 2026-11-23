@@ -10,7 +10,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 final class SudoCommands {
@@ -28,7 +28,7 @@ final class SudoCommands {
     }
 
     private final Server server;
-    private final Supplier<MohistCommandFeedback.Capture> openFeedback;
+    private final Function<CommandOutput, MohistCommandFeedback.Capture> openFeedback;
     // Reload and dispatch are serialized on the Minecraft main thread.
     private Set<String> allowed;
     private boolean dispatching;
@@ -37,7 +37,7 @@ final class SudoCommands {
         this(server, allowed, new MohistCommandFeedback(server)::open);
     }
 
-    SudoCommands(Server server, Set<String> allowed, Supplier<MohistCommandFeedback.Capture> openFeedback) {
+    SudoCommands(Server server, Set<String> allowed, Function<CommandOutput, MohistCommandFeedback.Capture> openFeedback) {
         this.server = server;
         this.allowed = Set.copyOf(allowed);
         this.openFeedback = openFeedback;
@@ -97,9 +97,10 @@ final class SudoCommands {
         if (server.getCommandAliases().keySet().stream().anyMatch(target::equalsIgnoreCase)) {
             return CompletableFuture.completedFuture(new Result("rejected"));
         }
+        CommandOutput output = scheduled == null ? new CommandOutput() : scheduled.output();
         MohistCommandFeedback.Capture feedback;
         try {
-            feedback = openFeedback.get();
+            feedback = openFeedback.apply(output);
         } catch (IllegalStateException e) {
             return CompletableFuture.completedFuture(new Result("error", "服务端命令反馈接口不可用，指令未执行。"));
         }
@@ -120,7 +121,13 @@ final class SudoCommands {
         CommandException failure = dispatchFailure;
         return complete.completeOnTimeout(false, Math.max(0, captureDeadlineMs - System.currentTimeMillis()),
                         TimeUnit.MILLISECONDS)
-                .thenApply(captured -> commandResult(feedback.output().get(), found, failure, captured));
+                .thenApply(captured -> {
+                    var initial = output.finishInitial();
+                    if (scheduled == null) {
+                        output.close();
+                    }
+                    return commandResult(initial, found, failure, captured);
+                });
     }
 
     private static Result commandResult(BoundedCommandOutput.Snapshot output, boolean dispatched, CommandException failure,

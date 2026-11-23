@@ -13,13 +13,17 @@ public final class ScheduledOutput {
 
     private record Event(ScheduledOutput owner, String cancellation) {}
 
-    private final BoundedCommandOutput output = new BoundedCommandOutput();
+    private final CommandOutput output = new CommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
     private int pending;
     private boolean scheduled;
     private boolean sealed;
     private boolean ran;
     private boolean complete = true;
+
+    CommandOutput output() {
+        return output;
+    }
 
     public static void enqueue(Object event) {
         enqueue(event, "已取消一项预约函数。");
@@ -54,7 +58,7 @@ public final class ScheduledOutput {
             if (registered != null) {
                 ScheduledOutput owner = registered.owner();
                 owner.pending--;
-                owner.output.appendLine(registered.cancellation());
+                owner.output.appendFollowupLine(registered.cancellation());
                 owner.finishIfReady();
             }
         }
@@ -76,7 +80,7 @@ public final class ScheduledOutput {
 
         Supplier<CompletableFuture<Boolean>> closeCapture;
         try {
-            closeCapture = OutputCapture.begin(owner.output::appendLine, owner);
+            closeCapture = OutputCapture.begin(owner.output::appendFollowupLine, owner);
         } catch (RuntimeException | LinkageError failure) {
             try {
                 OutputCapture.runQueuedTask(callback);
@@ -118,6 +122,7 @@ public final class ScheduledOutput {
     }
 
     void abandon() {
+        output.close();
         result.cancel(false);
         synchronized (EVENTS) {
             if (scheduled) {
@@ -127,8 +132,8 @@ public final class ScheduledOutput {
     }
 
     private void finishIfReady() {
-        if (sealed && pending == 0 && scheduled) {
-            var snapshot = output.snapshot();
+        if (sealed && pending == 0 && scheduled && !result.isDone()) {
+            var snapshot = output.finishFollowup();
             String status = !complete ? "partial" : ran ? "ok" : "cancelled";
             result.complete(new SudoCommands.Result(status, snapshot.text(), snapshot.truncated()));
         }

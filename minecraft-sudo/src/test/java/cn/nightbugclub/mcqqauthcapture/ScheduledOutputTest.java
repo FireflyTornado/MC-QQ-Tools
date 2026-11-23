@@ -5,11 +5,49 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ScheduledOutputTest {
+    @Test
+    void initialSnapshotDoesNotSplitAComponentBeingWrittenOnAnotherThread() throws Exception {
+        var output = new CommandOutput();
+        var firstPartWritten = new CountDownLatch(1);
+        var snapshotStarted = new CountDownLatch(1);
+        var writeRest = new CompletableFuture<Void>();
+        var workers = Executors.newFixedThreadPool(2);
+        try {
+            var writer = workers.submit(() -> output.append(buffer -> {
+                buffer.append("第一段");
+                firstPartWritten.countDown();
+                writeRest.join();
+                buffer.append("第二段\n");
+            }));
+            assertTrue(firstPartWritten.await(2, TimeUnit.SECONDS));
+            var initial = workers.submit(() -> {
+                snapshotStarted.countDown();
+                return output.finishInitial();
+            });
+            assertTrue(snapshotStarted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> initial.get(100, TimeUnit.MILLISECONDS));
+            writeRest.complete(null);
+            writer.get(2, TimeUnit.SECONDS);
+
+            assertEquals(new BoundedCommandOutput.Snapshot("第一段第二段\n", false), initial.get(2, TimeUnit.SECONDS));
+            output.appendLine("下一条消息");
+            assertEquals(new BoundedCommandOutput.Snapshot("下一条消息\n", false), output.finishFollowup());
+            output.append(ignored -> fail("A retained sender cannot write to a closed session"));
+        } finally {
+            writeRest.complete(null);
+            workers.shutdownNow();
+        }
+    }
+
     @Test
     void capturesActualEventsAndTheirNestedSchedulesWithoutMixingRequests() throws Exception {
         var scheduled = new ScheduledOutput();

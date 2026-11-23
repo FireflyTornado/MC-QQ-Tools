@@ -258,6 +258,7 @@ final class SudoChannel implements AutoCloseable {
     private void finishExecution(Connection source, Request request, SudoCommands.Result result, Throwable failure,
                                  ScheduledOutput scheduled) {
         if (failure != null) {
+            scheduled.output().finishInitial();
             log.warning("/sudo #" + request.id + " 执行异常（" + failure.getClass().getSimpleName() + "）");
             result = new SudoCommands.Result("error");
         }

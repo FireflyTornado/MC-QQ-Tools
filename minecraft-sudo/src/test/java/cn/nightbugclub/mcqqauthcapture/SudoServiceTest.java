@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
@@ -62,8 +63,8 @@ class SudoServiceTest {
         Files.writeString(allowlist, "list\nmcqqsudo reload\n");
         var commands = new AtomicReference<SudoCommands>();
         try (var feedback = mockConstruction(MohistCommandFeedback.class, (capture, context) ->
-                when(capture.open()).thenReturn(new MohistCommandFeedback.Capture(
-                        remote, new BoundedCommandOutput()::snapshot)));
+                when(capture.open(any(CommandOutput.class))).thenReturn(new MohistCommandFeedback.Capture(
+                        remote, ignored -> () -> CompletableFuture.completedFuture(true))));
              var channels = mockConstruction(SudoChannel.class, (channel, context) ->
                      commands.set((SudoCommands) context.arguments().get(1)))) {
             service.start(server);

@@ -1,4 +1,4 @@
-"""Resolve MC_AUTH_ENABLED as the installed API unit would on its next start."""
+"""Resolve MC_AUTH_ENABLED as the installed service would on its next start."""
 
 import json
 import subprocess
@@ -79,4 +79,4 @@ if __name__ == "__main__":
     try:
         print(service_auth_mode(sys.argv[1]))
     except (OSError, subprocess.SubprocessError, LookupError, ValueError, TypeError):
-        sys.exit("Unable to resolve the installed API unit's authorization mode.")
+        sys.exit("Unable to resolve the installed unit's authorization mode.")

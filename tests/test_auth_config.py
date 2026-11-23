@@ -125,6 +125,19 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(SUDO_SUBMIT_PATH, method="POST"))[0], 404)
         self.assertIsNone((await self.request("/internal/health"))[2]["sudo_connected"])
 
+    async def test_banlist_rejects_configured_sudo_tokens_when_sudo_is_disabled(self):
+        create_app = sys.modules["mc_api"].create_app
+        for key in ("MC_SUDO_BOT_TOKEN", "MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN"):
+            with self.subTest(key=key):
+                with self.assertLogs("mc_qq_tools", "ERROR") as logs:
+                    self.app = create_app({
+                        **ENV, "MC_SUDO_ENABLED": "false", "MC_BANLIST_TOKEN": BANLIST_TOKEN, key: BANLIST_TOKEN,
+                    })
+                self.assertIn("MC_BANLIST_TOKEN 必须使用独立凭据", logs.output[0])
+                self.assertNotIn(BANLIST_TOKEN, logs.output[0])
+                self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[0], 404)
+                self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
+
     async def test_stale_auth_database_stays_closed_while_sudo_keeps_its_routes(self):
         with closing(sqlite3.connect(database.DB_PATH)) as conn:
             conn.execute("PRAGMA user_version = 1")

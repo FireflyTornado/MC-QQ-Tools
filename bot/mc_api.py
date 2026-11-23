@@ -19,7 +19,7 @@ def create_app(config: dict[str, str | None]) -> FastAPI:
     if components.auth is not None:
         from auth_api import AuthApi
 
-        auth = AuthApi(components.auth, group_id, read_banlist_token(config, components.auth, components.sudo))
+        auth = AuthApi(components.auth, group_id, read_banlist_token(config, components.auth))
         app.include_router(auth.router)
     app.state.auth = auth
     sudo = None

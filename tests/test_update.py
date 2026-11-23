@@ -164,10 +164,18 @@ def mock_command(name, args):
                 print(conn.execute(operation).fetchone()[0])
             return 0
     if name == "python":
-        if args == ["-I", "-B", "deploy/service_auth_mode.py", API]:
-            if "service-probe-fails" in faults:
+        if args[:3] == ["-I", "-B", "deploy/service_auth_mode.py"]:
+            unit = args[3]
+            assert unit in (API, BOT)
+            if (unit == API and "service-probe-fails" in faults) or (unit == BOT and "bot-probe-fails" in faults):
                 return 1
-            print(int("sudo-only" not in faults))
+            enabled = "sudo-only" not in faults
+            if unit == BOT and (
+                "api-bot-mismatch" in faults
+                or ("bot-mode-changes" in faults and "backup:online" in events.read_text(encoding="utf-8"))
+            ):
+                enabled = not enabled
+            print(int(enabled))
             return 0
         if args[:3] == ["-I", "-B", "-c"]:
             exec(args[3], {"__name__": "__main__"})
@@ -529,7 +537,25 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         self.assertIn("Missing, empty or unsafe runtime file: bot/data/auth.db", out)
         self.assertEqual(self.observed(), [])
         out = self.run_tool("--check", "--local", faults=("service-probe-fails",))
-        self.assertIn("Unable to determine MC_AUTH_ENABLED for the installed API unit", out)
+        self.assertIn(f"Unable to determine MC_AUTH_ENABLED for {API}", out)
+
+    def test_refuses_to_skip_migration_if_bot_enables_auth(self):
+        target = self.incoming("bot/migrations/001.sql")
+        out = self.run_tool("--apply", target, faults=("sudo-only", "api-bot-mismatch"))
+        self.assertIn(f"MC_AUTH_ENABLED differs between {API} (0) and {BOT} (1)", out)
+        self.assertEqual(self.observed(), [])
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.initial)
+
+        out = self.run_tool("--apply", target, faults=("sudo-only", "bot-probe-fails"))
+        self.assertIn(f"Unable to determine MC_AUTH_ENABLED for {BOT}", out)
+        self.assertEqual(self.observed(), [])
+
+    def test_rechecks_bot_auth_mode_before_stopping_services(self):
+        target = self.incoming("bot/migrations/001.sql")
+        out = self.run_tool("--apply", target, faults=("bot-mode-changes",))
+        self.assertIn(f"MC_AUTH_ENABLED differs between {API} (1) and {BOT} (0)", out)
+        self.assertEqual(self.observed(), ["fetch", "backup:online"])
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.initial)
 
     def test_reenabling_auth_runs_a_deferred_migration_at_the_same_commit(self):
         target = self.incoming("bot/migrations/001.sql")

@@ -78,15 +78,18 @@ def check_auth_database(components: ComponentSettings) -> ComponentSettings:
     return components
 
 
-def read_banlist_token(
-    config: dict[str, str | None], auth: AuthSettings, sudo: SudoSettings | None,
-) -> bytes | None:
+def read_banlist_token(config: dict[str, str | None], auth: AuthSettings) -> bytes | None:
     if config.get("MC_BANLIST_TOKEN"):
         try:
             token = require_token(config, "MC_BANLIST_TOKEN")
-            other_tokens = {auth.api_token, auth.notify_token, config.get("ONEBOT_ACCESS_TOKEN")}
-            if sudo is not None:
-                other_tokens.update((sudo.bot_token, sudo.mod_token))
+            other_tokens = {
+                auth.api_token,
+                auth.notify_token,
+                config.get("ONEBOT_ACCESS_TOKEN"),
+                config.get("MC_SUDO_BOT_TOKEN"),
+                config.get("MC_SUDO_MOD_TOKEN"),
+                config.get("MC_SUDO_PLUGIN_TOKEN"),
+            }
             if token in other_tokens:
                 raise ConfigError("MC_BANLIST_TOKEN 必须使用独立凭据")
             return token.encode("ascii")

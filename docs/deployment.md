@@ -248,7 +248,7 @@ sudo bash deploy/update.sh --apply REVIEWED_COMMIT_SHA
 - `--check --local` 只使用缓存的 `origin/main`，不联网或更新 Git 引用，因此无法确认 GitHub 是否有新提交。两种检查模式都保持源码、虚拟环境、数据库和服务原样。
 - `--apply` 接受完整的 40 位 SHA 或至少 7 位且能唯一解析的十六进制前缀。执行前将 `REVIEWED_COMMIT_SHA` 替换为已审核的 SHA。目标必须在本次取得的 `origin/main` 历史中，并能从当前 `HEAD` 快进。管理员须先核对目标完整 SHA 与 CI 结果，再决定是否进入维护窗口。工具不会查询或替代这项审核。
 
-使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具按已加载的 `mc-qq-api.service` 环境读取 `MC_AUTH_ENABLED`，进程环境优先于 `bot/.env`。如果修改了 unit 或 drop-in，先运行 `systemctl daemon-reload`。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
+使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具按 `mc-qq-api.service` 和 `mc-qq-bot.service` 各自已加载的环境读取 `MC_AUTH_ENABLED`，进程环境优先于 `bot/.env`。任一单元的开关无法判定，或两个开关不一致时，工具会中止。如果修改了 unit 或 drop-in，先运行 `systemctl daemon-reload`。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
 
 Apply 按以下顺序执行。
 
@@ -353,7 +353,7 @@ include /opt/mc-qq-auth/deploy/nginx/mc-qq-api-http.conf;
 
 ### 玩家封禁名单联动
 
-在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。从旧版本升级时，运行 `python bot/migrate.py` 将数据库从 v1 迁移到 v2，然后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
+在 `bot/.env` 设置独立的 `MC_BANLIST_TOKEN`。停用 Sudo 时，保留在配置中的 Sudo Token 仍须与封禁名单 Token 不同。从旧版本升级时，运行 `python bot/migrate.py` 将数据库从 v1 迁移到 v2，然后重启 FastAPI 和 Bot，并使用上面的共用 HTTPS 规则。随后更新 Minecraft 插件。每个授权数据库只启用一个上报实例。
 
 ```yaml
 banlist-watch:

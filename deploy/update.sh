@@ -135,13 +135,20 @@ for path in bot/.env napcat/.env; do
     [[ -f $path && -s $path && ! -L $path && -r $path ]] || die "Missing, empty or unsafe runtime file: $path"
 done
 [[ -x $PYTHON ]] || die 'Production virtual environment interpreter is unavailable.'
-api_auth_mode() {
-    local enabled
-    enabled=$("$PYTHON" -I -B deploy/service_auth_mode.py "$API" 2>/dev/null) || return 1
+unit_auth_mode() {
+    local unit=$1 enabled
+    enabled=$("$PYTHON" -I -B deploy/service_auth_mode.py "$unit" 2>/dev/null) || return 1
     [[ $enabled == 0 || $enabled == 1 ]] || return 1
     printf '%s\n' "$enabled"
 }
-auth_enabled=$(api_auth_mode) || die 'Unable to determine MC_AUTH_ENABLED for the installed API unit.'
+shared_auth_mode() {
+    local api_mode bot_mode
+    api_mode=$(unit_auth_mode "$API") || die "Unable to determine MC_AUTH_ENABLED for $API."
+    bot_mode=$(unit_auth_mode "$BOT") || die "Unable to determine MC_AUTH_ENABLED for $BOT."
+    [[ $api_mode == "$bot_mode" ]] || die "MC_AUTH_ENABLED differs between $API ($api_mode) and $BOT ($bot_mode)."
+    printf '%s\n' "$api_mode"
+}
+auth_enabled=$(shared_auth_mode) || exit 1
 if (( auth_enabled )); then
     command -v sqlite3 >/dev/null || die 'Missing command: sqlite3'
     [[ -d bot/data && ! -L bot/data ]] || die 'Expected a real directory: bot/data'
@@ -412,7 +419,8 @@ phase=preflight
 clean_worktree
 [[ $(repo_git rev-parse HEAD) == "$head" && $(repo_git symbolic-ref --short HEAD) == main ]] ||
     die 'HEAD or branch changed during preflight.'
-[[ $(api_auth_mode) == "$auth_enabled" ]] || die 'The API authorization mode changed during preflight.'
+checked_auth=$(shared_auth_mode) || exit 1
+[[ $checked_auth == "$auth_enabled" ]] || die 'The service authorization mode changed during preflight.'
 phase=stop
 if (( update_bot )); then
     systemctl stop "$BOT" >/dev/null 2>&1 || die 'Failed to stop Bot.'

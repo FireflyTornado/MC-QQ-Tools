@@ -50,7 +50,7 @@ def _font_source(bold: bool) -> tuple[str, int] | None:
     if source is None:
         if bold:
             return _font_source(False)
-        logger.warning("[MC-QQ-AUTH] 未找到中文字体，状态图使用英文备用标签")
+        logger.warning("[MC-QQ-Tools] 未找到中文字体，状态图使用英文备用标签")
     return source
 
 
@@ -226,7 +226,7 @@ def render_status(
 
     fields = {
         "font_family": family,
-        "title": text(messages.info_text("info.title", **variables), 29, 485, "MC-QQ-Auth", strong=True),
+        "title": text(messages.info_text("info.title", **variables), 29, 485, "MC-QQ-Tools", strong=True),
         "page_label": "运行状态" if cjk else "Runtime status",
         "avatar": _avatar_uri(avatar),
         "avatar_display": "inline" if avatar is not None else "none",

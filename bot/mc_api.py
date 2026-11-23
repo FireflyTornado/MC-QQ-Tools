@@ -9,7 +9,7 @@ def create_app(config: dict[str, str | None]) -> FastAPI:
     group_id = str(target_group_id(config))
     components = read_components(config)
     app = FastAPI(
-        title="MC QQ Authentication API",
+        title="MC-QQ-Tools API",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -33,6 +33,7 @@ def create_app(config: dict[str, str | None]) -> FastAPI:
     async def health():
         return {
             "status": "ok",
+            "auth_enabled": auth is not None,
             "minecraft_connections": len(auth.connections) if auth is not None else 0,
             "sudo_connected": sudo.connected if sudo is not None else None,
         }

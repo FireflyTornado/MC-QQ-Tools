@@ -55,7 +55,7 @@ def read_sudo_output_settings(config: dict[str, str | None]) -> SudoOutputSettin
 class SudoSettings:
     qq_ids: frozenset[str]
     bot_token: str
-    plugin_token: str
+    mod_token: str
 
 
 def read_sudo_settings(
@@ -79,10 +79,22 @@ def read_sudo_settings(
             raise ConfigError("启用 /sudo 时，MC_SUDO_QQ_IDS 必须至少包含一个 QQ 号")
         return None
     bot_token = require_token(config, "MC_SUDO_BOT_TOKEN")
-    plugin_token = require_token(config, "MC_SUDO_PLUGIN_TOKEN")
-    if bot_token == plugin_token or {bot_token, plugin_token} & {config.get("ONEBOT_ACCESS_TOKEN"), *auth_tokens}:
+    mod_key = "MC_SUDO_MOD_TOKEN"
+    legacy_key = "MC_SUDO_PLUGIN_TOKEN"
+    legacy_token = config.get(legacy_key)
+    if config.get(mod_key) is None and legacy_token is not None:
+        mod_token = require_token(config, legacy_key)
+        if mod_token == f"REPLACE_WITH_{mod_key}":
+            raise ConfigError(f"{legacy_key} 必须填写实际凭据")
+    else:
+        mod_token = require_token(config, mod_key)
+        if legacy_token is not None and legacy_token != mod_token:
+            raise ConfigError(f"{mod_key} 与 {legacy_key} 必须使用相同的值")
+        if mod_token == f"REPLACE_WITH_{legacy_key}":
+            raise ConfigError(f"{mod_key} 必须填写实际凭据")
+    if bot_token == mod_token or {bot_token, mod_token} & {config.get("ONEBOT_ACCESS_TOKEN"), *auth_tokens}:
         raise ConfigError("/sudo 凭据必须独立配置")
-    return SudoSettings(frozenset(ids), bot_token, plugin_token)
+    return SudoSettings(frozenset(ids), bot_token, mod_token)
 
 
 def is_single_command(command: str) -> bool:

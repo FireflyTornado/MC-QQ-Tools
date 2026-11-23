@@ -23,6 +23,27 @@ class SudoServiceTest {
     Path configDirectory;
 
     @Test
+    void honorsTheLegacyDirectoryUntilTheNewDirectoryExists() throws Exception {
+        Path current = configDirectory.resolve("mcqqsudo");
+        Path legacy = configDirectory.resolve("mcqqauth-sudo");
+        assertEquals(current, SudoMod.configDirectory(configDirectory));
+        Files.createDirectory(legacy);
+        Files.writeString(legacy.resolve("config.yml"), "sudo: {enabled: false}\n");
+        Path rules = Files.writeString(legacy.resolve(SudoCommands.ALLOWLIST_FILE), "list\n");
+
+        var service = new SudoService(SudoMod.configDirectory(configDirectory), mock(Logger.class));
+        service.start(null);
+        assertFalse(Files.exists(current));
+        assertEquals(Set.of("list"), SudoCommands.readAllowlist(rules));
+
+        Files.createDirectory(current);
+        assertEquals(current, SudoMod.configDirectory(configDirectory));
+        new SudoService(SudoMod.configDirectory(configDirectory), mock(Logger.class)).start(null);
+        assertEquals(Set.of(), SudoCommands.readAllowlist(current.resolve(SudoCommands.ALLOWLIST_FILE)));
+        assertEquals(Set.of("list"), SudoCommands.readAllowlist(rules));
+    }
+
+    @Test
     void createsDisabledDefaultsAndPreservesExistingRules() throws Exception {
         var service = new SudoService(configDirectory, mock(Logger.class));
         Path allowlist = configDirectory.resolve(SudoCommands.ALLOWLIST_FILE);

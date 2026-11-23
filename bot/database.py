@@ -255,9 +255,9 @@ def init_database(db_path: Path | None = None) -> None:
         ))
         known_tables = CURRENT_TABLES.keys() | LEGACY_TABLES
         if tables and not known_tables.intersection(tables):
-            raise MigrationError("Database has no recognized MC-QQ-Auth tables")
+            raise MigrationError("Database has no recognized MCQQAuth tables")
         if any(tables[name] != "table" for name in known_tables.intersection(tables)):
-            raise MigrationError("An expected MC-QQ-Auth table is a view")
+            raise MigrationError("An expected MCQQAuth table is a view")
 
         if version == 0:
             if "offline_bindings" in tables and "auth_state" not in tables:

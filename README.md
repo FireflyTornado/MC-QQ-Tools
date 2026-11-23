@@ -1,6 +1,11 @@
-# MC-QQ-Auth
+# MC-QQ-Tools
 
-MC-QQ-Auth 面向 Minecraft Java 版离线社区服务器。玩家在指定 QQ 群绑定游戏 ID，Minecraft 插件通过 HTTPS 快照和 WSS 更新提醒获取授权名单，并据此执行游戏端准入。
+MC-QQ-Tools 为 Minecraft Java 服务器提供两套可独立启用的工具，按需共用 NapCat、Bot 和 FastAPI。
+
+| 组件 | 用途 |
+| --- | --- |
+| **MCQQAuth** 插件 | 在 QQ 群绑定游戏 ID，通过 HTTPS 快照和 WSS 同步授权名单，管理游戏服准入与封禁联动。 |
+| **MCQQSudo** 模组 | 从 QQ 群提交获准的 Minecraft 指令，在群内回显执行结果和后续输出。 |
 
 ## 功能状态
 
@@ -13,9 +18,9 @@ MC-QQ-Auth 面向 Minecraft Java 版离线社区服务器。玩家在指定 QQ �
 
 ## 系统架构与技术栈
 
-**QQ 群 → NapCat → NoneBot2 → SQLite → FastAPI → HTTPS/WSS → Minecraft 插件**
+**QQ 群 → NapCat → NoneBot2 → FastAPI → Minecraft**
 
-NapCat、Bot 和授权 API 部署在同一台主机，Minecraft 服务端在另一台主机。Bot 写入 SQLite 后通知 FastAPI，游戏端通过 HTTPS 拉取完整名单，通过 WSS 得知何时刷新。系统使用 Python 3.12、NoneBot2 / OneBot v11、FastAPI / Uvicorn、SQLite 和 Docker Compose。插件使用 Java 17、Maven 和 Spigot API 1.20.1，目标服务端为 Mohist 1.20.1。详见 [架构说明](docs/architecture.md)。
+NapCat、Bot 和 FastAPI 部署在同一台主机，Minecraft 服务端在另一台主机。MCQQAuth 使用 SQLite 保存授权数据，游戏端通过 HTTPS 获取完整名单，通过 WSS 接收刷新通知。MCQQSudo 使用独立 WSS 通道收发指令和回执。两个游戏端组件分别构建，目标服务端为 Mohist 1.20.1。详见 [架构说明](docs/architecture.md)。
 
 ## QQ 群使用方式
 

@@ -1,4 +1,4 @@
-# MC-QQ-Auth 默认文案。复制为同目录的 messages.yml 后修改，重启 Bot 生效。
+# MC-QQ-Tools 默认文案。复制为同目录的 messages.yml 后修改，重启 Bot 生效。
 # 只填写要覆盖的字段也可以。文案最多 1000 字符。用 {{ 和 }} 显示字面花括号。
 # 通用变量可用于所有文字文案，包括状态图的标题和标签。
 # {group_id} 是配置的目标 QQ 群号，{bot_qq} 是当前机器人的 QQ 号。
@@ -77,19 +77,19 @@ commands:
     # 收到 HTTP 响应时使用 success，包括非 2xx。{status_code} 是响应的 HTTP 状态码。
     # 四种回复均支持 {latency_ms}，即本次检测耗时，单位为毫秒。
     success: |-
-      [MC-QQ-Auth] Ping
+      [MC-QQ-Tools] Ping
       FastAPI Health: HTTP {status_code}
       Latency: {latency_ms} ms
     timeout: |-
-      [MC-QQ-Auth] Ping
+      [MC-QQ-Tools] Ping
       FastAPI Health: Timeout
       Latency: {latency_ms} ms
     connection_error: |-
-      [MC-QQ-Auth] Ping
+      [MC-QQ-Tools] Ping
       FastAPI Health: Connection failed
       Latency: {latency_ms} ms
     error: |-
-      [MC-QQ-Auth] Ping
+      [MC-QQ-Tools] Ping
       FastAPI Health: Invalid HTTP response
       Latency: {latency_ms} ms
   reconcile:
@@ -134,7 +134,7 @@ commands:
   help:
     # 授权启用时的帮助正文。每种文案都支持 {group_id} 和 {bot_qq}。
     message: |-
-      [MC-QQ-Auth] 指令帮助
+      [MC-QQ-Tools] 指令帮助
       /绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID
       /我的绑定 或 /binding · 查询自己的绑定
       /解绑 或 /unbind · 撤销自己的绑定
@@ -157,9 +157,9 @@ commands:
 
 info:
   # 图片上按单行显示，超过可用宽度时截断。
-  title: "MC-QQ-Auth"
+  title: "MC-QQ-Tools"
   # 旧版兼容项。采集时间显示在账号卡内，使用 Bot 服务器的当地时间。
-  footer: "MC-QQ-Auth"
+  footer: "MC-QQ-Tools"
   labels:
     # bot、auth_version、last_reconcile 和 last_notice 为旧版兼容项。
     bot: "Bot"

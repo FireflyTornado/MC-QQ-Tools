@@ -132,7 +132,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_both_components_mount_their_routes_and_use_separate_credentials(self):
         self.app = sys.modules["mc_api"].create_app({
             **ENV, "MC_SUDO_ENABLED": "true", "MC_SUDO_QQ_IDS": '["123"]',
-            "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_PLUGIN_TOKEN": "mod-token",
+            "MC_SUDO_BOT_TOKEN": "bot-token", "MC_SUDO_MOD_TOKEN": "mod-token",
         })
         self.app.state.auth.db_path = self.api.db_path
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[0], 200)
@@ -156,7 +156,8 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
         async def check_channels(auth_connections, sudo_connected):
             status, _, health = await self.request("/internal/health")
             self.assertEqual((status, health), (200, {
-                "status": "ok", "minecraft_connections": auth_connections, "sudo_connected": sudo_connected,
+                "status": "ok", "auth_enabled": True,
+                "minecraft_connections": auth_connections, "sudo_connected": sudo_connected,
             }))
 
         await check_channels(0, False)
@@ -434,7 +435,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.upload_banlist(1, 1, entries))[0], 422)
         self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)], "PUT", b'{"entries":'))[0], 422)
         self.set_version(database.MAX_AUTH_VERSION)
-        with self.assertLogs("mc_qq_auth", "ERROR"):
+        with self.assertLogs("mc_qq_tools", "ERROR"):
             self.assertEqual((await self.upload_banlist(1, 1, {"Steve": None}))[0], 503)
         self.assertEqual((await self.request(BANLIST_PATH, [bearer(BANLIST_TOKEN)]))[2], {"generation": 0})
         self.assertEqual((await self.request(SNAPSHOT_PATH, [bearer(API_TOKEN)]))[2]["active_names"], ["alex", "steve"])
@@ -513,7 +514,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_websocket_connects_and_broadcasts_existing_messages(self):
         status, _, health = await self.request("/internal/health")
         self.assertEqual((status, health), (200, {
-            "status": "ok", "minecraft_connections": 0, "sudo_connected": None,
+            "status": "ok", "auth_enabled": True, "minecraft_connections": 0, "sudo_connected": None,
         }))
         incoming = asyncio.Queue()
         outgoing = asyncio.Queue()
@@ -532,7 +533,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             })
             status, _, health = await self.request("/internal/health")
             self.assertEqual((status, health), (200, {
-                "status": "ok", "minecraft_connections": 1, "sudo_connected": None,
+                "status": "ok", "auth_enabled": True, "minecraft_connections": 1, "sudo_connected": None,
             }))
             status, _, notify = await self.request(NOTIFY_PATH, [bearer(NOTIFY_TOKEN)], "POST")
             self.assertEqual(status, 200)
@@ -582,7 +583,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError(API_TOKEN)
 
         async with self.websocket(broken_send) as (failed, failed_task), self.websocket() as (healthy, _):
-            with self.assertLogs("mc_qq_auth", "WARNING") as logs:
+            with self.assertLogs("mc_qq_tools", "WARNING") as logs:
                 status, _, body = await self.request(NOTIFY_PATH, [bearer(NOTIFY_TOKEN)], "POST")
                 self.assertEqual(status, 200)
                 self.assertEqual(body, {"success": True, "version": VERSION, "delivered": 1})
@@ -687,7 +688,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(binding_service, "DB_PATH", self.api.db_path), patch.object(
                 notify_client, "load_config", return_value=ENV
             ), patch.object(notify_client.opener, "open", side_effect=URLError(NOTIFY_TOKEN)), self.assertLogs(
-                "mc_qq_auth", "WARNING"
+                "mc_qq_tools", "WARNING"
             ) as logs:
                 self.assertEqual(binding_service.unbind_player(GROUP_ID, "1"), "Steve")
                 self.assertIsNone(binding_service.get_binding(GROUP_ID, "1"))
@@ -711,7 +712,7 @@ class ApiAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(outgoing.empty())
 
             self.set_version(VERSION - 1)
-            with self.assertLogs("mc_qq_auth", "ERROR"):
+            with self.assertLogs("mc_qq_tools", "ERROR"):
                 self.assertEqual((await self.request(NOTIFY_PATH, [bearer(NOTIFY_TOKEN)], "POST"))[0], 503)
             self.assertEqual(self.api.last_broadcast_version, VERSION)
             self.assertTrue(outgoing.empty())
@@ -797,11 +798,11 @@ class ConfigTests(unittest.TestCase):
         sudo_only = read_components({**sudo, "MC_AUTH_ENABLED": "false", "MC_API_TOKEN": "bot-token"})
         self.assertIsNone(sudo_only.auth)
         self.assertIsNotNone(sudo_only.sudo)
-        with self.assertLogs("mc_qq_auth", "ERROR"):
+        with self.assertLogs("mc_qq_tools", "ERROR"):
             sudo_only = read_components({**sudo, "MC_NOTIFY_TOKEN": NOTIFY_TOKEN})
         self.assertIsNone(sudo_only.auth)
         self.assertIsNotNone(sudo_only.sudo)
-        with self.assertLogs("mc_qq_auth", "ERROR"):
+        with self.assertLogs("mc_qq_tools", "ERROR"):
             auth_only = read_components({**ENV, **sudo, "MC_SUDO_BOT_TOKEN": API_TOKEN})
         self.assertIsNotNone(auth_only.auth)
         self.assertIsNone(auth_only.sudo)
@@ -835,7 +836,7 @@ class ConfigTests(unittest.TestCase):
             ):
                 response.status = status
                 response.read.return_value = body
-                with self.subTest(status=status, length=len(body)), self.assertLogs("mc_qq_auth", "WARNING") as logs:
+                with self.subTest(status=status, length=len(body)), self.assertLogs("mc_qq_tools", "WARNING") as logs:
                     self.assertFalse(notify_client.notify_auth_updated())
                     self.assertNotIn(NOTIFY_TOKEN, "\n".join(logs.output))
 
@@ -846,7 +847,7 @@ class ConfigTests(unittest.TestCase):
             binding_service, "DB_PATH", path
         ), patch.object(
             notify_client.opener, "open", side_effect=URLError(NOTIFY_TOKEN)
-        ), self.assertLogs("mc_qq_auth", level="WARNING") as logs:
+        ), self.assertLogs("mc_qq_tools", level="WARNING") as logs:
             self.assertEqual(binding_service.bind_player(GROUP_ID, "qq", "MiXeD"), ("success", "MiXeD"))
             self.assertEqual(binding_service.get_binding(GROUP_ID, "qq"), "MiXeD")
         self.assertNotIn(NOTIFY_TOKEN, "\n".join(logs.output))
@@ -906,7 +907,7 @@ assert mc_api.app.state.auth.banlist_token is None
                 *ENV, "DRIVER", "LOG_LEVEL", "ENVIRONMENT", "ONEBOT_ACCESS_TOKEN",
                 "ONEBOT_V11_ACCESS_TOKEN", "ONEBOT_WS_URLS", "ONEBOT_V11_WS_URLS",
                 "MC_AUTH_ENABLED", "MC_BANLIST_TOKEN", "MC_SUDO_ENABLED",
-                "MC_SUDO_QQ_IDS", "MC_SUDO_BOT_TOKEN", "MC_SUDO_PLUGIN_TOKEN",
+                "MC_SUDO_QQ_IDS", "MC_SUDO_BOT_TOKEN", "MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN",
             }
         }
         env.update(TARGET_GROUP_ID="98765", ONEBOT_ACCESS_TOKEN=onebot_token, PYTHONUTF8="1")
@@ -930,7 +931,7 @@ assert mc_api.app.state.auth.banlist_token is None
             shutil.copyfile(BOT_DIR / rel, project / rel)
         (project / ".env").write_text(
             'DRIVER=~websockets\nTARGET_GROUP_ID=12345\nMC_AUTH_ENABLED=false\nMC_SUDO_ENABLED=true\n'
-            'MC_SUDO_QQ_IDS=["123"]\nMC_SUDO_BOT_TOKEN=bot-token\nMC_SUDO_PLUGIN_TOKEN=mod-token\n',
+            'MC_SUDO_QQ_IDS=["123"]\nMC_SUDO_BOT_TOKEN=bot-token\nMC_SUDO_MOD_TOKEN=mod-token\n',
             encoding="utf-8",
         )
         code = """
@@ -965,7 +966,9 @@ def check_routes(port):
         conn.request("GET", "/internal/health")
         response = conn.getresponse()
         assert response.status == 200
-        assert json.load(response) == {"status": "ok", "minecraft_connections": 0, "sudo_connected": False}
+        assert json.load(response) == {
+            "status": "ok", "auth_enabled": False, "minecraft_connections": 0, "sudo_connected": False,
+        }
         conn.request("GET", "/internal/mc/snapshot")
         assert conn.getresponse().status == 404
 

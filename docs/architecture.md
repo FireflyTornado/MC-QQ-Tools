@@ -1,15 +1,14 @@
-# 系统架构
+# MC-QQ-Tools 系统架构
 
 ## 组件与部署
 
 ```text
-QQ 群 → NapCat → NoneBot2 → SQLite
-NoneBot2 ── 提交后 POST 通知 ──→ FastAPI ←→ SQLite
-FastAPI ── HTTPS 快照 / WSS 更新提醒 ──→ Minecraft 插件
-Minecraft 插件 ── HTTPS 封禁快照 ──→ FastAPI
+QQ 群 → NapCat → NoneBot2 ↔ FastAPI
+MCQQAuth：NoneBot2 / FastAPI ↔ SQLite，FastAPI ↔ 授权插件
+MCQQSudo：NoneBot2 ↔ 回环指令与回执 API ↔ 模组 WSS 通道
 ```
 
-NapCat、NoneBot2 和 FastAPI 通常部署在同一台主机。NoneBot2 使用 OneBot v11 WebSocket 客户端连接 NapCat，接收目标群的消息和事件。Minecraft 运行在异地主机，插件通过受控的 HTTPS/WSS 入口接入授权 API。反代访问边界见 [部署说明](deployment.md)。
+NapCat、NoneBot2 和 FastAPI 通常部署在同一台主机。NoneBot2 使用 OneBot v11 WebSocket 接收目标群的消息和事件。MCQQAuth 通过 HTTPS 快照和 WSS 更新提醒同步授权，封禁快照通过 HTTPS 上报。MCQQSudo 使用单独的 WSS 通道，指令与回执状态保存在 API 进程内。两个组件可以分别启用。反代访问边界见 [部署说明](deployment.md)。
 
 ## 写入与授权版本
 

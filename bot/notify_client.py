@@ -6,7 +6,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from app_config import ConfigError, load_config, notify_url, require_token
 from runtime_status import record_outcome
 
-logger = logging.getLogger("mc_qq_auth")
+logger = logging.getLogger("mc_qq_tools.auth")
 NOTIFY_TIMEOUT = 3
 MAX_NOTIFY_RESPONSE = 4096
 

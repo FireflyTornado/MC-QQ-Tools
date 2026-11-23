@@ -59,7 +59,7 @@ def get_avatar(qq_id: str) -> Image.Image | None:
         avatar = _download_avatar(qq_id)
     except Exception as exc:
         # Transport and image decoding are both optional parts of the status card.
-        logger.debug("[MC-QQ-AUTH] QQ 头像不可用（{}）", type(exc).__name__)
+        logger.debug("[MC-QQ-Tools] QQ 头像不可用（{}）", type(exc).__name__)
         avatar = None
     with _cache_lock:
         ttl = AVATAR_TTL if avatar is not None else FAILURE_TTL

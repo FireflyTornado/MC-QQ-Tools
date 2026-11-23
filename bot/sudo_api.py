@@ -22,7 +22,7 @@ from sudo_config import (
     is_single_command,
 )
 
-logger = logging.getLogger("uvicorn.error.mc_qq_auth.sudo")
+logger = logging.getLogger("uvicorn.error.mc_qq_tools.sudo")
 PLUGIN_RESULTS = {"ok", "rejected", "error", "busy", "expired", "partial", "scheduled"}
 FOLLOWUP_RESULTS = {"ok", "error", "cancelled", "expired", "partial"}
 MAX_MESSAGE_BYTES = 8192
@@ -230,7 +230,7 @@ def sudo_router(
         nonlocal plugin
         if (
             settings is None or plugin is not None
-            or not verify_bearer(websocket.headers.getlist("authorization"), settings.plugin_token.encode("ascii"))
+            or not verify_bearer(websocket.headers.getlist("authorization"), settings.mod_token.encode("ascii"))
         ):
             await websocket.close(code=1008)
             return

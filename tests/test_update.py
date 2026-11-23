@@ -15,6 +15,7 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1] / "deploy" / "update.sh"
 ORIGIN = "https://github.com/FireflyTornado/MC-qq-auth-BF656.git"
+NEW_ORIGIN = "https://github.com/FireflyTornado/MC-QQ-Tools.git"
 API = "mc-qq-api.service"
 BOT = "mc-qq-bot.service"
 
@@ -91,12 +92,18 @@ def mock_command(name, args):
             print("INFO: Bot 10001 disconnected")
         return 0
     if name == "curl":
-        if "health" in faults and f"start:{API}" in events.read_text(encoding="utf-8"):
+        is_health = args[-1].endswith("/health")
+        if "sudo-only" in faults:
+            assert is_health and "-o" not in args
+            print(json.dumps({"status": "ok", "auth_enabled": "auth-mismatch" in faults}))
+            print("200", end="")
+        elif "health" in faults and f"start:{API}" in events.read_text(encoding="utf-8"):
             print("503", end="")
         else:
-            print("200" if args[-1].endswith("/health") else "401", end="")
+            print("200" if is_health else "401", end="")
         return 0
     if name == "sqlite3":
+        assert "sudo-only" not in faults
         source, operation = local_path(args[-2]), args[-1]
         with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             if operation.startswith(".backup "):
@@ -114,6 +121,9 @@ def mock_command(name, args):
                 print(conn.execute(operation).fetchone()[0])
             return 0
     if name == "python":
+        if args[:3] == ["-I", "-B", "-c"]:
+            exec(args[3], {"__name__": "__main__"})
+            return 0
         if "pip" in args:
             command = next(x for x in args if x in {"download", "install", "check"})
             record("pip:" + command)
@@ -159,7 +169,9 @@ class UpdateTests(unittest.TestCase):
         self.state.write_text(json.dumps({API: "active", BOT: "active"}), encoding="utf-8")
         self.bash = find_bash()
         self.git_exe = shutil.which("git")
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        self.env = {
+            k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k.upper() != "MC_AUTH_ENABLED"
+        }
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1")
         self.upstream.mkdir()
         self.git(self.upstream, "init", "-b", "main", "--template=")
@@ -168,6 +180,7 @@ class UpdateTests(unittest.TestCase):
             "README.md": "before\n", "requirements.txt": "example==1.0\n",
             "requirements.in": "example==1.0\n",
             "bot/bot.py": "# baseline\n", "bot/mc_api.py": "# baseline\n",
+            "bot/app_config.py": (SOURCE.parents[1] / "bot/app_config.py").read_text(encoding="utf-8"),
             "bot/database.py": "# baseline\n", "bot/migrate.py": "# baseline\n",
             "bot/migrations/001.sql": "-- initial\n", "napcat/compose.yaml": "services: {}\n",
             "deploy/systemd/mc-qq-api.service": "# baseline\n",
@@ -176,7 +189,7 @@ class UpdateTests(unittest.TestCase):
         self.initial = self.commit_upstream()
         self.git(self.root, "clone", "--quiet", str(self.upstream), str(self.repo))
         for path in ("bot/.env", "napcat/.env"):
-            self.write(self.repo / path, "synthetic fixture\n")
+            self.write(self.repo / path, "# synthetic fixture\n")
         (self.repo / "napcat/data").mkdir()
         (self.repo / "bot/data").mkdir()
         self.db = self.repo / "bot/data/auth.db"
@@ -222,7 +235,7 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         tool = SOURCE.read_text(encoding="utf-8")
         tool = tool.replace("PROJECT=/opt/mc-qq-auth BACKUPS=/opt/mc-qq-auth-backups",
                             f"PROJECT={shlex.quote(shell_repo)} BACKUPS={shlex.quote(shell_root + '/backups')}", 1)
-        tool = tool.replace("/tmp/mc-qq-auth-update.", shell_root + "/mc-qq-auth-update.")
+        tool = tool.replace("/tmp/mc-qq-tools-update.", shell_root + "/mc-qq-tools-update.")
         if os.name == "nt":
             # MSYS cannot open a Windows directory on this descriptor. The lock command is mocked.
             tool = tool.replace("exec {lock_fd}<.git\n", "exec {lock_fd}<.git/HEAD\n")
@@ -437,6 +450,25 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         target = self.incoming("README.md")
         self.assertIn("Source-only update", self.run_tool("--apply", target, okay=True))
         self.assertEqual(self.observed(), ["fetch", "merge"])
+        self.assertFalse(self.backups.exists())
+
+    def test_sudo_only_upgrades_from_new_origin_without_a_database(self):
+        self.env["UPDATE_EXPECTED_ORIGIN"] = NEW_ORIGIN
+        self.write(self.repo / "bot/.env", "# synthetic fixture\nMC_AUTH_ENABLED=false\n")
+        self.db.unlink()
+        self.db.parent.rmdir()
+        target = self.incoming("bot/mc_api.py", "bot/migrations/001.sql")
+
+        mismatch = self.run_tool("--apply", target, faults=("sudo-only", "auth-mismatch"))
+        self.assertIn("API or OneBot baseline health is unverified", mismatch)
+        self.assertEqual(self.observed(), ["fetch"])
+        self.events.write_text("", encoding="utf-8")
+
+        out = self.run_tool("--apply", target, faults=("sudo-only",), okay=True)
+        self.assertIn("migration=0", out)
+        self.assertIn("API health verified on loopback with authorization disabled", out)
+        self.assertEqual(self.observed(), ["fetch", f"stop:{BOT}", f"stop:{API}", "merge", f"start:{API}", f"start:{BOT}"])
+        self.assertFalse(self.db.parent.exists())
         self.assertFalse(self.backups.exists())
 
 

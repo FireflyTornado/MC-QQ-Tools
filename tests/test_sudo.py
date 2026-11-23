@@ -15,11 +15,23 @@ from sudo_api import sudo_router
 from app_config import ConfigError
 from sudo_config import (
     MAX_RESULT_BYTES, SUDO_FOLLOWUP_PATH, SUDO_SUBMIT_PATH, SUDO_WS_PATH,
-    SudoSettings, is_single_command, read_sudo_output_settings,
+    SudoSettings, is_single_command, read_sudo_output_settings, read_sudo_settings,
 )
 
 
 class SudoOutputSettingsTests(unittest.TestCase):
+    def test_legacy_and_new_mod_token_keys(self):
+        config = {"MC_SUDO_QQ_IDS": '["123"]', "MC_SUDO_BOT_TOKEN": "bot-token"}
+        keys = ("MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN")
+        for fields in ({keys[0]: "mod-token"}, {keys[1]: "mod-token"}, dict.fromkeys(keys, "mod-token")):
+            self.assertEqual(read_sudo_settings(config | fields).mod_token, "mod-token")
+        with self.assertRaisesRegex(ConfigError, "MC_SUDO_MOD_TOKEN.*MC_SUDO_PLUGIN_TOKEN") as error:
+            read_sudo_settings(config | {keys[0]: "mod-token", keys[1]: "old-token"})
+        self.assertNotIn("old-token", str(error.exception))
+        for key, other in (keys, keys[::-1]):
+            with self.subTest(key=key), self.assertRaisesRegex(ConfigError, key):
+                read_sudo_settings(config | {key: f"REPLACE_WITH_{other}"})
+
     def test_threshold_boundaries_and_config(self):
         defaults = read_sudo_output_settings({})
         self.assertFalse(defaults.use_file("a\r\n" * 10))

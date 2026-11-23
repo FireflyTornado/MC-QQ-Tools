@@ -65,7 +65,7 @@ final class SudoService {
             channel.start();
         } catch (IOException | InvalidConfigurationException | SecurityException e) {
             stop();
-            log.warning("/sudo 已关闭，请检查 config/mcqqauth-sudo 下的文件权限和 YAML 格式。");
+            log.warning("/sudo 已关闭，请检查 " + directory + " 下的文件权限和 YAML 格式。");
         } catch (IllegalArgumentException e) {
             stop();
             log.warning("/sudo 已关闭。 " + e.getMessage());

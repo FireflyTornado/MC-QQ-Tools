@@ -12,16 +12,28 @@ import net.minecraftforge.fml.loading.FMLPaths;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
 
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.util.logging.Logger;
 
 @Mod(SudoMod.MOD_ID)
 public final class SudoMod {
     static final String MOD_ID = "mcqqsudo";
     private static final Logger LOG = Logger.getLogger("MCQQSudo");
-    private final SudoService service = new SudoService(FMLPaths.CONFIGDIR.get().resolve("mcqqauth-sudo"), LOG);
+    private final SudoService service = new SudoService(configDirectory(FMLPaths.CONFIGDIR.get()), LOG);
 
     public SudoMod() {
         MinecraftForge.EVENT_BUS.register(this);
+    }
+
+    static Path configDirectory(Path configRoot) {
+        Path directory = configRoot.resolve(MOD_ID);
+        Path legacy = configRoot.resolve("mcqqauth-sudo");
+        if (Files.notExists(directory, LinkOption.NOFOLLOW_LINKS) && Files.exists(legacy, LinkOption.NOFOLLOW_LINKS)) {
+            return legacy;
+        }
+        return directory;
     }
 
     @SubscribeEvent

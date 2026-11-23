@@ -6,7 +6,7 @@ from app_config import ConfigError, read_switch, require_token
 from sudo_config import SudoSettings, read_sudo_settings
 
 
-logger = logging.getLogger("mc_qq_auth")
+logger = logging.getLogger("mc_qq_tools")
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ def read_banlist_token(
             token = require_token(config, "MC_BANLIST_TOKEN")
             other_tokens = {auth.api_token, auth.notify_token, config.get("ONEBOT_ACCESS_TOKEN")}
             if sudo is not None:
-                other_tokens.update((sudo.bot_token, sudo.plugin_token))
+                other_tokens.update((sudo.bot_token, sudo.mod_token))
             if token in other_tokens:
                 raise ConfigError("MC_BANLIST_TOKEN 必须使用独立凭据")
             return token.encode("ascii")

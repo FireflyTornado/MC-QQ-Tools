@@ -72,7 +72,7 @@ async def _nickname(bot: Bot) -> str | None:
         async with asyncio.timeout(LOGIN_INFO_TIMEOUT):
             identity = await bot.get_login_info()
     except Exception as exc:
-        logger.debug("[MC-QQ-AUTH] OneBot 登录信息不可用（{}）", type(exc).__name__)
+        logger.debug("[MC-QQ-Tools] OneBot 登录信息不可用（{}）", type(exc).__name__)
         return None
     if not isinstance(identity, dict) or str(identity.get("user_id")) != bot.self_id:
         return None
@@ -107,6 +107,6 @@ async def handle_info(bot: Bot) -> None:
         try:
             png = await asyncio.to_thread(_status_png, qq_id, nickname, connected, connected_for)
         except Exception as exc:
-            logger.warning("[MC-QQ-AUTH] 状态图生成失败（{}）", type(exc).__name__)
+            logger.warning("[MC-QQ-Tools] 状态图生成失败（{}）", type(exc).__name__)
             await info.finish(message_config.MESSAGES.render("commands.info.error", **variables))
     await info.finish(MessageSegment.image(png, cache=False))

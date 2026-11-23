@@ -4,7 +4,7 @@ umask 077
 export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
 
 readonly PROJECT=/opt/mc-qq-auth BACKUPS=/opt/mc-qq-auth-backups
-readonly REPO=FireflyTornado/MC-qq-auth-BF656
+readonly REPO=FireflyTornado/MC-QQ-Tools LEGACY_REPO=FireflyTornado/MC-qq-auth-BF656
 readonly API=mc-qq-api.service BOT=mc-qq-bot.service
 readonly DB="$PROJECT/bot/data/auth.db" PYTHON="$PROJECT/bot/.venv/bin/python"
 readonly -a PROTECTED=(bot/.env napcat/.env bot/data napcat/data bot/.venv)
@@ -46,7 +46,7 @@ finish() {
     if [[ -n $incomplete_backup && $incomplete_backup == "$BACKUPS"/auth-*.db ]]; then
         rm -f -- "$incomplete_backup"
     fi
-    if [[ -n $scratch && $scratch == /tmp/mc-qq-auth-update.* && -d $scratch && ! -L $scratch ]]; then
+    if [[ -n $scratch && $scratch == /tmp/mc-qq-tools-update.* && -d $scratch && ! -L $scratch ]]; then
         rm -rf -- "$scratch"
     fi
     exit "$status"
@@ -76,7 +76,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-for command in git id flock systemctl docker sqlite3 timeout; do
+for command in git id flock systemctl docker timeout; do
     command -v "$command" >/dev/null || die "Missing command: $command"
 done
 if [[ $mode == apply ]]; then
@@ -99,13 +99,19 @@ flock -n "$lock_fd" || die 'Another upgrade or check holds the repository lock.'
 [[ $(repo_git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}') == origin/main ]] ||
     die 'Expected main to track origin/main.'
 head=$(repo_git rev-parse --verify HEAD)
+expected_origin() {
+    local address=$1 repo
+    for repo in "$REPO" "$LEGACY_REPO"; do
+        case "$address" in
+            "https://github.com/$repo"|"https://github.com/$repo.git"|"git@github.com:$repo"|"git@github.com:$repo.git"| \
+            "ssh://git@github.com:$repo"|"ssh://git@github.com:$repo.git") return 0 ;;
+        esac
+    done
+    return 1
+}
 origin=$(repo_git remote get-url --all origin)
-case "$origin" in
-    "https://github.com/$REPO"|"https://github.com/$REPO.git"|"git@github.com:$REPO"|"git@github.com:$REPO.git"| \
-    "ssh://git@github.com/$REPO"|"ssh://git@github.com/$REPO.git") ;;
-    *) die 'Origin is not the expected GitHub repository.' ;;
-esac
-log "Worktree $PROJECT, main $head, origin $REPO."
+expected_origin "$origin" || die 'Origin is not the expected GitHub repository.'
+log "Worktree $PROJECT, main $head, origin $origin."
 clean_worktree() {
     local marker changes flags
     for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
@@ -122,17 +128,29 @@ clean_worktree
 tracked=$(repo_git ls-files -- "${PROTECTED[@]}")
 [[ -z $tracked ]] || die 'A protected runtime path is tracked in Git.'
 
-for path in bot napcat bot/data napcat/data bot/.venv; do
+for path in bot napcat napcat/data bot/.venv; do
     [[ -d $path && ! -L $path ]] || die "Expected a real directory: $path"
 done
-for path in bot/.env napcat/.env bot/data/auth.db; do
+for path in bot/.env napcat/.env; do
     [[ -f $path && -s $path && ! -L $path && -r $path ]] || die "Missing, empty or unsafe runtime file: $path"
 done
 [[ -x $PYTHON ]] || die 'Production virtual environment interpreter is unavailable.'
-for path in "$DB-wal" "$DB-shm" "$DB-journal"; do
-    [[ ! -L $path && ( ! -e $path || -f $path ) ]] || die 'Unsafe SQLite sidecar file.'
-done
-log 'Protected configuration and database files are present and nonempty.'
+auth_enabled=$("$PYTHON" -I -B -c '
+import sys
+sys.path.insert(0, "bot")
+from app_config import load_config, read_switch
+print(int(read_switch(load_config(), "MC_AUTH_ENABLED", default=True)))
+' 2>/dev/null) || die 'Unable to determine MC_AUTH_ENABLED from deployment configuration.'
+[[ $auth_enabled == 0 || $auth_enabled == 1 ]] || die 'Unexpected MC_AUTH_ENABLED result.'
+if (( auth_enabled )); then
+    command -v sqlite3 >/dev/null || die 'Missing command: sqlite3'
+    [[ -d bot/data && ! -L bot/data ]] || die 'Expected a real directory: bot/data'
+    [[ -f $DB && -s $DB && ! -L $DB && -r $DB ]] || die 'Missing, empty or unsafe runtime file: bot/data/auth.db'
+    for path in "$DB-wal" "$DB-shm" "$DB-journal"; do
+        [[ ! -L $path && ( ! -e $path || -f $path ) ]] || die 'Unsafe SQLite sidecar file.'
+    done
+fi
+log "Protected runtime configuration present. Authorization enabled (1=yes): $auth_enabled."
 
 cached=$(repo_git rev-parse --verify 'refs/remotes/origin/main^{commit}') || die 'Missing cached origin/main.'
 remote=$cached
@@ -202,7 +220,7 @@ changed() {
 }
 deps=0 migration=0 units_changed=0 compose_changed=0 tool_changed=0 update_api=0 update_bot=0
 if changed requirements.txt requirements.in; then deps=1; fi
-if changed bot/database.py bot/migrate.py bot/migrations; then migration=1; fi
+if (( auth_enabled )) && changed bot/database.py bot/migrate.py bot/migrations; then migration=1; fi
 if changed deploy/systemd; then units_changed=1; fi
 if changed deploy/update.sh; then tool_changed=1; fi
 if changed napcat ':(exclude)napcat/.env.example'; then compose_changed=1; fi
@@ -238,7 +256,9 @@ fi
     die 'Apply does not install unit changes, modify NapCat or replace the running updater.'
 [[ $head != "$target" ]] || die 'HEAD is already at the target. No upgrade ran. After a failed run, follow manual recovery.'
 
-for required in bot/bot.py bot/mc_api.py bot/database.py bot/migrate.py requirements.txt; do
+required_files=(bot/bot.py bot/mc_api.py requirements.txt)
+if (( auth_enabled )); then required_files+=(bot/database.py bot/migrate.py); fi
+for required in "${required_files[@]}"; do
     entry=$(repo_git ls-tree "$target" -- "$required") || die "Cannot inspect target file: $required"
     [[ $entry =~ ^100(644|755)[[:space:]]blob[[:space:]] ]] || die "Missing or non-regular target file: $required"
 done
@@ -255,10 +275,25 @@ api_ready() {
     ss -H -ltnp 'sport = :18765' |
         awk -v pid="$pid" '$4 != "127.0.0.1:18765" || index($0,"pid=" pid ",")==0 {bad=1} END {exit !(NR==1 && !bad)}' ||
         return 1
-    [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
-        http://127.0.0.1:18765/internal/health) == 200 ]] &&
-    [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
-        http://127.0.0.1:18765/internal/mc/snapshot) == 401 ]]
+    if (( auth_enabled )); then
+        [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:18765/internal/health) == 200 ]] &&
+        [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:18765/internal/mc/snapshot) == 401 ]]
+    else
+        curl -q --noproxy '*' -s --max-time 3 -w '\n%{http_code}' http://127.0.0.1:18765/internal/health |
+            "$PYTHON" -I -B -c '
+import json
+import sys
+body, _, code = sys.stdin.read(8193).rpartition("\n")
+try:
+    payload = json.loads(body)
+except ValueError:
+    sys.exit(1)
+sys.exit(not (code == "200" and isinstance(payload, dict)
+              and payload.get("status") == "ok" and payload.get("auth_enabled") is False))
+' 2>/dev/null
+    fi
 }
 bot_ready() {
     local pid invocation
@@ -324,7 +359,7 @@ if (( update_api || update_bot )); then
 fi
 if (( deps )); then
     phase=wheel-download
-    scratch=$(mktemp -d /tmp/mc-qq-auth-update.XXXXXXXX) || die 'Cannot create private download directory.'
+    scratch=$(mktemp -d /tmp/mc-qq-tools-update.XXXXXXXX) || die 'Cannot create private download directory.'
     repo_git show "$target:requirements.txt" >"$scratch/requirements.txt" || die 'Cannot read target lock file.'
     # Accept only pinned package entries and the platform marker used by this project.
     awk 'BEGIN { quote=sprintf("%c",34); marker="; sys_platform == " quote "win32" quote "$" }
@@ -338,7 +373,7 @@ if (( deps )); then
     log 'Target dependency wheels downloaded before stopping services.'
 fi
 
-if (( update_api || update_bot )); then
+if (( auth_enabled && (update_api || update_bot) )); then
     phase=backup
     backup_database online
 fi
@@ -393,8 +428,12 @@ if (( update_api || update_bot )); then
         log "Started $API."
     fi
     phase=health
-    wait_ready api_ready || die 'API PID, loopback listener, health 200 or snapshot 401 did not verify.'
-    log 'API health verified on loopback, including snapshot HTTP 401 without credentials.'
+    wait_ready api_ready || die 'API PID, loopback listener or component health did not verify.'
+    if (( auth_enabled )); then
+        log 'API health verified on loopback, including snapshot HTTP 401 without credentials.'
+    else
+        log 'API health verified on loopback with authorization disabled.'
+    fi
     if (( update_bot )); then
         phase=restart
         attempted_starts+=("$BOT")

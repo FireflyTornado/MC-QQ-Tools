@@ -1,7 +1,7 @@
 # Candidate template based on the deployment conventions.
 
 [Unit]
-Description=MC-QQ-Auth FastAPI
+Description=MC-QQ-Tools FastAPI
 After=network.target
 
 [Service]

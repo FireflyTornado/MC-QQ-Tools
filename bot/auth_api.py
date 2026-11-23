@@ -22,7 +22,7 @@ WS_CLOSE_TIMEOUT = 3
 RECONCILE_INTERVAL = 60
 BANLIST_PATH = "/internal/mc/banlist"
 MAX_BANLIST_BYTES = 2 * 1024 * 1024
-logger = logging.getLogger("mc_qq_auth")
+logger = logging.getLogger("mc_qq_tools.auth")
 
 
 UploadNumber = Annotated[int, Field(strict=True, ge=1, le=MAX_AUTH_VERSION)]

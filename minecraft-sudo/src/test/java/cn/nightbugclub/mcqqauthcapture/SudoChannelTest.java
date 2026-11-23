@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -90,7 +91,7 @@ class SudoChannelTest {
             assertEquals("busy", reconnected.status());
             fixture.tasks.remove().run();
             assertEquals("ok", reconnected.status());
-            verify(fixture.commands).execute(eq("test2"), anyLong());
+            verify(fixture.commands).execute(eq("test2"), anyLong(), any(ScheduledOutput.class));
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
@@ -101,7 +102,7 @@ class SudoChannelTest {
         try (var fixture = new ChannelFixture()) {
             var original = fixture.connect();
             var reconnected = new ArrayDeque<Peer>();
-            when(fixture.commands.execute(eq("test1"), anyLong())).thenAnswer(call -> {
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
                 original.disconnect();
                 var next = fixture.openNext(1000);
                 next.send(2);
@@ -117,8 +118,8 @@ class SudoChannelTest {
             next.send(3);
             fixture.tasks.remove().run();
             assertEquals("ok", next.status());
-            verify(fixture.commands).execute(eq("test1"), anyLong());
-            verify(fixture.commands).execute(eq("test3"), anyLong());
+            verify(fixture.commands).execute(eq("test1"), anyLong(), any(ScheduledOutput.class));
+            verify(fixture.commands).execute(eq("test3"), anyLong(), any(ScheduledOutput.class));
             verifyNoMoreInteractions(fixture.commands);
             assertTrue(original.replies.isEmpty());
         }
@@ -129,7 +130,7 @@ class SudoChannelTest {
         try (var fixture = new ChannelFixture()) {
             var peer = fixture.connect();
             var result = new CompletableFuture<SudoCommands.Result>();
-            when(fixture.commands.execute(eq("test1"), anyLong())).thenReturn(result);
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class))).thenReturn(result);
 
             peer.send(1);
             fixture.tasks.remove().run();
@@ -142,6 +143,40 @@ class SudoChannelTest {
             peer.send(3);
             fixture.tasks.remove().run();
             assertEquals("ok", peer.status());
+        }
+    }
+
+    @Test
+    void acknowledgesScheduleThenReleasesSlotAndReturnsCancellation() throws Exception {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            var frames = new LinkedBlockingQueue<String>();
+            doAnswer(call -> {
+                frames.add(call.getArgument(0));
+                return CompletableFuture.completedFuture(peer.socket);
+            }).when(peer.socket).sendText(anyString(), eq(true));
+            var event = new Object();
+            when(fixture.commands.execute(eq("test1"), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
+                var close = OutputCapture.begin(ignored -> {}, call.getArgument(2));
+                ScheduledOutput.enqueue(event);
+                close.get().join();
+                return CompletableFuture.completedFuture(new SudoCommands.Result("ok", "queued"));
+            });
+            peer.send(1);
+            fixture.tasks.remove().run();
+            var ack = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("scheduled", ack.get("status").getAsString());
+            assertEquals("queued", ack.get("output").getAsString());
+
+            peer.send(2);
+            fixture.tasks.remove().run();
+            assertEquals("ok", JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject()
+                    .get("status").getAsString());
+            ScheduledOutput.cancel(event);
+            var followup = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals(ack.get("id"), followup.get("id"));
+            assertEquals("cancelled", followup.get("status").getAsString());
+            assertTrue(followup.get("followup").getAsBoolean());
         }
     }
 
@@ -163,7 +198,7 @@ class SudoChannelTest {
                 return future;
             });
             when(http.newWebSocketBuilder()).thenReturn(builder);
-            when(commands.execute(anyString(), anyLong()))
+            when(commands.execute(anyString(), anyLong(), any(ScheduledOutput.class)))
                     .thenReturn(CompletableFuture.completedFuture(new SudoCommands.Result("ok")));
             var settings = new SudoChannel.Settings(URI.create("wss://localhost/sudo"), "test-token");
             channel = new SudoChannel(settings, commands, tasks::add, mock(Logger.class), 1000, 30000, http, timer);

@@ -670,6 +670,34 @@ events:
             self.assertEqual(Message(await self.command_reply("/sudo reload", message_id=51)).extract_plain_text(),
                              "命令已返回，输出采集不完整。")
 
+    async def test_sudo_delivers_scheduled_followup_to_original_group_without_holding_slot(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
+        ready = asyncio.Event()
+
+        async def later(*args):
+            await ready.wait()
+            return "ok", "预约完成", False
+
+        with patch.object(self.sudo, "submit", side_effect=[
+            ("scheduled", "已预约", False), ("ok", "在线玩家", False),
+        ]) as submit, patch.object(self.sudo, "request_result", side_effect=later) as poll:
+            ack = Message(await self.command_reply("/sudo schedule function demo:notice 45s", message_id=52))
+            request_id = submit.await_args.args[1]["id"]
+            self.assertIn(request_id, ack.extract_plain_text())
+            self.assertEqual(Message(await self.command_reply("/sudo list", message_id=53)).extract_plain_text(),
+                             "在线玩家")
+            task, = self.sudo.followup_tasks
+            ready.set()
+            await asyncio.wait_for(task, 2)
+            poll.assert_awaited_once_with("bot-token", "GET", f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}")
+            self.send_group.assert_awaited_once_with(
+                group_id=GROUP, message=MessageSegment.text(f"预约指令后续回执 {request_id}\n预约完成"),
+            )
+
     async def test_sudo_uploads_exact_utf8_and_reports_unconfirmed_upload(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
             frozenset({str(ABSENT)}), "bot-token", "plugin-token",

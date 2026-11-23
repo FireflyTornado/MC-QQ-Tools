@@ -83,6 +83,10 @@ final class SudoCommands {
     }
 
     CompletableFuture<Result> execute(String command, long captureDeadlineMs) {
+        return execute(command, captureDeadlineMs, null);
+    }
+
+    CompletableFuture<Result> execute(String command, long captureDeadlineMs, ScheduledOutput scheduled) {
         if (!validCommand(command) || allowed.stream().noneMatch(
                 prefix -> command.equals(prefix) || command.startsWith(prefix + " "))) {
             return CompletableFuture.completedFuture(new Result("rejected"));
@@ -99,7 +103,7 @@ final class SudoCommands {
         } catch (IllegalStateException e) {
             return CompletableFuture.completedFuture(new Result("error", "服务端命令反馈接口不可用，指令未执行。"));
         }
-        MohistCommandFeedback.Session session = feedback.beginExtendedCapture().get();
+        MohistCommandFeedback.Session session = feedback.beginExtendedCapture().apply(scheduled);
         CommandException dispatchFailure = null;
         boolean dispatched = false;
         CompletableFuture<Boolean> complete;

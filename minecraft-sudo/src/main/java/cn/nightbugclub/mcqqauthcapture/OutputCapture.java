@@ -20,10 +20,13 @@ public final class OutputCapture {
 
     private OutputCapture() {}
 
-    // The Bukkit plugin loads this bridge through the server class loader. The contract uses only JDK types.
     public static Supplier<CompletableFuture<Boolean>> begin(Consumer<String> output) {
+        return begin(output, null);
+    }
+
+    static Supplier<CompletableFuture<Boolean>> begin(Consumer<String> output, ScheduledOutput scheduled) {
         attachLogCollector();
-        var session = new Session(output);
+        var session = new Session(output, scheduled);
         Frame previous = ACTIVE.get();
         ACTIVE.set(new Frame(session));
         return () -> {
@@ -31,6 +34,11 @@ public final class OutputCapture {
             session.finish(true);
             return session.completed;
         };
+    }
+
+    static ScheduledOutput scheduledOutput() {
+        Frame frame = ACTIVE.get();
+        return frame == null ? null : frame.session.scheduled;
     }
 
     public static <T> Consumer<T> track(Consumer<T> callback) {
@@ -153,8 +161,11 @@ public final class OutputCapture {
         private int pending = 1; // Dispatch itself owns the first slot.
         private boolean complete = true;
 
-        Session(Consumer<String> output) {
+        private final ScheduledOutput scheduled;
+
+        Session(Consumer<String> output, ScheduledOutput scheduled) {
             this.output = output;
+            this.scheduled = scheduled;
         }
 
         synchronized boolean register() {

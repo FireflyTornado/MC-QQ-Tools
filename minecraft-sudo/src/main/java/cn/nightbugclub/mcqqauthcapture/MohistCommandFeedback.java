@@ -16,6 +16,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import static org.objectweb.asm.Opcodes.*;
@@ -26,9 +27,9 @@ final class MohistCommandFeedback {
     }
 
     record Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output,
-                   Supplier<Session> beginExtendedCapture) {
+                   Function<ScheduledOutput, Session> beginExtendedCapture) {
         Capture(RemoteConsoleCommandSender sender, Supplier<BoundedCommandOutput.Snapshot> output) {
-            this(sender, output, () -> () -> CompletableFuture.completedFuture(true));
+            this(sender, output, ignored -> () -> CompletableFuture.completedFuture(true));
         }
     }
 
@@ -64,7 +65,7 @@ final class MohistCommandFeedback {
                     new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), appendComponent, appendString);
             var sender = Objects.requireNonNull(
                     (RemoteConsoleCommandSender) methods.getSender.invoke(source, methods.createStack.invoke(source)));
-            return new Capture(sender, output::snapshot, () -> begin(output));
+            return new Capture(sender, output::snapshot, scheduled -> begin(output, scheduled));
         } catch (ReflectiveOperationException | LinkageError | ClassCastException | NullPointerException e) {
             throw new IllegalStateException("Mohist command feedback is unavailable", e);
         }
@@ -90,9 +91,9 @@ final class MohistCommandFeedback {
         return server.getClass().getMethod("getServer").invoke(server);
     }
 
-    private static Session begin(BoundedCommandOutput output) {
+    private static Session begin(BoundedCommandOutput output, ScheduledOutput scheduled) {
         try {
-            var scope = OutputCapture.begin(output::appendLine);
+            var scope = OutputCapture.begin(output::appendLine, scheduled);
             return scope::get;
         } catch (LinkageError | RuntimeException e) {
             return () -> CompletableFuture.completedFuture(false);

@@ -175,7 +175,7 @@ class SudoCommandsTest {
         var completed = new CompletableFuture<Boolean>();
         var output = new BoundedCommandOutput();
         var commands = new SudoCommands(server, Set.of("say"), () ->
-                new MohistCommandFeedback.Capture(console, output::snapshot, () -> () -> completed));
+                new MohistCommandFeedback.Capture(console, output::snapshot, ignored -> () -> completed));
         when(server.dispatchCommand(console, "say hello")).thenReturn(true);
 
         var waiting = commands.execute("say hello", System.currentTimeMillis() + 30_000);
@@ -186,7 +186,7 @@ class SudoCommandsTest {
         assertEquals(new SudoCommands.Result("ok", "hello\n"), waiting.join());
 
         var incomplete = new SudoCommands(server, Set.of("say"), () ->
-                new MohistCommandFeedback.Capture(console, output::snapshot, () -> CompletableFuture::new));
+                new MohistCommandFeedback.Capture(console, output::snapshot, ignored -> CompletableFuture::new));
         assertEquals(new SudoCommands.Result("partial", "hello\n"), incomplete.execute("say hello"));
     }
 

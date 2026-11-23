@@ -12,6 +12,9 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -243,32 +246,65 @@ final class SudoChannel implements AutoCloseable {
             finish(source, request, new SudoCommands.Result("expired"));
             return;
         }
+        var scheduled = new ScheduledOutput();
         try {
-            commands.execute(request.command, request.deadlineMs - CLOCK_SKEW_MS)
-                    .whenComplete((result, failure) -> finishExecution(source, request, result, failure));
+            commands.execute(request.command, request.deadlineMs - CLOCK_SKEW_MS, scheduled)
+                    .whenComplete((result, failure) -> finishExecution(source, request, result, failure, scheduled));
         } catch (RuntimeException e) {
-            finishExecution(source, request, null, e);
+            finishExecution(source, request, null, e, scheduled);
         }
     }
 
-    private void finishExecution(Connection source, Request request, SudoCommands.Result result, Throwable failure) {
+    private void finishExecution(Connection source, Request request, SudoCommands.Result result, Throwable failure,
+                                 ScheduledOutput scheduled) {
         if (failure != null) {
             log.warning("/sudo #" + request.id + " 执行异常（" + failure.getClass().getSimpleName() + "）");
             result = new SudoCommands.Result("error");
         }
-        finish(source, request, result);
+        finish(source, request, result, scheduled);
     }
 
     private synchronized void finish(Connection source, Request request, SudoCommands.Result result) {
+        finish(source, request, result, null);
+    }
+
+    private synchronized void finish(Connection source, Request request, SudoCommands.Result result,
+                                     ScheduledOutput scheduled) {
         if (running == request) {
             running = null;
             executing = false;
+            if (active == source && scheduled != null && scheduled.seal()) {
+                result = new SudoCommands.Result("scheduled", result.output(), result.truncated());
+                source.followups.add(scheduled);
+                reply(source, request, result);
+                scheduled.result().whenCompleteAsync((later, failure) ->
+                        finishScheduled(source, request, scheduled, later, failure));
+            } else {
+                reply(source, request, result);
+                if (scheduled != null) {
+                    scheduled.abandon();
+                }
+            }
             log.info("/sudo #" + request.id + " result=" + result.status());
-            reply(source, request, result);
+        } else if (scheduled != null) {
+            scheduled.abandon();
+        }
+    }
+
+    private synchronized void finishScheduled(Connection source, Request request, ScheduledOutput scheduled,
+                                              SudoCommands.Result result, Throwable failure) {
+        source.followups.remove(scheduled);
+        scheduled.abandon();
+        if (failure == null) {
+            reply(source, request, result, true);
         }
     }
 
     private synchronized void reply(Connection source, Request request, SudoCommands.Result result) {
+        reply(source, request, result, false);
+    }
+
+    private synchronized void reply(Connection source, Request request, SudoCommands.Result result, boolean followup) {
         if (active != source) {
             return;
         }
@@ -279,7 +315,12 @@ final class SudoChannel implements AutoCloseable {
         if (result.truncated()) {
             response.addProperty("truncated", true);
         }
-        source.socket.sendText(JSON.toJson(response), true).whenComplete((socket, failure) -> {
+        if (followup) {
+            response.addProperty("followup", true);
+        }
+        String frame = JSON.toJson(response);
+        source.sending = source.sending.thenCompose(ignored -> source.socket.sendText(frame, true));
+        source.sending.whenComplete((socket, failure) -> {
             if (failure != null) {
                 disconnect(source, "回执发送失败");
             }
@@ -302,12 +343,16 @@ final class SudoChannel implements AutoCloseable {
 
     private final class Connection implements WebSocket.Listener {
         private final StringBuilder message = new StringBuilder();
+        private final Set<ScheduledOutput> followups = new HashSet<>();
+        private CompletableFuture<WebSocket> sending = CompletableFuture.completedFuture(null);
         private WebSocket socket;
         private ScheduledFuture<?> heartbeat;
         private long ping;
         private boolean awaitingPong;
 
         private void abort() {
+            followups.forEach(ScheduledOutput::abandon);
+            followups.clear();
             if (heartbeat != null) {
                 heartbeat.cancel(false);
             }

@@ -326,7 +326,7 @@ MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_PLUGIN_TOKEN=REPLACE_WITH_MC_SUDO_PLUGIN_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知和 OneBot 的凭据区分。Bot 通过固定的回环地址 `127.0.0.1:18765` 提交指令。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知和 OneBot 的凭据区分。Bot 通过固定的回环地址 `127.0.0.1:18765` 提交指令和读取后续回执。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
 用 JDK 17 构建 MCQQAuth Sudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
 
@@ -359,7 +359,11 @@ Mod 为每条命令创建独立的远程执行者反馈缓冲，并采集本次�
 
 Mod 的 `sync.reconnect-min-ms` 和 `sync.reconnect-max-ms` 分别默认为 1000 和 30000 毫秒。`/sudo` 通道在握手成功或收到匹配的 Pong 后等待 20 秒发送 Ping，Pong 超时为 15 秒。心跳超时后按配置退避重连。
 
-Mod 在当前请求的等待窗口内收集已关联的回调。回调超时会返回已收集内容并提示采集不完整。长时间调度函数、第三方自建线程，以及不经过 Log4j 的控制台写入暂未接入。
+Mod 在当前请求的等待窗口内收集已关联的回调。回调超时会返回已收集内容并提示采集不完整。第三方自建线程和不经过 Log4j 的控制台写入暂未接入。
+
+原版 `/schedule function` 实际入队后，群里先收到预约回执及请求编号，可以继续提交其他指令。函数执行后的输出会按同一编号补发，超过文本阈值时发为 TXT。可以用包含 `say 预约回显测试` 的数据包函数试验 `/sudo schedule function demo:notice 45s`，再用 `schedule clear demo:notice` 或重新预约验证取消和替换。一个请求安排多个函数时，后续回执在相关函数全部执行或取消后发出。
+
+预约回显最多跟踪一小时，状态保存在内存中。指令连接断开会结束本次回传，服务重启后按新的请求开始跟踪。原版定时事件继续按游戏服规则执行。启用预约补发时需同时部署包含此功能的 Mod、FastAPI 和 Bot。
 
 可在 `bot/.env` 中调整输出发送方式。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
 

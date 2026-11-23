@@ -16,6 +16,8 @@ from qq_group import group_rule
 from runtime_status import HEALTH_PORT
 from sudo_config import (
     MAX_RESULT_MESSAGE_BYTES,
+    SUDO_FOLLOWUP_PATH,
+    SUDO_FOLLOWUP_TIMEOUT,
     SUDO_SUBMIT_PATH,
     SUDO_TIMEOUT,
     SudoOutputSettings,
@@ -33,6 +35,7 @@ except ConfigError as exc:
     settings = None
 
 running = asyncio.Lock()
+followup_tasks: set[asyncio.Task] = set()
 recent: OrderedDict[tuple[int, int, int], float] = OrderedDict()
 REPLAY_WINDOW = 300
 MAX_RECENT = 1024
@@ -48,6 +51,8 @@ REPLIES = {
     "expired": "指令已过期，未执行。",
     "timeout": "执行超时，结果未知。",
     "partial": "命令已返回，输出采集不完整。",
+    "scheduled": "预约已受理，函数执行后将补发结果。",
+    "cancelled": "预约函数已取消。",
 }
 
 
@@ -77,13 +82,17 @@ def command_from(event: GroupMessageEvent) -> str | None:
 
 
 async def submit(token: str, payload: dict) -> tuple[str, str, bool]:
+    return await request_result(token, "POST", SUDO_SUBMIT_PATH, payload)
+
+
+async def request_result(token: str, method: str, path: str, payload: dict | None = None) -> tuple[str, str, bool]:
     # Socket I/O is cancellable under the handler's total deadline.
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", HEALTH_PORT)
         try:
             protocol = h11.Connection(h11.CLIENT)
-            body = json.dumps(payload).encode("utf-8")
-            request = h11.Request(method="POST", target=SUDO_SUBMIT_PATH, headers=[
+            body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+            request = h11.Request(method=method, target=path, headers=[
                 ("Host", f"127.0.0.1:{HEALTH_PORT}"),
                 ("Authorization", f"Bearer {token}"),
                 ("Content-Type", "application/json"),
@@ -91,7 +100,8 @@ async def submit(token: str, payload: dict) -> tuple[str, str, bool]:
                 ("Connection", "close"),
             ])
             writer.write(protocol.send(request))
-            writer.write(protocol.send(h11.Data(data=body)))
+            if body:
+                writer.write(protocol.send(h11.Data(data=body)))
             writer.write(protocol.send(h11.EndOfMessage()))
             await writer.drain()
 
@@ -120,7 +130,8 @@ async def submit(token: str, payload: dict) -> tuple[str, str, bool]:
         status, output = result.get("status"), result.get("output", "")
         truncated = result.get("truncated", False)
         if (
-            isinstance(status, str) and status in REPLIES and isinstance(output, str)
+            isinstance(status, str) and (status in REPLIES or (method == "GET" and status == "waiting"))
+            and isinstance(output, str)
             and type(truncated) is bool
             and not any(0xD800 <= ord(char) <= 0xDFFF for char in output)
         ):
@@ -144,6 +155,65 @@ async def upload_output(bot: Bot, group_id: int, request_id: str, output: str) -
         return True
     logger.warning("/sudo #{} 群文件上传未返回文件 ID", request_id)
     return False
+
+
+async def render_result(bot: Bot, group_id: int, request_id: str, status: str, output: str,
+                        truncated: bool, *, followup: bool = False) -> MessageSegment | None:
+    text = "".join(
+        char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
+    )
+    if truncated or (output and not text.strip()) or output_settings.use_file(output):
+        filename_id = f"{request_id}-followup" if followup else request_id
+        if await upload_output(bot, group_id, filename_id, output):
+            if followup:
+                text = "输出已上传为文件。"
+            elif status not in {"partial", "scheduled"}:
+                return None
+            else:
+                text = ""
+        else:
+            text = f"结果文件上传失败或未确认。请求编号：{request_id}"
+    if not text.strip():
+        text = {
+            "expired": "等待预约函数回传已过期。",
+            "ok": "预约函数已执行，服务端无输出。",
+            "disconnected": "指令通道已断开，无法接收预约函数后续结果。",
+        }.get(status, REPLIES[status]) if followup else REPLIES[status]
+    elif status in {"partial", "scheduled"}:
+        if not text.endswith("\n"):
+            text += "\n"
+        text += REPLIES[status]
+    if status == "scheduled":
+        text += f" 请求编号：{request_id}"
+    if followup:
+        text = f"预约指令后续回执 {request_id}\n{text}"
+    return MessageSegment.text(text)
+
+
+async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str) -> None:
+    status, output, truncated = "expired", "", False
+    try:
+        async with asyncio.timeout(SUDO_FOLLOWUP_TIMEOUT + SUDO_TIMEOUT):
+            while True:
+                try:
+                    async with asyncio.timeout(20):
+                        reply = await request_result(token, "GET", f"{SUDO_FOLLOWUP_PATH}/{request_id}")
+                except TimeoutError:
+                    reply = ("unknown", "", False)
+                if reply[0] not in {"waiting", "unknown", "unavailable"}:
+                    status, output, truncated = reply
+                    break
+                if reply[0] != "waiting":
+                    await asyncio.sleep(2)
+    except TimeoutError:
+        pass
+    try:
+        message = await render_result(bot, group_id, request_id, status, output, truncated, followup=True)
+        if message is not None:
+            async with asyncio.timeout(UPLOAD_TIMEOUT):
+                await bot.send_group_msg(group_id=group_id, message=message)
+    except Exception as exc:
+        logger.warning("/sudo #{} 预约结果发送失败（{}）", request_id, type(exc).__name__)
 
 
 @sudo.handle()
@@ -191,20 +261,13 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
         except TimeoutError:
             status, output, truncated = "timeout", "", False
         logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, status)
-        text = "".join(
-            char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
-        )
-        if truncated or (output and not text.strip()) or output_settings.use_file(output):
-            if await upload_output(bot, event.group_id, request_id, output):
-                if status == "partial":
-                    await sudo.finish(MessageSegment.text(REPLIES[status]))
-                return
-            await sudo.finish(MessageSegment.text(f"结果文件上传失败或未确认。请求编号：{request_id}"))
-            return
-        if not text.strip():
-            text = REPLIES[status]
-        elif status == "partial":
-            if not text.endswith("\n"):
-                text += "\n"
-            text += REPLIES[status]
-        await sudo.finish(MessageSegment.text(text))
+        message = await render_result(bot, event.group_id, request_id, status, output, truncated)
+        if status == "scheduled":
+            try:
+                await sudo.send(message)
+            finally:
+                task = asyncio.create_task(deliver_followup(bot, event.group_id, settings.bot_token, request_id))
+                followup_tasks.add(task)
+                task.add_done_callback(followup_tasks.discard)
+        elif message is not None:
+            await sudo.finish(message)

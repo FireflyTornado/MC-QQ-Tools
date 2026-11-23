@@ -53,10 +53,10 @@ class ServiceAuthModeTests(unittest.TestCase):
             self.assertEqual(Path(private_file).read_text(encoding="utf-8"), expected)
             self.assertNotIn("secret", " ".join(command))
             self.assertEqual(json.loads(kwargs["input"]), properties["UnsetEnvironment"])
-            return subprocess.CompletedProcess(command, 0, "1\n")
+            return subprocess.CompletedProcess(command, 0, "1 0\n")
 
         with patch.object(service_auth_mode.subprocess, "run", side_effect=run):
-            self.assertEqual(service_auth_mode.service_auth_mode(API), "1")
+            self.assertEqual(service_auth_mode.service_component_modes(API), "1 0")
 
 
 def local_path(value):
@@ -77,6 +77,9 @@ def mock_command(name, args):
     events = root / "events"
     faults = set(os.environ.get("UPDATE_FAULTS", "").split(","))
     state_path = root / "services.json"
+    auth_enabled = "sudo-only" not in faults and "both-disabled" not in faults
+    sudo_enabled = bool(faults & {"sudo-only", "both-enabled", "enable-auth"})
+    enabling_auth = bool(faults & {"enable-auth", "enable-auth-without-sudo"})
 
     def record(event):
         with events.open("a", encoding="utf-8") as out:
@@ -126,21 +129,34 @@ def mock_command(name, args):
         return 0
     if name == "journalctl":
         assert "_SYSTEMD_INVOCATION_ID=" + "a" * 32 in args
+        bot_restarted = f"start:{BOT}" in events.read_text(encoding="utf-8")
+        auth = auth_enabled and (not enabling_auth or bot_restarted)
+        if bot_restarted and "bot-drops-auth" in faults:
+            auth = False
+        if bot_restarted or "legacy-bot" not in faults:
+            print(f"MC-QQ-Tools components: auth={int(auth)} sudo={int(sudo_enabled)}")
         print("INFO: Bot 10001 connected")
-        if "onebot" in faults and f"start:{BOT}" in events.read_text(encoding="utf-8"):
+        if "onebot" in faults and bot_restarted:
             print("INFO: Bot 10001 disconnected")
         return 0
     if name == "curl":
         is_health = args[-1].endswith("/health")
         api_restarted = f"start:{API}" in events.read_text(encoding="utf-8")
         auth = "auth-mismatch" in faults or (
-            "sudo-only" not in faults and ("enable-auth" not in faults or api_restarted)
+            auth_enabled and (not enabling_auth or api_restarted)
         )
         if "health" in faults and api_restarted:
             print("503", end="")
         elif is_health:
             if "-o" not in args:
-                print(json.dumps({"status": "ok", "auth_enabled": auth}))
+                payload = {"status": "ok", "auth_enabled": auth}
+                if "missing-sudo-health-key" not in faults:
+                    if (not sudo_enabled or "missing-sudo-route" in faults
+                            or (api_restarted and "sudo-route-lost-after-restart" in faults)):
+                        payload["sudo_connected"] = None
+                    else:
+                        payload["sudo_connected"] = "sudo-connected" in faults
+                print(json.dumps(payload))
             print("200", end="")
         else:
             print("401" if auth else "404", end="")
@@ -169,15 +185,18 @@ def mock_command(name, args):
             assert unit in (API, BOT)
             if (unit == API and "service-probe-fails" in faults) or (unit == BOT and "bot-probe-fails" in faults):
                 return 1
-            enabled = "sudo-only" not in faults
+            auth, sudo = auth_enabled, sudo_enabled
             if unit == BOT and (
                 "api-bot-mismatch" in faults
                 or ("bot-mode-changes" in faults and "backup:online" in events.read_text(encoding="utf-8"))
             ):
-                enabled = not enabled
-            print(int(enabled))
+                auth = not auth
+            if unit == API and "api-bot-sudo-mismatch" in faults:
+                sudo = not sudo
+            print(int(auth), int(sudo))
             return 0
         if args[:3] == ["-I", "-B", "-c"]:
+            sys.argv = ["-c", *args[4:]]
             exec(args[3], {"__name__": "__main__"})
             return 0
         if "pip" in args:
@@ -436,7 +455,7 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
 
     def test_onebot_failure_after_bot_only_update_leaves_api_active(self):
         target = self.incoming("bot/bot.py")
-        self.assertIn("Bot OneBot connection did not verify",
+        self.assertIn("Bot OneBot connection or loaded components did not verify",
                       self.run_tool("--apply", target, faults=("onebot",)))
         self.assertEqual(self.observed(), [
             "fetch", "backup:online", f"stop:{BOT}", "merge", f"start:{BOT}", f"stop:{BOT}",
@@ -537,7 +556,7 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         self.assertIn("Missing, empty or unsafe runtime file: bot/data/auth.db", out)
         self.assertEqual(self.observed(), [])
         out = self.run_tool("--check", "--local", faults=("service-probe-fails",))
-        self.assertIn(f"Unable to determine MC_AUTH_ENABLED for {API}", out)
+        self.assertIn(f"Unable to determine component modes for {API}", out)
 
     def test_refuses_to_skip_migration_if_bot_enables_auth(self):
         target = self.incoming("bot/migrations/001.sql")
@@ -547,7 +566,7 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.initial)
 
         out = self.run_tool("--apply", target, faults=("sudo-only", "bot-probe-fails"))
-        self.assertIn(f"Unable to determine MC_AUTH_ENABLED for {BOT}", out)
+        self.assertIn(f"Unable to determine component modes for {BOT}", out)
         self.assertEqual(self.observed(), [])
 
     def test_rechecks_bot_auth_mode_before_stopping_services(self):
@@ -569,6 +588,55 @@ exec "$UPDATE_REAL_GIT" "${args[@]}"
         self.assertIn("Verified SQLite schema 2", out)
         self.assertEqual(self.observed(), ["fetch", "backup:online", f"stop:{BOT}", f"stop:{API}",
                                           "backup:stopped", "migrate", f"start:{API}", f"start:{BOT}"])
+
+    def test_rejects_sudo_mode_mismatch_before_updating(self):
+        target = self.incoming("bot/mc_api.py")
+        out = self.run_tool("--apply", target, faults=("sudo-only", "api-bot-sudo-mismatch"))
+        self.assertIn(f"Sudo enablement differs between {API} (0) and {BOT} (1)", out)
+        self.assertEqual(self.observed(), [])
+
+    def test_requires_sudo_route_even_when_api_is_healthy(self):
+        target = self.incoming("bot/mc_api.py")
+        for faults in (("sudo-only", "missing-sudo-route"), ("both-enabled", "missing-sudo-health-key")):
+            with self.subTest(faults=faults):
+                self.events.write_text("", encoding="utf-8")
+                out = self.run_tool("--apply", target, faults=faults)
+                self.assertIn("API or OneBot baseline health is unverified", out)
+                self.assertEqual(self.observed(), ["fetch"])
+
+    def test_rejects_connected_bot_that_did_not_load_expected_auth(self):
+        target = self.incoming("bot/bot.py")
+        out = self.run_tool("--apply", target, faults=("both-enabled", "bot-drops-auth"))
+        self.assertIn("Bot OneBot connection or loaded components did not verify", out)
+        self.assertEqual(self.observed(), ["fetch", "backup:online", f"stop:{BOT}", "merge",
+                                          f"start:{BOT}", f"stop:{BOT}"])
+
+    def test_restarts_legacy_bot_to_verify_its_components_after_api_update(self):
+        target = self.incoming("bot/mc_api.py")
+        out = self.run_tool("--apply", target, faults=("both-enabled", "legacy-bot", "sudo-connected"), okay=True)
+        self.assertIn("The running Bot did not report the expected components", out)
+        self.assertEqual(self.observed(), ["fetch", "backup:online", f"stop:{BOT}", f"stop:{API}", "merge",
+                                          f"start:{API}", f"start:{BOT}"])
+
+    def test_rejects_sudo_route_lost_after_api_restart(self):
+        target = self.incoming("bot/mc_api.py")
+        out = self.run_tool("--apply", target, faults=("both-enabled", "sudo-route-lost-after-restart"))
+        self.assertIn("API PID, loopback listener or component health did not verify", out)
+        self.assertEqual(self.observed(), ["fetch", "backup:online", f"stop:{API}", "merge",
+                                          f"start:{API}", f"stop:{API}"])
+
+    def test_verifies_services_when_both_components_are_intentionally_disabled(self):
+        target = self.incoming("bot/mc_api.py")
+        out = self.run_tool("--apply", target, faults=("both-disabled",), okay=True)
+        self.assertIn("Components (1=enabled): Auth=0 Sudo=0", out)
+        self.assertEqual(self.observed(), ["fetch", f"stop:{API}", "merge", f"start:{API}"])
+
+    def test_reenabling_auth_does_not_require_sudo(self):
+        target = self.incoming("bot/migrations/001.sql")
+        out = self.run_tool("--apply", target, faults=("enable-auth-without-sudo",), okay=True)
+        self.assertIn("Verified SQLite schema 2", out)
+        self.assertIn("Components (1=enabled): Auth=1 Sudo=0", out)
+        self.assertIn("migrate", self.observed())
 
 
 if __name__ == "__main__":

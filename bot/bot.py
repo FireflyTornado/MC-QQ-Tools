@@ -44,11 +44,11 @@ def init_bot() -> None:
         finally:
             nonebot.logger.enable("nonebot")
 
-        auth_enabled = components.auth is not None
+        auth_enabled = False
         sudo_enabled = False
-        if auth_enabled:
-            for name in ("qq_events", "qq_bindings", "qq_db"):
-                nonebot.load_plugin(f"plugins.{name}")
+        if components.auth is not None:
+            auth_plugins = [nonebot.load_plugin(f"plugins.{name}") for name in ("qq_events", "qq_bindings", "qq_db")]
+            auth_enabled = all(plugin is not None for plugin in auth_plugins)
         if components.sudo is not None and components.sudo_output is not None:
             plugin = nonebot.load_plugin("plugins.qq_sudo")
             if plugin is not None:
@@ -57,6 +57,7 @@ def init_bot() -> None:
         status = nonebot.load_plugin("plugins.status_commands")
         if status is not None:
             status.module.configure(auth=auth_enabled, sudo=sudo_enabled)
+        print(f"MC-QQ-Tools components: auth={int(auth_enabled)} sudo={int(sudo_enabled)}", flush=True)
 
 
 init_bot()

@@ -879,6 +879,12 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(app_config.ConfigError, "MC_SUDO_MOD_TOKEN"):
             read_components({**sudo, "MC_AUTH_ENABLED": "false"})
 
+    def test_bot_validates_api_token_when_configured(self):
+        for value in ("", "not a bearer token", NOTIFY_TOKEN):
+            with self.subTest(empty=not value, matches_notify=value == NOTIFY_TOKEN):
+                with self.assertRaisesRegex(app_config.ConfigError, "MC_API_TOKEN"):
+                    read_components({**ENV, "MC_API_TOKEN": value}, for_api=False)
+
     def test_sudo_rejects_configured_banlist_token_even_when_auth_is_disabled(self):
         for key in ("MC_SUDO_BOT_TOKEN", "MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN"):
             config = {
@@ -1011,6 +1017,7 @@ assert mc_api.app.state.auth.banlist_token is None
                 self.fail("Bot startup exposed a synthetic credential")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("MC_SUDO_TEXT_MAX_CHARS", result.stderr)
+        self.assertIn("MC-QQ-Tools components: auth=1 sudo=0", result.stdout.splitlines())
 
     def test_sudo_only_boots_without_auth_files_and_delivers_a_delayed_reply(self):
         project = self.root / "sudo-only"
@@ -1148,3 +1155,4 @@ assert not (Path(sys.argv[1]) / "data").exists()
             text=True, encoding="utf-8", timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("MC-QQ-Tools components: auth=0 sudo=1", result.stdout.splitlines())

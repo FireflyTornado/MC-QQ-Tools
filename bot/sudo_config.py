@@ -75,10 +75,10 @@ def _read_mod_token(config: dict[str, str | None]) -> str:
     return token
 
 
-def read_sudo_settings(config: dict[str, str | None], *, require_mod_token: bool = True) -> SudoSettings | None:
+def read_sudo_qq_ids(config: dict[str, str | None]) -> frozenset[str]:
     enabled = read_switch(config, "MC_SUDO_ENABLED", default=None)
     if enabled is False:
-        return None
+        return frozenset()
     raw_ids = config.get("MC_SUDO_QQ_IDS")
     try:
         ids = json.loads(raw_ids) if raw_ids is not None else []
@@ -89,20 +89,25 @@ def read_sudo_settings(config: dict[str, str | None], *, require_mod_token: bool
         for value in ids
     ):
         raise ConfigError("MC_SUDO_QQ_IDS 必须为 QQ 号字符串的 JSON 数组")
-    if not ids:
-        if enabled:
-            raise ConfigError("启用 /sudo 时，MC_SUDO_QQ_IDS 必须至少包含一个 QQ 号")
+    if enabled and not ids:
+        raise ConfigError("启用 /sudo 时，MC_SUDO_QQ_IDS 必须至少包含一个 QQ 号")
+    return frozenset(ids)
+
+
+def read_sudo_settings(config: dict[str, str | None], *, require_mod_token: bool = True) -> SudoSettings | None:
+    qq_ids = read_sudo_qq_ids(config)
+    if not qq_ids:
         return None
     bot_token = require_token(config, "MC_SUDO_BOT_TOKEN")
-    mod_token = _read_mod_token(config) if require_mod_token else None
     configured_mod_tokens = {config.get(MOD_TOKEN_KEY), config.get(LEGACY_MOD_TOKEN_KEY)}
+    mod_token = _read_mod_token(config) if require_mod_token or configured_mod_tokens != {None} else None
     reserved_tokens = {
         token for key in ("ONEBOT_ACCESS_TOKEN", "MC_API_TOKEN", "MC_NOTIFY_TOKEN", "MC_BANLIST_TOKEN")
         if (token := config.get(key))
     }
     if bot_token in configured_mod_tokens or ({bot_token} | configured_mod_tokens) & reserved_tokens:
         raise ConfigError("/sudo 凭据必须独立配置")
-    return SudoSettings(frozenset(ids), bot_token, mod_token)
+    return SudoSettings(qq_ids, bot_token, mod_token)
 
 
 def is_single_command(command: str) -> bool:

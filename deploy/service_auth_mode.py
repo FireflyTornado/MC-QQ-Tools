@@ -1,4 +1,4 @@
-"""Resolve MC_AUTH_ENABLED as the installed service would on its next start."""
+"""Resolve the configured Auth and Sudo modes for the installed service's next start."""
 
 import json
 import subprocess
@@ -19,8 +19,10 @@ for assignment in json.load(sys.stdin):
 
 sys.path.insert(0, sys.argv[1])
 from app_config import load_config, read_switch
+from sudo_config import read_sudo_qq_ids
 
-print(int(read_switch(load_config(), "MC_AUTH_ENABLED", default=True)))
+config = load_config()
+print(int(read_switch(config, "MC_AUTH_ENABLED", default=True)), int(bool(read_sudo_qq_ids(config))))
 """
 
 
@@ -32,7 +34,7 @@ def bus_data(*args):
     return json.loads(result.stdout)["data"]
 
 
-def service_auth_mode(unit: str) -> str:
+def service_component_modes(unit: str) -> str:
     path, = bus_data("call", SYSTEMD, "/org/freedesktop/systemd1", f"{SYSTEMD}.Manager", "LoadUnit", "s", unit)
 
     def property_value(name):
@@ -70,13 +72,13 @@ def service_auth_mode(unit: str) -> str:
             input=json.dumps(unset), capture_output=True, check=True, text=True, encoding="utf-8", timeout=20,
         )
     mode = result.stdout.strip()
-    if mode not in {"0", "1"}:
-        raise ValueError("Unexpected authorization mode")
+    if mode not in {"0 0", "0 1", "1 0", "1 1"}:
+        raise ValueError("Unexpected component modes")
     return mode
 
 
 if __name__ == "__main__":
     try:
-        print(service_auth_mode(sys.argv[1]))
+        print(service_component_modes(sys.argv[1]))
     except (OSError, subprocess.SubprocessError, LookupError, ValueError, TypeError):
-        sys.exit("Unable to resolve the installed unit's authorization mode.")
+        sys.exit("Unable to resolve the installed unit's component modes.")

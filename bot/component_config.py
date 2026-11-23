@@ -32,7 +32,9 @@ class ComponentSettings:
 def read_auth_settings(config: dict[str, str | None], *, require_api_token: bool) -> AuthSettings | None:
     if not read_switch(config, "MC_AUTH_ENABLED", default=True):
         return None
-    api_token = require_token(config, "MC_API_TOKEN") if require_api_token else None
+    api_token = None
+    if require_api_token or config.get("MC_API_TOKEN") is not None:
+        api_token = require_token(config, "MC_API_TOKEN")
     notify_token = require_token(config, "MC_NOTIFY_TOKEN")
     if api_token is not None and secrets.compare_digest(api_token, notify_token):
         raise ConfigError("MC_API_TOKEN 与 MC_NOTIFY_TOKEN 必须使用不同的值")

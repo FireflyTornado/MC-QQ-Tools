@@ -36,7 +36,7 @@ cp -n bot/.env.example bot/.env
 
 Bot 和 FastAPI 使用同一组组件开关，修改后重启两个进程。未设置 `MC_AUTH_ENABLED` 时，默认启用授权。未设置 `MC_SUDO_ENABLED` 时，沿用 `MC_SUDO_QQ_IDS` 的启用方式。显式设置为 `false` 会关闭对应的命令和 API 路由。两项同时启用时，凭据配置错误会停用出错的组件，另一项仍可启动。
 
-按进程配置授权凭据时，`MC_API_TOKEN` 可只在 FastAPI 服务环境中设置。`MC_NOTIFY_TOKEN` 由 Bot 发送，由 FastAPI 校验，两边须使用相同的值。停用授权时，已配置的这两个 Token 仍须与 Sudo 凭据不同。
+按进程配置授权凭据时，`MC_API_TOKEN` 可只在 FastAPI 服务环境中设置。Bot 启用授权时也会校验自身环境中已配置的 `MC_API_TOKEN`。`MC_NOTIFY_TOKEN` 由 Bot 发送，由 FastAPI 校验，两边须使用相同的值。停用授权时，已配置的这两个 Token 仍须与 Sudo 凭据不同。
 
 只部署 MCQQSudo 时，在现有 `bot/.env` 中设置 `MC_AUTH_ENABLED=false` 和 `MC_SUDO_ENABLED=true`，填好公共配置和 [远程指令凭据](#qq群管理指令)，即可用上述启动命令启动 Bot 和 FastAPI。授权 Token 和 SQLite 仅在启用 MCQQAuth 时需要。只部署 MCQQAuth 时，可设置 `MC_SUDO_ENABLED=false`。
 
@@ -215,7 +215,7 @@ sudo journalctl -u mc-qq-api.service -u mc-qq-bot.service -n 100 --no-pager
 sudo journalctl -u mc-qq-api.service -u mc-qq-bot.service -f
 ```
 
-确认 `18765` 只监听 `127.0.0.1`，健康接口返回 `"status":"ok"`。授权启用时，未带凭据的快照请求返回 `401`。只部署 MCQQSudo 时，健康响应应包含 `"auth_enabled":false`。数据库完整性另行核验。
+确认 `18765` 只监听 `127.0.0.1`，健康接口返回 `"status":"ok"`。授权启用时，未带凭据的快照请求返回 `401`。启用 Sudo 时，`sudo_connected` 为布尔值，`false` 表示路由已挂载且游戏服尚未连接。关闭 Sudo 时该字段为 `null`。只部署 MCQQSudo 时，健康响应应包含 `"auth_enabled":false`。Bot 启动日志中的 `MC-QQ-Tools components` 记录实际加载的组件。数据库完整性另行核验。
 
 ```sh
 sudo ss -ltnp 'sport = :18765'
@@ -250,7 +250,7 @@ sudo bash deploy/update.sh --apply REVIEWED_COMMIT_SHA
 - `--check --local` 只使用缓存的 `origin/main`，不联网或更新 Git 引用，因此无法确认 GitHub 是否有新提交。两种检查模式都保持源码、虚拟环境、数据库和服务原样。
 - `--apply` 接受完整的 40 位 SHA 或至少 7 位且能唯一解析的十六进制前缀。执行前将 `REVIEWED_COMMIT_SHA` 替换为已审核的 SHA。目标必须在本次取得的 `origin/main` 历史中，并能从当前 `HEAD` 快进。管理员须先核对目标完整 SHA 与 CI 结果，再决定是否进入维护窗口。工具不会查询或替代这项审核。
 
-使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具按 `mc-qq-api.service` 和 `mc-qq-bot.service` 各自已加载的环境读取 `MC_AUTH_ENABLED`，进程环境优先于 `bot/.env`。任一单元的开关无法判定，或两个开关不一致时，工具会中止。如果修改了 unit 或 drop-in，先运行 `systemctl daemon-reload`。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
+使用前确认已有 `main` 跟踪 `origin/main`，root 能访问预期 GitHub 仓库，现有 unit、回环端口、NapCat 容器名和运行目录符合本页约定。工具需要 Git、Bash、`flock`、systemd 工具、Docker CLI、curl、iproute2 和已有的 `bot/.venv`。启用授权的部署还需要 `sqlite3`。工具按 `mc-qq-api.service` 和 `mc-qq-bot.service` 各自已加载的环境判定 Auth 和 Sudo 的启用状态，进程环境优先于 `bot/.env`。任一单元的组件状态无法判定，或两边对同一个组件的启用状态不一致时，工具会中止。如果修改了 unit 或 drop-in，先运行 `systemctl daemon-reload`。运行工具期间避免其他管理员并发修改 Git、运行目录或服务。`flock` 锁住仓库的 `.git` 目录，仅约束使用同一锁的升级工具进程。
 
 Apply 按以下顺序执行。
 
@@ -259,7 +259,7 @@ Apply 按以下顺序执行。
 3. 涉及服务时先核验现有 API、Bot 和 NapCat 的健康。依赖有变化时，先按目标锁文件从 PyPI 下载 wheel。下载失败时服务保持运行。
 4. 涉及服务且启用授权时，先做在线 SQLite 一致性备份，再停受影响服务。需要迁移时先停 Bot 再停 API，确认两者均为 `inactive`，并在停写后再做一份备份。停写期间管理员也要暂停其他数据库写入者。
 5. 用 `git merge --ff-only --no-autostash --no-overwrite-ignore` 合入已经审核的 SHA。涉及依赖时，停服期间从预下载的 wheel 离线安装并运行 `pip check`。启用授权时，对比活动库的 `user_version` 与目标代码的数据库版本。需要迁移时运行 `bot/migrate.py`，确认 `quick_check` 通过且数据库版本与目标一致。只部署 MCQQSudo 时可直接升级源码和依赖。
-6. 启动受影响服务，验证 API 的进程 PID、`127.0.0.1:18765` 监听和健康 `200`。启用授权时再核对未授权快照返回 `401`。只部署 MCQQSudo 时核对健康响应中 `auth_enabled=false`，游戏服暂时停机也可进行这项检查。最后确认 Bot 在 journald 中记录了 OneBot 连接，且其进程已连接 `127.0.0.1:13001`。NapCat 保持运行，日志级别需保留 OneBot 的连接记录。
+6. 启动受影响服务，验证 API 的进程 PID、`127.0.0.1:18765` 监听和健康 `200`。按预期启用状态核对健康响应的 `auth_enabled` 和 `sudo_connected`，启用授权时再核对未授权快照返回 `401`。最后在本次 Bot 启动的 journald 日志中核对实际加载的组件与 OneBot 连接记录，并确认进程已连接 `127.0.0.1:13001`。运行中的 Bot 缺少预期组件记录时，工具会安排重启并验证。NapCat 保持运行，日志级别需保留 OneBot 的连接记录。
 
 备份保存在仓库外的 `/opt/mc-qq-auth-backups/`。目录要求 root 所有、权限 `0700`，每份备份使用独立文件名，权限 `0600`。工具使用 SQLite `.backup`，只有非空、`quick_check` 返回 `ok` 且 `user_version` 与源一致的文件才会被报告为有效备份。中断留下的文件需重新核验后才能用于恢复。
 
@@ -378,7 +378,7 @@ MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。两个键同时设置时值必须一致，否则 FastAPI 停用 Sudo。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。Bot 启用 Sudo 时也会校验自身环境中已配置的 Mod Token。两个键同时设置时值必须一致。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
 用 JDK 17 构建 MCQQSudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
 

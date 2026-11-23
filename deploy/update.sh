@@ -135,20 +135,24 @@ for path in bot/.env napcat/.env; do
     [[ -f $path && -s $path && ! -L $path && -r $path ]] || die "Missing, empty or unsafe runtime file: $path"
 done
 [[ -x $PYTHON ]] || die 'Production virtual environment interpreter is unavailable.'
-unit_auth_mode() {
-    local unit=$1 enabled
-    enabled=$("$PYTHON" -I -B deploy/service_auth_mode.py "$unit" 2>/dev/null) || return 1
-    [[ $enabled == 0 || $enabled == 1 ]] || return 1
-    printf '%s\n' "$enabled"
+unit_component_modes() {
+    local unit=$1 modes
+    modes=$("$PYTHON" -I -B deploy/service_auth_mode.py "$unit" 2>/dev/null) || return 1
+    [[ $modes =~ ^[01]\ [01]$ ]] || return 1
+    printf '%s\n' "$modes"
 }
-shared_auth_mode() {
-    local api_mode bot_mode
-    api_mode=$(unit_auth_mode "$API") || die "Unable to determine MC_AUTH_ENABLED for $API."
-    bot_mode=$(unit_auth_mode "$BOT") || die "Unable to determine MC_AUTH_ENABLED for $BOT."
-    [[ $api_mode == "$bot_mode" ]] || die "MC_AUTH_ENABLED differs between $API ($api_mode) and $BOT ($bot_mode)."
-    printf '%s\n' "$api_mode"
+shared_component_modes() {
+    local api_modes bot_modes api_auth api_sudo bot_auth bot_sudo
+    api_modes=$(unit_component_modes "$API") || die "Unable to determine component modes for $API."
+    bot_modes=$(unit_component_modes "$BOT") || die "Unable to determine component modes for $BOT."
+    read -r api_auth api_sudo <<< "$api_modes"
+    read -r bot_auth bot_sudo <<< "$bot_modes"
+    [[ $api_auth == "$bot_auth" ]] || die "MC_AUTH_ENABLED differs between $API ($api_auth) and $BOT ($bot_auth)."
+    [[ $api_sudo == "$bot_sudo" ]] || die "Sudo enablement differs between $API ($api_sudo) and $BOT ($bot_sudo)."
+    printf '%s\n' "$api_modes"
 }
-auth_enabled=$(shared_auth_mode) || exit 1
+component_modes=$(shared_component_modes) || exit 1
+read -r auth_enabled sudo_enabled <<< "$component_modes"
 if (( auth_enabled )); then
     command -v sqlite3 >/dev/null || die 'Missing command: sqlite3'
     [[ -d bot/data && ! -L bot/data ]] || die 'Expected a real directory: bot/data'
@@ -157,7 +161,7 @@ if (( auth_enabled )); then
         [[ ! -L $path && ( ! -e $path || -f $path ) ]] || die 'Unsafe SQLite sidecar file.'
     done
 fi
-log "Protected runtime configuration present. Authorization enabled (1=yes): $auth_enabled."
+log "Protected runtime configuration present. Components (1=enabled): Auth=$auth_enabled Sudo=$sudo_enabled."
 
 cached=$(repo_git rev-parse --verify 'refs/remotes/origin/main^{commit}') || die 'Missing cached origin/main.'
 remote=$cached
@@ -304,21 +308,15 @@ if [[ $target_entries =~ (^|$'\n')(120000|160000)\  ]]; then
 fi
 
 api_ready() {
-    local expected_auth=${1:-$auth_enabled} pid
+    local expected_auth=${1:-$auth_enabled} expected_sudo=${2:-$sudo_enabled} pid
     active "$API" || return 1
     pid=$(systemctl show -p MainPID --value "$API") || return 1
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
     ss -H -ltnp 'sport = :18765' |
         awk -v pid="$pid" '$4 != "127.0.0.1:18765" || index($0,"pid=" pid ",")==0 {bad=1} END {exit !(NR==1 && !bad)}' ||
         return 1
-    if (( expected_auth )); then
-        [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
-            http://127.0.0.1:18765/internal/health) == 200 ]] &&
-        [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
-            http://127.0.0.1:18765/internal/mc/snapshot) == 401 ]]
-    else
-        curl -q --noproxy '*' -s --max-time 3 -w '\n%{http_code}' http://127.0.0.1:18765/internal/health |
-            "$PYTHON" -I -B -c '
+    curl -q --noproxy '*' -s --max-time 3 -w '\n%{http_code}' http://127.0.0.1:18765/internal/health |
+        "$PYTHON" -I -B -c '
 import json
 import sys
 body, _, code = sys.stdin.read(8193).rpartition("\n")
@@ -326,13 +324,19 @@ try:
     payload = json.loads(body)
 except ValueError:
     sys.exit(1)
+auth, sudo = (value == "1" for value in sys.argv[1:])
 sys.exit(not (code == "200" and isinstance(payload, dict)
-              and payload.get("status") == "ok" and payload.get("auth_enabled") is False))
-' 2>/dev/null
+              and payload.get("status") == "ok" and payload.get("auth_enabled") is auth
+              and "sudo_connected" in payload
+              and (isinstance(payload["sudo_connected"], bool) if sudo else payload["sudo_connected"] is None)))
+' "$expected_auth" "$expected_sudo" 2>/dev/null || return 1
+    if (( expected_auth )); then
+        [[ $(curl -q --noproxy '*' -s --max-time 3 -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:18765/internal/mc/snapshot) == 401 ]]
     fi
 }
 bot_ready() {
-    local pid invocation
+    local check_components=${1:-1} pid invocation
     active "$BOT" || return 1
     pid=$(systemctl show -p MainPID --value "$BOT") || return 1
     invocation=$(systemctl show -p InvocationID --value "$BOT") || return 1
@@ -341,7 +345,11 @@ bot_ready() {
         awk -v pid="$pid" '$1=="ESTAB" && $5=="127.0.0.1:13001" && index($0,"pid=" pid ",") {ok=1} END {exit !ok}' ||
         return 1
     timeout 4s journalctl --no-pager -q -o cat -u "$BOT" "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null |
-        awk '/Bot [0-9]+ disconnected/ {ok=0} /Bot [0-9]+ connected/ {ok=1} END {exit !ok}'
+        awk -v check="$check_components" -v expected="MC-QQ-Tools components: auth=$auth_enabled sudo=$sudo_enabled" '
+            /^MC-QQ-Tools components: auth=[01] sudo=[01]$/ && !seen {components=$0; seen=1}
+            /Bot [0-9]+ disconnected/ {ok=0}
+            /Bot [0-9]+ connected/ {ok=1}
+            END {exit !(ok && (!check || components == expected))}'
 }
 wait_ready() {
     local attempt
@@ -384,16 +392,20 @@ pip_locked() {
 
 if (( update_api || update_bot )); then
     [[ $napcat == 'running healthy' || $napcat == 'running none' ]] || die 'NapCat baseline is not running.'
-    # A running Sudo-only API can be upgraded to an Auth-enabled API after migration.
+    # A healthy API can transition from Auth disabled after its database is migrated.
     if api_ready; then
         :
-    elif (( auth_enabled )) && api_ready 0; then
+    elif (( auth_enabled )) && { api_ready 0 "$sudo_enabled" || api_ready 0 "$((1 - sudo_enabled))"; }; then
         update_api=1 update_bot=1
         log 'The API currently has authorization disabled. Both services will be restarted.'
     else
         die 'API or OneBot baseline health is unverified; review locally.'
     fi
-    bot_ready || die 'API or OneBot baseline health is unverified; review locally.'
+    bot_ready 0 || die 'API or OneBot baseline health is unverified; review locally.'
+    if (( ! update_bot )) && ! bot_ready; then
+        update_bot=1
+        log 'The running Bot did not report the expected components. Bot will be restarted and verified.'
+    fi
 fi
 if (( deps )); then
     phase=wheel-download
@@ -419,8 +431,8 @@ phase=preflight
 clean_worktree
 [[ $(repo_git rev-parse HEAD) == "$head" && $(repo_git symbolic-ref --short HEAD) == main ]] ||
     die 'HEAD or branch changed during preflight.'
-checked_auth=$(shared_auth_mode) || exit 1
-[[ $checked_auth == "$auth_enabled" ]] || die 'The service authorization mode changed during preflight.'
+checked_modes=$(shared_component_modes) || exit 1
+[[ $checked_modes == "$component_modes" ]] || die 'The service component modes changed during preflight.'
 phase=stop
 if (( update_bot )); then
     systemctl stop "$BOT" >/dev/null 2>&1 || die 'Failed to stop Bot.'
@@ -484,7 +496,7 @@ if (( update_api || update_bot )); then
         log "Started $BOT."
     fi
     phase=health
-    wait_ready bot_ready || die 'Bot OneBot connection did not verify. Check journald locally.'
+    wait_ready bot_ready || die 'Bot OneBot connection or loaded components did not verify. Check journald locally.'
     api_ready || die 'API health changed after checking Bot.'
     napcat=$(napcat_status) || die 'NapCat status became unavailable.'
     [[ $napcat == 'running healthy' || $napcat == 'running none' ]] || die 'NapCat is not running or healthy.'

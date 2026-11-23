@@ -32,6 +32,17 @@ class SudoOutputSettingsTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ConfigError, key):
                 read_sudo_settings(config | {key: f"REPLACE_WITH_{other}"})
 
+    def test_bot_validates_mod_token_and_alias_when_configured(self):
+        config = {"MC_SUDO_QQ_IDS": '["123"]', "MC_SUDO_BOT_TOKEN": "bot-token"}
+        self.assertIsNone(read_sudo_settings(config, require_mod_token=False).mod_token)
+        for key in ("MC_SUDO_MOD_TOKEN", "MC_SUDO_PLUGIN_TOKEN"):
+            for value in ("", "not a bearer token"):
+                with self.subTest(key=key, empty=not value), self.assertRaisesRegex(ConfigError, key):
+                    read_sudo_settings({**config, key: value}, require_mod_token=False)
+        with self.assertRaisesRegex(ConfigError, "MC_SUDO_MOD_TOKEN.*MC_SUDO_PLUGIN_TOKEN"):
+            read_sudo_settings({**config, "MC_SUDO_MOD_TOKEN": "mod-token", "MC_SUDO_PLUGIN_TOKEN": "old-token"},
+                               require_mod_token=False)
+
     def test_threshold_boundaries_and_config(self):
         defaults = read_sudo_output_settings({})
         self.assertFalse(defaults.use_file("a\r\n" * 10))

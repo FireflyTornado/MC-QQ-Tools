@@ -220,6 +220,7 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
     )
     output_in_file = False
     output_in_message = bool(text.strip())
+    file_upload_failed = False
     failed_with_followup = status == "error" and waiting
     if reply.truncated or (output and not text.strip()) or output_settings.use_file(output):
         output_in_message = False
@@ -238,6 +239,7 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
             else:
                 text = ""
         else:
+            file_upload_failed = True
             text = f"结果文件上传失败或未确认。请求编号：{request_id}"
             if followup and reply.final and terminal_notice is None:
                 terminal_notice = {
@@ -246,22 +248,28 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
                 }.get(status, FOLLOWUP_REPLIES[status])
     if not text.strip():
         if waiting and status in {"ok", "scheduled"} and not output and not reply.truncated:
-            return RenderedReply(MessageSegment.text("正在执行..."))
-        text = terminal_notice or (FOLLOWUP_REPLIES if followup else REPLIES)[status]
-        if waiting and status == "partial" and not output and not reply.truncated:
-            text += "\n后续输出仍会补发。"
+            text = "正在执行..."
+        else:
+            text = terminal_notice or (FOLLOWUP_REPLIES if followup else REPLIES)[status]
+            if waiting and status == "partial" and not output and not reply.truncated:
+                text += "\n后续输出仍会补发。"
     elif terminal_notice is not None or failed_with_followup or status in {"partial", "scheduled"}:
         if not text.endswith("\n"):
             text += "\n"
         text += terminal_notice or REPLIES[status]
-    if status == "scheduled":
-        text += f" 请求编号：{request_id}"
     if failed_with_followup:
-        text += f"\n后台任务的结果会继续补发。请求编号：{request_id}"
+        if reply.wait_seconds == SUDO_DIRECT_REPLY_TIMEOUT:
+            text += "\n如果收到后续输出，会继续补发。"
+        else:
+            text += "\n后台任务的结果会继续补发。"
     if followup:
         if pending_initial_notice is not None:
             text = f"{pending_initial_notice}\n{text}"
         text = f"指令后续回执 {request_id}\n{text}"
+    elif waiting and not file_upload_failed:
+        if not text.endswith("\n"):
+            text += "\n"
+        text += f"请求编号：{request_id}"
     return RenderedReply(MessageSegment.text(text), output_in_file, output_in_message)
 
 

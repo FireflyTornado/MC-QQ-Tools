@@ -2,7 +2,9 @@ package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.JsonParser;
 import org.apache.logging.log4j.LogManager;
+import org.bukkit.Server;
 import org.bukkit.command.CommandException;
+import org.bukkit.command.RemoteConsoleCommandSender;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -13,11 +15,13 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
@@ -317,6 +321,71 @@ class SudoChannelTest {
             assertEquals("final batch\n", last.get("output").getAsString());
             output.get().appendLine("ignored after expiry");
             assertEquals("", output.get().takeFollowup().text());
+        }
+    }
+
+    @Test
+    void streamsLateSenderOutputAfterDispatchThrowsButDoesNotWaitForCommandsThatNeverRan() throws Exception {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            fixture.takeNext(20, SECONDS);
+            var frames = new LinkedBlockingQueue<String>();
+            when(peer.socket.sendText(anyString(), eq(true))).thenAnswer(call -> {
+                frames.add(call.getArgument(0));
+                return CompletableFuture.completedFuture(peer.socket);
+            });
+
+            var server = mock(Server.class);
+            var lateReply = new AtomicReference<Runnable>();
+            var feedbackAvailable = new AtomicBoolean(true);
+            when(server.dispatchCommand(any(RemoteConsoleCommandSender.class), eq("test1"))).thenAnswer(call -> {
+                RemoteConsoleCommandSender sender = call.getArgument(0);
+                lateReply.set(() -> sender.sendMessage("Late report"));
+                throw new CommandException("Command failed after submitting work to another executor");
+            });
+            var commands = new SudoCommands(server, Set.of("test1", "test2", "test3"), output -> {
+                if (!feedbackAvailable.get()) {
+                    throw new IllegalStateException("Feedback unavailable");
+                }
+                var sender = mock(RemoteConsoleCommandSender.class);
+                doAnswer(call -> {
+                    output.appendLine(call.getArgument(0, String.class));
+                    return null;
+                }).when(sender).sendMessage(anyString());
+                return new MohistCommandFeedback.Capture(sender, ignored -> () -> CompletableFuture.completedFuture(true));
+            });
+            when(fixture.commands.execute(anyString(), anyLong(), any(ScheduledOutput.class))).thenAnswer(call ->
+                    commands.execute(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
+
+            peer.send(1, true);
+            fixture.tasks.remove().run();
+            var ack = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("error", ack.get("status").getAsString());
+            assertEquals(30, ack.get("wait_seconds").getAsInt());
+            var expiry = fixture.takeNext(30, SECONDS);
+            CompletableFuture.runAsync(lateReply.get()).get(2, SECONDS);
+            fixture.runNext(1, SECONDS);
+            var update = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals(ack.get("id"), update.get("id"));
+            assertEquals(1, update.get("sequence").getAsInt());
+            assertEquals("Late report\n", update.get("output").getAsString());
+            expiry.action().run();
+            var terminal = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertTrue(terminal.get("final").getAsBoolean());
+
+            peer.send(2, true);
+            fixture.tasks.remove().run();
+            var missing = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("error", missing.get("status").getAsString());
+            assertNull(missing.get("wait_seconds"));
+
+            feedbackAvailable.set(false);
+            peer.send(3, true);
+            fixture.tasks.remove().run();
+            var unavailable = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
+            assertEquals("error", unavailable.get("status").getAsString());
+            assertNull(unavailable.get("wait_seconds"));
+            verify(server, never()).dispatchCommand(any(), eq("test3"));
         }
     }
 

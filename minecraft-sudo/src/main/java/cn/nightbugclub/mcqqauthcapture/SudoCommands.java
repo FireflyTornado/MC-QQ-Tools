@@ -111,8 +111,15 @@ final class SudoCommands {
         dispatching = true;
         try {
             dispatched = server.dispatchCommand(feedback.sender(), command);
-        } catch (CommandException e) {
-            dispatchFailure = e;
+        } catch (RuntimeException | Error failure) {
+            if (scheduled != null) {
+                scheduled.markDispatchFailure();
+            }
+            if (failure instanceof CommandException commandFailure) {
+                dispatchFailure = commandFailure;
+            } else {
+                throw failure;
+            }
         } finally {
             dispatching = false;
             complete = session.finish();

@@ -23,9 +23,18 @@ public final class ScheduledOutput {
     private boolean sealed;
     private boolean ran;
     private boolean complete = true;
+    private volatile boolean failedDuringDispatch;
 
     CommandOutput output() {
         return output;
+    }
+
+    void markDispatchFailure() {
+        failedDuringDispatch = true;
+    }
+
+    boolean failedDuringDispatch() {
+        return failedDuringDispatch;
     }
 
     public static void enqueue(Object event) {

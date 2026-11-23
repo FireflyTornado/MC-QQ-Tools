@@ -332,7 +332,8 @@ final class SudoChannel implements AutoCloseable {
             boolean tracked = active == source && scheduled != null && scheduled.seal();
             boolean succeeded = result.status().equals("ok");
             boolean partial = result.status().equals("partial");
-            boolean observeSender = request.streamFollowup && (succeeded || partial);
+            boolean observeSender = request.streamFollowup && scheduled != null
+                    && (succeeded || partial || scheduled.failedDuringDispatch());
             // The legacy protocol uses its status to signal that a follow-up is available.
             boolean scheduledStatus = succeeded || (partial && !request.streamFollowup);
             boolean sendTracked = tracked && (scheduledStatus || request.streamFollowup);

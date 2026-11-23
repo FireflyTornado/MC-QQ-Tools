@@ -744,6 +744,76 @@ events:
                 group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n后台完成"),
             )
 
+    async def test_sudo_reports_terminal_status_even_after_a_tracked_task_sent_output(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
+        scenarios = [
+            (self.sudo.Reply("scheduled", "函数已预约", wait_seconds=3600),
+             [self.sudo.Reply("ok", sequence=1)], ["已安排的任务执行完毕。"]),
+            (self.sudo.Reply("ok", wait_seconds=3600),
+             [self.sudo.Reply("ok", "已生成部分结果\n", sequence=1, final=False),
+              self.sudo.Reply("expired", sequence=2)], ["已生成部分结果\n", "等待任务回传超时。"]),
+        ]
+        for message_id, (initial, frames, messages) in enumerate(scenarios, start=74):
+            with self.subTest(status=frames[-1].status):
+                self.send_group.reset_mock()
+                with patch.object(self.sudo, "submit", return_value=initial) as submit, \
+                     patch.object(self.sudo, "request_result", side_effect=frames):
+                    await self.command_reply("/sudo schedule function demo:notice 45s", message_id=message_id)
+                    request_id = submit.await_args.args[1]["id"]
+                    await asyncio.wait_for(asyncio.gather(*self.sudo.followup_tasks), 2)
+                self.assertEqual(
+                    [call.kwargs for call in self.send_group.await_args_list],
+                    [{"group_id": GROUP, "message": MessageSegment.text(f"指令后续回执 {request_id}\n{text}")}
+                     for text in messages],
+                )
+
+    async def test_sudo_reports_tracked_timeout_when_polling_reaches_its_deadline(self):
+        request_id = "c" * 32
+
+        async def wait_without_a_result(*args):
+            await asyncio.Future()
+
+        with patch.object(self.sudo, "SUDO_FOLLOWUP_TIMEOUT", 0.01), \
+             patch.object(self.sudo, "SUDO_TIMEOUT", 0.2), \
+             patch.object(self.sudo, "request_result", side_effect=wait_without_a_result):
+            await asyncio.wait_for(self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id,
+                                   self.sudo.Reply("scheduled", "函数已预约"), delivered_output=True), 2)
+
+        self.send_group.assert_awaited_once_with(
+            group_id=GROUP, message=MessageSegment.text(f"指令后续回执 {request_id}\n等待任务回传超时。"),
+        )
+
+    async def test_sudo_includes_unsent_initial_failure_in_the_first_delivered_followup_only(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", set()))
+        self.reply.side_effect = RuntimeError("OneBot unavailable for initial reply")
+        self.send_group.side_effect = [RuntimeError("OneBot unavailable for the first retry"),
+                                       {"message_id": 10}, {"message_id": 11}]
+        frames = [self.sudo.Reply("ok", "后台已有输出", sequence=1, final=False),
+                  self.sudo.Reply("ok", "后台任务完成", sequence=2)]
+        with patch.object(self.sudo, "submit", return_value=self.sudo.Reply("error", wait_seconds=3600)) as submit, \
+             patch.object(self.sudo, "request_result", side_effect=frames), \
+             patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0):
+            await self.bot.handle_event(self.group_message("/sudo list", message_id=76))
+            self.reply.assert_awaited_once()
+            request_id = submit.await_args.args[1]["id"]
+            await asyncio.wait_for(asyncio.gather(*self.sudo.followup_tasks), 2)
+
+        heading = f"指令后续回执 {request_id}\n"
+        with_initial_error = f"{heading}首轮命令执行失败或无法确认结果。\n后台已有输出"
+        self.assertEqual(
+            [call.kwargs for call in self.send_group.await_args_list],
+            [{"group_id": GROUP, "message": MessageSegment.text(text)}
+             for text in (with_initial_error, with_initial_error, f"{heading}后台任务完成")],
+        )
+
     async def test_sudo_retries_the_same_followup_before_advancing_the_cursor(self):
         request_id = "a" * 32
         path = f"{self.sudo.SUDO_FOLLOWUP_PATH}/{request_id}"

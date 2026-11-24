@@ -1,12 +1,16 @@
 package cn.nightbugclub.mcqqauthcapture;
 
-import java.util.IdentityHashMap;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -15,7 +19,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
-/** Entry points used by the optional Forge transformer. */
+/** Entry points used by the Forge transformer. */
 public final class ExecutorOutput {
     private ExecutorOutput() {}
 
@@ -55,44 +59,76 @@ public final class ExecutorOutput {
     public static List<Runnable> shutdownNow(ExecutorService executor) {
         List<Runnable> drained = executor.shutdownNow();
         if (!drained.isEmpty()) {
-            var tasks = new IdentityHashMap<Runnable, Boolean>();
-            drained.forEach(task -> tasks.put(task, true));
-            ScheduledOutput.discardQueuedWork(work -> work.executor() == executor && tasks.containsKey(work.task()));
+            ScheduledOutput.discardQueuedWork(executor, queue(executor), drained);
         }
         return drained;
     }
 
     public static boolean remove(ThreadPoolExecutor executor, Runnable task) {
         boolean removed = executor.remove(task);
-        if (removed) {
-            ScheduledOutput.discardQueuedWork(work -> work.executor() == executor && work.task() == task);
+        if (removed && task != null) {
+            ScheduledOutput.discardQueuedWork(executor, queue(executor), List.of(task));
         }
         return removed;
     }
 
     public static boolean remove(BlockingQueue<?> queue, Object task) {
         boolean removed = queue.remove(task);
-        if (removed) {
-            ScheduledOutput.discardQueuedWork(work -> work.queue() == queue && work.task() == task);
+        if (removed && task != null) {
+            ScheduledOutput.discardQueuedWork(null, queue, List.of(task));
         }
         return removed;
     }
 
+    public static void clear(BlockingQueue<?> queue) {
+        Class<?> type = queue.getClass();
+        // These queues drain all elements under the same lock used by their normal removal operations.
+        if ((type == ArrayBlockingQueue.class || type == LinkedBlockingQueue.class || type == LinkedBlockingDeque.class)
+                && ScheduledOutput.watchesQueue(queue)) {
+            var removed = new ArrayList<>();
+            queue.drainTo(removed);
+            ScheduledOutput.discardQueuedWork(null, queue, removed);
+        } else {
+            queue.clear();
+        }
+    }
+
+    public static void purge(ThreadPoolExecutor pool) {
+        if (standardPool(pool)) {
+            for (Future<?> future : ScheduledOutput.queuedFutures(pool)) {
+                if (future instanceof Runnable task && future.isCancelled()) {
+                    remove(pool, task);
+                }
+            }
+        }
+        pool.purge();
+    }
+
+    public static RejectedExecutionHandler getRejectedExecutionHandler(ThreadPoolExecutor pool) {
+        return ExecutorRejections.original(pool.getRejectedExecutionHandler());
+    }
+
+    public static void setRejectedExecutionHandler(ThreadPoolExecutor pool, RejectedExecutionHandler handler) {
+        if (standardPool(pool)) {
+            ExecutorRejections.set(pool, handler);
+        } else {
+            pool.setRejectedExecutionHandler(handler);
+        }
+    }
+
     static Executor observeExecutor(Object event, Executor executor) {
-        if (!(executor instanceof ExecutorService pool) || !standardPool(pool) || !standardRejection(pool)) {
+        if (!(executor instanceof ExecutorService pool) || !standardPool(pool) || !ScheduledOutput.hasPendingEvent(event)) {
             return executor;
         }
         return task -> {
-            boolean shutDown = standardRejection(pool) && pool.isShutdown();
-            if (pool instanceof ScheduledExecutorService scheduler) {
-                var future = scheduler.schedule(task, 0, TimeUnit.NANOSECONDS);
-                observeQueuedWork(event, pool, future, future);
+            if (!ScheduledOutput.hasPendingEvent(event)) {
+                pool.execute(task);
+            } else if (pool instanceof ScheduledExecutorService scheduler) {
+                observeSubmission(event, pool, () -> scheduler.schedule(task, 0, TimeUnit.NANOSECONDS));
             } else {
+                observeRejections(pool);
                 observeQueuedWork(event, pool, task, null);
                 pool.execute(task);
-            }
-            if (shutDown) {
-                ScheduledOutput.cancel(event);
             }
         };
     }
@@ -123,16 +159,7 @@ public final class ExecutorOutput {
     private static <F extends Future<?>> F observe(Object event, ExecutorService executor, Supplier<F> submit) {
         boolean tracked = ScheduledOutput.registerTask(event);
         try {
-            boolean shutDown = tracked && standardRejection(executor) && executor.isShutdown();
-            F future = submit.get();
-            if (tracked) {
-                if (shutDown) {
-                    ScheduledOutput.cancel(event);
-                } else {
-                    observeQueuedWork(event, executor, future, future);
-                }
-            }
-            return future;
+            return tracked ? observeSubmission(event, executor, submit) : submit.get();
         } catch (RuntimeException | Error failure) {
             if (tracked) {
                 ScheduledOutput.completeTask(event, failure);
@@ -141,16 +168,37 @@ public final class ExecutorOutput {
         }
     }
 
+    private static <F extends Future<?>> F observeSubmission(Object event, ExecutorService executor, Supplier<F> submit) {
+        observeRejections(executor);
+        ScheduledOutput.beginQueueSubmission(event, executor, queue(executor));
+        try {
+            F future = submit.get();
+            observeQueuedWork(event, executor, future, future);
+            return future;
+        } finally {
+            ScheduledOutput.endQueueSubmission(event);
+        }
+    }
+
+    private static void observeRejections(ExecutorService executor) {
+        if (executor instanceof ThreadPoolExecutor pool) {
+            ExecutorRejections.observe(pool);
+        }
+    }
+
     private static void observeQueuedWork(Object event, ExecutorService executor, Object task, Future<?> future) {
-        BlockingQueue<?> queue = executor instanceof ThreadPoolExecutor pool ? pool.getQueue() : null;
-        ScheduledOutput.observeQueuedWork(event, new ScheduledOutput.QueuedWork(executor, queue, task, future));
+        ScheduledOutput.observeQueuedWork(event, new ScheduledOutput.QueuedWork(executor, queue(executor), task, future));
+    }
+
+    private static BlockingQueue<?> queue(ExecutorService executor) {
+        return executor instanceof ThreadPoolExecutor pool && standardPool(pool) ? pool.getQueue() : null;
     }
 
     static boolean standardRejection(ExecutorService executor) {
         if (!(executor instanceof ThreadPoolExecutor pool)) {
             return standardPool(executor);
         }
-        Class<?> handler = pool.getRejectedExecutionHandler().getClass();
+        Class<?> handler = getRejectedExecutionHandler(pool).getClass();
         return handler == ThreadPoolExecutor.AbortPolicy.class || handler == ThreadPoolExecutor.CallerRunsPolicy.class
                 || handler == ThreadPoolExecutor.DiscardPolicy.class || handler == ThreadPoolExecutor.DiscardOldestPolicy.class;
     }

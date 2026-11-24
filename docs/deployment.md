@@ -427,7 +427,9 @@ Forge 在启动时从 MCQQSudo JAR 注册转换器，再直接挂载其中的主
 
 普通 `ThreadPoolExecutor.execute` 保留原 Runnable 的队列身份，继续由原线程池处理。自定义线程池、自定义 Future 实现、内嵌依赖、Bukkit 插件 JAR、周期任务和组合多个 Future 的 API 仍可使用原有采集路径或下述显式接口。
 
-插件用自有线程、线程池或回调时，可以将 Mod JAR 作为编译期依赖，在提交点使用 `cn.nightbugclub.mcqqauthcapture.CommandOutputContext.wrap(Runnable)` 或 `wrap(Consumer<T>)`。每次包装绑定一次调用，普通玩家或控制台触发的任务仍按原逻辑执行。若提交失败或任务在开始前取消，请调用包装对象的 `close()` 解除回传等待。此方法只解除关联，实际取消仍由插件的调度器处理。
+插件用自有线程、线程池或回调时，将 `MCQQSudo-0.3.1-game.jar` 作为编译期依赖。运行 `mvn -B -ntp -f minecraft-sudo/pom.xml clean install` 后，可声明 Maven 依赖 `cn.nightbugclub:MCQQSudo:0.3.1`，设置 `classifier` 为 `game`、`scope` 为 `provided`。已下载发布包时，也可从外层 JAR 的 `META-INF/mcqqsudo/` 提取该文件并加入编译类路径。游戏服的 `mods/` 只安装外层发布 JAR。
+
+在任务提交点使用 `cn.nightbugclub.mcqqauthcapture.CommandOutputContext.wrap(Runnable)` 或 `wrap(Consumer<T>)`。每次包装绑定一次调用，普通玩家或控制台触发的任务仍按原逻辑执行。若提交失败或任务在开始前取消，请调用包装对象的 `close()` 解除回传等待。此方法只解除关联，实际取消仍由插件的调度器处理。
 
 ```java
 var task = CommandOutputContext.wrap(() -> runBackgroundWork());

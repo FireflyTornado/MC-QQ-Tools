@@ -22,7 +22,9 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -136,6 +138,20 @@ class ExecutorTransformerTest {
         assertFalse(ExecutorTransformer.hasMatch(new ClassReader(classBytes(SerializableReference.class))));
     }
 
+    @Test
+    void rewritesQueueMaintenanceAndRejectionPolicyAccess() throws IOException {
+        var reader = new ClassReader(classBytes(QueueMaintenance.class));
+        assertTrue(ExecutorTransformer.hasMatch(reader));
+        var node = new ClassNode();
+        reader.accept(node, 0);
+        new ExecutorTransformer(Set.of(QueueMaintenance.class.getName())).transform(node, null);
+        var calls = node.methods.stream().flatMap(method -> Arrays.stream(method.instructions.toArray()))
+                .filter(MethodInsnNode.class::isInstance).map(MethodInsnNode.class::cast)
+                .filter(call -> call.owner.equals(BRIDGE)).map(call -> call.name).toList();
+        assertEquals(java.util.List.of("setRejectedExecutionHandler", "getRejectedExecutionHandler", "clear", "purge"),
+                calls);
+    }
+
     private static void jar(Path path, String entry, byte[] content, boolean mod) throws IOException {
         try (var out = new ZipOutputStream(Files.newOutputStream(path))) {
             if (mod) {
@@ -163,6 +179,16 @@ class ExecutorTransformerTest {
             work.thenApply(value -> value + 1);
             work.complete(9);
             return input.whenCompleteAsync((value, failure) -> {}, executor);
+        }
+    }
+
+    static class QueueMaintenance {
+        RejectedExecutionHandler reconfigure(ThreadPoolExecutor pool, RejectedExecutionHandler handler) {
+            pool.setRejectedExecutionHandler(handler);
+            var configured = pool.getRejectedExecutionHandler();
+            pool.getQueue().clear();
+            pool.purge();
+            return configured;
         }
     }
 

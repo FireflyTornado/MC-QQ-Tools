@@ -1,8 +1,13 @@
 package cn.nightbugclub.mcqqauthcapture;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
@@ -12,7 +17,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
-import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 public final class ScheduledOutput {
@@ -20,6 +24,7 @@ public final class ScheduledOutput {
     static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
+    private static final Map<Object, Submitting> SUBMISSIONS = new IdentityHashMap<>();
     private static boolean pollingQueuedWork;
 
     record QueuedWork(ExecutorService executor, BlockingQueue<?> queue, Object task, Future<?> future) {
@@ -33,6 +38,17 @@ public final class ScheduledOutput {
     }
 
     private record Event(ScheduledOutput owner, String cancellation, QueuedWork queued) {}
+
+    private record Submitting(ExecutorService executor, BlockingQueue<?> queue, List<WeakReference<Object>> discarded) {
+        void remember(Set<Object> tasks) {
+            discarded.removeIf(reference -> reference.get() == null);
+            tasks.forEach(task -> discarded.add(new WeakReference<>(task)));
+        }
+
+        boolean wasDiscarded(Object task) {
+            return discarded.stream().anyMatch(reference -> reference.get() == task);
+        }
+    }
 
     private final CommandOutput output = new CommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
@@ -67,6 +83,12 @@ public final class ScheduledOutput {
         return enqueue(task, "已取消一项后台任务。");
     }
 
+    static boolean hasPendingEvent(Object event) {
+        synchronized (EVENTS) {
+            return EVENTS.containsKey(event);
+        }
+    }
+
     private static boolean enqueue(Object event, String cancellation) {
         ScheduledOutput owner = OutputCapture.scheduledOutput();
         if (owner == null) {
@@ -87,10 +109,30 @@ public final class ScheduledOutput {
         }
     }
 
+    static void beginQueueSubmission(Object event, ExecutorService executor, BlockingQueue<?> queue) {
+        synchronized (EVENTS) {
+            if (EVENTS.containsKey(event)) {
+                // The JDK can expose its FutureTask before submit or schedule returns it.
+                SUBMISSIONS.put(event, new Submitting(executor, queue, new ArrayList<>()));
+            }
+        }
+    }
+
+    static void endQueueSubmission(Object event) {
+        synchronized (EVENTS) {
+            SUBMISSIONS.remove(event);
+        }
+    }
+
     static void observeQueuedWork(Object task, QueuedWork queued) {
         synchronized (EVENTS) {
+            Submitting submitting = SUBMISSIONS.remove(task);
             Event event = EVENTS.get(task);
             if (event == null) {
+                return;
+            }
+            if (submitting != null && submitting.wasDiscarded(queued.task())) {
+                cancel(task);
                 return;
             }
             EVENTS.put(task, new Event(event.owner(), event.cancellation(), queued));
@@ -101,13 +143,49 @@ public final class ScheduledOutput {
         }
     }
 
-    static void discardQueuedWork(Predicate<QueuedWork> discarded) {
+    static void discardQueuedWork(ExecutorService executor, BlockingQueue<?> queue, Collection<?> discarded) {
+        if (discarded.isEmpty()) {
+            return;
+        }
         synchronized (EVENTS) {
+            if (EVENTS.isEmpty()) {
+                return;
+            }
+            Set<Object> removed = Collections.newSetFromMap(new IdentityHashMap<>());
+            removed.addAll(discarded);
+            SUBMISSIONS.values().stream()
+                    .filter(submission -> sameQueue(executor, queue, submission.executor(), submission.queue()))
+                    .forEach(submission -> submission.remember(removed));
             var tasks = EVENTS.entrySet().stream()
-                    .filter(entry -> entry.getValue().queued() != null && discarded.test(entry.getValue().queued()))
+                    .filter(entry -> {
+                        var work = entry.getValue().queued();
+                        return work != null && sameQueue(executor, queue, work.executor(), work.queue())
+                                && removed.contains(work.task());
+                    })
                     .map(Map.Entry::getKey).toList();
             tasks.forEach(ScheduledOutput::cancel);
         }
+    }
+
+    static List<Future<?>> queuedFutures(ExecutorService pool) {
+        synchronized (EVENTS) {
+            return EVENTS.values().stream().map(Event::queued)
+                    .filter(work -> work != null && work.executor() == pool)
+                    .map(QueuedWork::task).filter(Future.class::isInstance)
+                    .<Future<?>>map(task -> (Future<?>) task).toList();
+        }
+    }
+
+    static boolean watchesQueue(BlockingQueue<?> queue) {
+        synchronized (EVENTS) {
+            return SUBMISSIONS.values().stream().anyMatch(submission -> submission.queue() == queue)
+                    || EVENTS.values().stream().anyMatch(event -> event.queued() != null && event.queued().queue() == queue);
+        }
+    }
+
+    private static boolean sameQueue(ExecutorService executor, BlockingQueue<?> queue,
+                                     ExecutorService otherExecutor, BlockingQueue<?> otherQueue) {
+        return (executor != null && executor == otherExecutor) || (queue != null && queue == otherQueue);
     }
 
     private static void scheduleQueuePoll() {
@@ -140,6 +218,7 @@ public final class ScheduledOutput {
 
     public static void cancel(Object event) {
         synchronized (EVENTS) {
+            SUBMISSIONS.remove(event);
             Event registered = EVENTS.remove(event);
             if (registered != null) {
                 ScheduledOutput owner = registered.owner();
@@ -206,6 +285,7 @@ public final class ScheduledOutput {
         Event registered;
         synchronized (EVENTS) {
             registered = EVENTS.remove(event);
+            SUBMISSIONS.remove(event);
             if (registered != null && cancelled) {
                 registered.owner().output.appendFollowupLine(registered.cancellation());
             }
@@ -246,6 +326,7 @@ public final class ScheduledOutput {
         }
         synchronized (EVENTS) {
             Event registered = EVENTS.remove(event);
+            SUBMISSIONS.remove(event);
             if (registered != null) {
                 ScheduledOutput owner = registered.owner();
                 owner.finishEvent(failure == null, failure == null);
@@ -292,7 +373,7 @@ public final class ScheduledOutput {
         result.cancel(false);
         synchronized (EVENTS) {
             if (scheduled) {
-                EVENTS.values().removeIf(event -> event.owner() == this);
+                removeOwnedEvents();
             }
         }
     }
@@ -305,9 +386,19 @@ public final class ScheduledOutput {
 
     private void finish(String status) {
         if (pending != 0) {
-            EVENTS.values().removeIf(event -> event.owner() == this);
+            removeOwnedEvents();
         }
         var snapshot = output.finishFollowup();
         result.complete(new SudoCommands.Result(status, snapshot.text(), snapshot.truncated()));
+    }
+
+    private void removeOwnedEvents() {
+        EVENTS.entrySet().removeIf(entry -> {
+            if (entry.getValue().owner() != this) {
+                return false;
+            }
+            SUBMISSIONS.remove(entry.getKey());
+            return true;
+        });
     }
 }

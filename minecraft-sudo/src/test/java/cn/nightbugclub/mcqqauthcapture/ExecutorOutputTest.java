@@ -5,14 +5,23 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -155,5 +164,165 @@ class ExecutorOutputTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void settlesSaturatedDiscardsWithoutChangingTheirFuturesOrPolicies() throws Exception {
+        for (RejectedExecutionHandler handler : List.of(new ThreadPoolExecutor.DiscardPolicy(),
+                new ThreadPoolExecutor.DiscardOldestPolicy())) {
+            var pool = occupiedPool(new ArrayBlockingQueue<>(1), handler);
+            try {
+                if (handler instanceof ThreadPoolExecutor.DiscardPolicy) {
+                    pool.execute(() -> {});
+                }
+                var request = new ScheduledOutput();
+                var close = OutputCapture.begin(line -> fail(line), request);
+                var dropped = ExecutorOutput.submit(pool, () -> fail("discarded task ran"));
+                assertTrue(close.get().join());
+                assertTrue(request.seal());
+
+                if (handler instanceof ThreadPoolExecutor.DiscardOldestPolicy) {
+                    // The eviction can be caused by an unrelated native submission.
+                    pool.execute(() -> {});
+                }
+                assertSame(handler, ExecutorOutput.getRejectedExecutionHandler(pool));
+                assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+                assertFalse(dropped.isDone());
+                assertEquals(1, pool.getQueue().size());
+            } finally {
+                pool.shutdownNow();
+            }
+        }
+    }
+
+    @Test
+    void remembersQueueRemovalWhileSubmitIsStillReturningItsFuture() throws Exception {
+        var afterOffer = new AtomicReference<Consumer<Runnable>>();
+        var pool = occupiedPool(queueWithOfferHook(afterOffer), new ThreadPoolExecutor.AbortPolicy());
+        try {
+            afterOffer.set(task -> assertTrue(CompletableFuture.supplyAsync(() ->
+                    ExecutorOutput.remove(pool.getQueue(), task)).join()));
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var dropped = ExecutorOutput.submit(pool, () -> fail("removed task ran"));
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+            assertFalse(dropped.isDone());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void noticesCallerRunsDiscardWhenShutdownRacesWithSubmission() throws Exception {
+        var afterOffer = new AtomicReference<Consumer<Runnable>>();
+        var pool = occupiedPool(queueWithOfferHook(afterOffer), new ThreadPoolExecutor.CallerRunsPolicy());
+        try {
+            afterOffer.set(task -> pool.shutdown());
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var dropped = ExecutorOutput.submit(pool, () -> fail("discarded task ran"));
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            assertFalse(pool.isTerminated());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+            assertFalse(dropped.isDone());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void settlesClearedTasksAndPurgedStageWorkers() throws Exception {
+        var pool = occupiedPool(new LinkedBlockingQueue<>(), new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var cleared = ExecutorOutput.submit(pool, () -> fail("cleared task ran"));
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            ExecutorOutput.clear(pool.getQueue());
+            assertTrue(pool.getQueue().isEmpty());
+            assertFalse(cleared.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+
+            var stageRequest = new ScheduledOutput();
+            var closeStage = OutputCapture.begin(line -> fail(line), stageRequest);
+            var stage = CommandOutputContext.supplyAsync(() -> fail("purged worker ran"), pool);
+            assertTrue(closeStage.get().join());
+            assertTrue(stageRequest.seal());
+            var worker = assertInstanceOf(Future.class, pool.getQueue().element());
+            assertNotSame(stage, worker);
+            assertTrue(worker.cancel(false));
+            assertFalse(stageRequest.result().isDone());
+            ExecutorOutput.purge(pool);
+            assertTrue(pool.getQueue().isEmpty());
+            assertFalse(stage.isDone());
+            assertEquals("cancelled", stageRequest.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void settlesStagesRejectedByAFullPoolAndStillRunsCallerRunsInline() throws Exception {
+        var pool = occupiedPool(new ArrayBlockingQueue<>(1), new ThreadPoolExecutor.DiscardPolicy());
+        try {
+            pool.execute(() -> {});
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var stage = CommandOutputContext.supplyAsync(() -> fail("discarded stage ran"), pool);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            assertFalse(stage.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+
+            var policy = new ThreadPoolExecutor.CallerRunsPolicy();
+            ExecutorOutput.setRejectedExecutionHandler(pool, policy);
+            assertSame(policy, ExecutorOutput.getRejectedExecutionHandler(pool));
+            var inlineRequest = new ScheduledOutput();
+            var closeInline = OutputCapture.begin(line -> fail(line), inlineRequest);
+            var inline = CommandOutputContext.supplyAsync(Thread::currentThread, pool);
+            assertTrue(closeInline.get().join());
+            assertTrue(inlineRequest.seal());
+            assertSame(Thread.currentThread(), inline.get(2, TimeUnit.SECONDS));
+            assertEquals("ok", inlineRequest.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static ThreadPoolExecutor occupiedPool(BlockingQueue<Runnable> queue, RejectedExecutionHandler handler)
+            throws InterruptedException {
+        var pool = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, queue, handler);
+        var started = new CountDownLatch(1);
+        pool.execute(() -> {
+            started.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException stopped) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        if (!started.await(5, TimeUnit.SECONDS)) {
+            pool.shutdownNow();
+            fail("worker did not start");
+        }
+        return pool;
+    }
+
+    private static BlockingQueue<Runnable> queueWithOfferHook(AtomicReference<Consumer<Runnable>> afterOffer) {
+        return new LinkedBlockingQueue<>() {
+            @Override
+            public boolean offer(Runnable task) {
+                boolean accepted = super.offer(task);
+                var hook = afterOffer.getAndSet(null);
+                if (accepted && hook != null) {
+                    hook.accept(task);
+                }
+                return accepted;
+            }
+        };
     }
 }

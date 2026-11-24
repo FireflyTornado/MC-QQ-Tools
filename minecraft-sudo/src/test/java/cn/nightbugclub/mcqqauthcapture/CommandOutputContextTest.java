@@ -3,11 +3,13 @@ package cn.nightbugclub.mcqqauthcapture;
 import org.apache.logging.log4j.LogManager;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -37,27 +39,66 @@ class CommandOutputContextTest {
     }
 
     @Test
-    void reportsAnUnobservableStageWithoutChangingTheCallerResult() throws Exception {
-        var stage = new CompletableFuture<Integer>() {
-            @Override
-            public CompletableFuture<Integer> whenComplete(BiConsumer<? super Integer, ? super Throwable> action) {
-                throw new UnsupportedOperationException("custom observer");
-            }
-
-            @Override
-            public CompletableFuture<Integer> copy() {
-                throw new UnsupportedOperationException("custom view");
-            }
-        };
+    void pollsOriginalFutureWhenBothObserverAndCopyAreUnavailable() throws Exception {
+        var stage = new ObserverlessFuture<Integer>();
         var request = new ScheduledOutput();
         var close = OutputCapture.begin(line -> fail(line), request);
         assertSame(stage, CommandOutputContext.track(stage));
         assertTrue(close.get().join());
         assertTrue(request.seal());
-        assertEquals(new SudoCommands.Result("partial", "无法观察后台阶段是否完成，输出采集可能不完整。\n"),
-                request.result().get(2, TimeUnit.SECONDS));
-        assertFalse(stage.isDone());
+        assertFalse(request.result().isDone());
         assertTrue(stage.complete(42));
+        assertEquals(new SudoCommands.Result("ok"), request.result().get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void capturesLateCallbackOutputWhilePollingItsDependentStage() throws Exception {
+        var upstream = new CompletableFuture<String>() {
+            @Override
+            public <U> CompletableFuture<U> newIncompleteFuture() {
+                return new ObserverlessFuture<>();
+            }
+        };
+        var log = LogManager.getLogger("test.context.observer");
+        var request = new ScheduledOutput();
+        var close = OutputCapture.begin(line -> fail(line), request);
+        var dependent = CommandOutputContext.whenComplete(upstream, (value, failure) -> log.error(value));
+        assertTrue(close.get().join());
+        assertTrue(request.seal());
+        assertFalse(request.result().isDone());
+        assertTrue(upstream.complete("迟到的回调输出"));
+        assertEquals("迟到的回调输出", dependent.toCompletableFuture().join());
+        assertEquals(new SudoCommands.Result("ok", "迟到的回调输出\n"), request.result().get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void reportsUnobservableStagesAndKeepsTheOutputWindowOpen() throws Exception {
+        var stage = (CompletionStage<?>) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{CompletionStage.class}, (proxy, method, arguments) -> {
+                    throw new UnsupportedOperationException(method.getName());
+                });
+        var request = new ScheduledOutput();
+        var close = OutputCapture.begin(line -> fail(line), request);
+        assertSame(stage, CommandOutputContext.track(stage));
+        assertTrue(close.get().join());
+        assertTrue(request.seal());
+        assertFalse(request.result().isDone());
+        request.output().appendFollowupLine("迟到消息");
+        request.expire();
+        assertEquals(new SudoCommands.Result("expired", "无法观察后台阶段是否完成，输出采集可能不完整。\n迟到消息\n"),
+                request.result().get(2, TimeUnit.SECONDS));
+    }
+
+    private static final class ObserverlessFuture<T> extends CompletableFuture<T> {
+        @Override
+        public CompletableFuture<T> whenComplete(BiConsumer<? super T, ? super Throwable> action) {
+            throw new UnsupportedOperationException("custom observer");
+        }
+
+        @Override
+        public CompletableFuture<T> copy() {
+            throw new UnsupportedOperationException("custom view");
+        }
     }
 
     @Test

@@ -6,6 +6,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -14,8 +15,9 @@ public final class ScheduledOutput {
     static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
+    private static boolean pollingFutures;
 
-    private record Event(ScheduledOutput owner, String cancellation) {}
+    private record Event(ScheduledOutput owner, String cancellation, Future<?> future) {}
 
     private final CommandOutput output = new CommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
@@ -64,9 +66,46 @@ public final class ScheduledOutput {
                 owner.complete = false;
                 return false;
             }
-            EVENTS.put(event, new Event(owner, cancellation));
+            EVENTS.put(event, new Event(owner, cancellation, null));
             owner.pending++;
             return true;
+        }
+    }
+
+    static void observeFuture(Object task, Future<?> future) {
+        synchronized (EVENTS) {
+            Event event = EVENTS.get(task);
+            if (event == null) {
+                return;
+            }
+            EVENTS.put(task, new Event(event.owner(), event.cancellation(), future));
+            if (!pollingFutures) {
+                pollingFutures = true;
+                scheduleFuturePoll();
+            }
+        }
+    }
+
+    private static void scheduleFuturePoll() {
+        CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS).execute(ScheduledOutput::pollFutures);
+    }
+
+    private static void pollFutures() {
+        synchronized (EVENTS) {
+            var settled = EVENTS.entrySet().stream()
+                    .filter(entry -> entry.getValue().future() != null && entry.getValue().future().isDone())
+                    .map(Map.Entry::getKey).toList();
+            for (Object task : settled) {
+                Event event = EVENTS.get(task);
+                if (event != null) {
+                    completeTask(task, event.future().isCancelled() ? new CancellationException()
+                            : new IllegalStateException("Executor completed without running the task"));
+                }
+            }
+            pollingFutures = EVENTS.values().stream().anyMatch(event -> event.future() != null);
+            if (pollingFutures) {
+                scheduleFuturePoll();
+            }
         }
     }
 
@@ -209,6 +248,9 @@ public final class ScheduledOutput {
     }
 
     private void finish(String status) {
+        if (pending != 0) {
+            EVENTS.values().removeIf(event -> event.owner() == this);
+        }
         var snapshot = output.finishFollowup();
         result.complete(new SudoCommands.Result(status, snapshot.text(), snapshot.truncated()));
     }

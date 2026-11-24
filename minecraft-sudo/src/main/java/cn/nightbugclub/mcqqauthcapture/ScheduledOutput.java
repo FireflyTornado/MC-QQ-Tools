@@ -1,12 +1,16 @@
 package cn.nightbugclub.mcqqauthcapture;
 
+import java.lang.ref.WeakReference;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 public final class ScheduledOutput {
@@ -14,8 +18,14 @@ public final class ScheduledOutput {
     static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
+    private static final ScheduledThreadPoolExecutor POLLER = new ScheduledThreadPoolExecutor(2, task -> {
+        var thread = new Thread(task, "MCQQSudo output poll");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private static boolean pollingFutures;
 
-    private record Event(ScheduledOutput owner, String cancellation) {}
+    private record Event(ScheduledOutput owner, String cancellation, Future<?> future) {}
 
     private final CommandOutput output = new CommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
@@ -50,6 +60,12 @@ public final class ScheduledOutput {
         return enqueue(task, "已取消一项后台任务。");
     }
 
+    static boolean hasPendingEvent(Object event) {
+        synchronized (EVENTS) {
+            return EVENTS.containsKey(event);
+        }
+    }
+
     private static boolean enqueue(Object event, String cancellation) {
         ScheduledOutput owner = OutputCapture.scheduledOutput();
         if (owner == null) {
@@ -64,9 +80,73 @@ public final class ScheduledOutput {
                 owner.complete = false;
                 return false;
             }
-            EVENTS.put(event, new Event(owner, cancellation));
+            EVENTS.put(event, new Event(owner, cancellation, null));
             owner.pending++;
             return true;
+        }
+    }
+
+    static void observeFuture(Object eventId, Future<?> future) {
+        synchronized (EVENTS) {
+            Event event = EVENTS.get(eventId);
+            if (event != null && future != null) {
+                EVENTS.put(eventId, new Event(event.owner(), event.cancellation(), future));
+                if (!pollingFutures) {
+                    pollingFutures = true;
+                    schedulePoll(ScheduledOutput::pollFutures);
+                }
+            }
+        }
+    }
+
+    static void schedulePoll(Runnable poll) {
+        POLLER.schedule(poll, 1, TimeUnit.SECONDS);
+    }
+
+    private static void pollFutures() {
+        Map<Object, Event> observed = new IdentityHashMap<>();
+        synchronized (EVENTS) {
+            EVENTS.forEach((id, event) -> {
+                if (event.future() != null) {
+                    observed.put(id, event);
+                }
+            });
+        }
+        try {
+            observed.forEach(ScheduledOutput::pollFuture);
+        } finally {
+            synchronized (EVENTS) {
+                pollingFutures = EVENTS.values().stream().anyMatch(event -> event.future() != null);
+                if (pollingFutures) {
+                    schedulePoll(ScheduledOutput::pollFutures);
+                }
+            }
+        }
+    }
+
+    private static void pollFuture(Object id, Event event) {
+        boolean cancelled;
+        try {
+            if (!event.future().isDone()) {
+                return;
+            }
+            cancelled = event.future().isCancelled();
+        } catch (RuntimeException | LinkageError | AssertionError unsupported) {
+            synchronized (EVENTS) {
+                if (EVENTS.get(id) == event) {
+                    var owner = event.owner();
+                    owner.complete = false;
+                    owner.output.appendFollowupLine("无法观察后台任务是否完成，输出采集可能不完整。");
+                    EVENTS.put(id, new Event(owner, event.cancellation(), null));
+                }
+            }
+            return;
+        }
+        synchronized (EVENTS) {
+            if (EVENTS.get(id) == event) {
+                completeTask(id, cancelled ? new CancellationException()
+                        : new IllegalStateException("Executor completed without running the task"));
+            }
         }
     }
 
@@ -83,18 +163,42 @@ public final class ScheduledOutput {
     }
 
     public static void run(Object event, Runnable callback) {
-        runCompletion(event, callback, null);
-    }
-
-    static void runCompletion(Object event, Runnable callback, Throwable upstreamFailure) {
         call(event, () -> {
             callback.run();
             return null;
-        }, upstreamFailure);
+        }, null);
     }
 
-    static <T> T call(Object event, Supplier<T> callback) {
-        return call(event, callback::get, null);
+    static <T> T callStage(Object event, Supplier<T> callback, CompletableFuture<Throwable> settled) {
+        return callStage(event, callback, settled, null);
+    }
+
+    static void runStageCompletion(Object event, Runnable callback, CompletableFuture<Throwable> settled,
+                                   Throwable upstreamFailure) {
+        callStage(event, () -> {
+            callback.run();
+            return null;
+        }, settled, upstreamFailure);
+    }
+
+    private static <T> T callStage(Object event, Supplier<T> callback, CompletableFuture<Throwable> settled,
+                                   Throwable upstreamFailure) {
+        // In thenCompose the callback can return before its dependent stage finishes.
+        return call(event, callback::get, upstreamFailure, (registered, captured) -> {
+            // A pending mod stage must be able to outlive an expired request without retaining it.
+            var request = new WeakReference<>(registered.owner());
+            String cancellation = registered.cancellation();
+            settled.thenAccept(failure -> {
+                var owner = request.get();
+                if (owner != null) {
+                    boolean cancelled = isCancellation(failure);
+                    if (cancelled && !isCancellation(upstreamFailure)) {
+                        owner.output.appendFollowupLine(cancellation);
+                    }
+                    owner.finishEvent(captured && (failure == null || cancelled), !cancelled);
+                }
+            });
+        });
     }
 
     public static <T> T callFuture(Object event, Callable<T> callback) throws Exception {
@@ -103,19 +207,22 @@ public final class ScheduledOutput {
 
     private static <T, E extends Exception> T call(Object event, OutputCapture.QueuedAction<T, E> callback,
                                                     Throwable upstreamFailure) throws E {
+        return call(event, callback, upstreamFailure, (registered, captured) ->
+                registered.owner().finishEvent(captured, !isCancellation(upstreamFailure)));
+    }
+
+    private static <T, E extends Exception> T call(Object event, OutputCapture.QueuedAction<T, E> callback,
+                                                    Throwable upstreamFailure,
+                                                    BiConsumer<Event, Boolean> finish) throws E {
         boolean cancelled = isCancellation(upstreamFailure);
-        ScheduledOutput owner;
+        Event registered;
         synchronized (EVENTS) {
-            Event registered = EVENTS.remove(event);
-            owner = registered == null ? null : registered.owner();
-            if (owner != null) {
-                if (cancelled) {
-                    owner.output.appendFollowupLine(registered.cancellation());
-                } else {
-                    owner.ran = true;
-                }
+            registered = EVENTS.remove(event);
+            if (registered != null && cancelled) {
+                registered.owner().output.appendFollowupLine(registered.cancellation());
             }
         }
+        ScheduledOutput owner = registered == null ? null : registered.owner();
         if (owner == null || owner.result.isDone()) {
             return OutputCapture.callQueuedTask(callback);
         }
@@ -127,7 +234,7 @@ public final class ScheduledOutput {
             try {
                 return OutputCapture.callQueuedTask(callback);
             } finally {
-                owner.finishEvent(false);
+                finish.accept(registered, false);
             }
         }
         boolean succeeded = false;
@@ -139,7 +246,7 @@ public final class ScheduledOutput {
             boolean ranSuccessfully = succeeded && (upstreamFailure == null || cancelled);
             closeCapture.get().completeOnTimeout(false, 30, TimeUnit.SECONDS)
                     .whenComplete((captured, failure) ->
-                            owner.finishEvent(ranSuccessfully && Boolean.TRUE.equals(captured)));
+                            finish.accept(registered, ranSuccessfully && Boolean.TRUE.equals(captured)));
         }
     }
 
@@ -153,8 +260,7 @@ public final class ScheduledOutput {
             Event registered = EVENTS.remove(event);
             if (registered != null) {
                 ScheduledOutput owner = registered.owner();
-                owner.ran |= failure == null;
-                owner.finishEvent(failure == null);
+                owner.finishEvent(failure == null, failure == null);
             }
         }
     }
@@ -164,10 +270,11 @@ public final class ScheduledOutput {
                 || (failure instanceof CompletionException && failure.getCause() instanceof CancellationException);
     }
 
-    private void finishEvent(boolean captured) {
+    private void finishEvent(boolean captured, boolean ran) {
         synchronized (EVENTS) {
             pending--;
             complete &= captured;
+            this.ran |= ran;
             finishIfReady();
         }
     }
@@ -197,7 +304,7 @@ public final class ScheduledOutput {
         result.cancel(false);
         synchronized (EVENTS) {
             if (scheduled) {
-                EVENTS.values().removeIf(event -> event.owner() == this);
+                removeOwnedEvents();
             }
         }
     }
@@ -209,7 +316,14 @@ public final class ScheduledOutput {
     }
 
     private void finish(String status) {
+        if (pending != 0) {
+            removeOwnedEvents();
+        }
         var snapshot = output.finishFollowup();
         result.complete(new SudoCommands.Result(status, snapshot.text(), snapshot.truncated()));
+    }
+
+    private void removeOwnedEvents() {
+        EVENTS.values().removeIf(event -> event.owner() == this);
     }
 }

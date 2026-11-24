@@ -33,6 +33,7 @@ final class SudoChannel implements AutoCloseable {
     private static final long CLOCK_SKEW_MS = 1_000;
     private static final int MAX_FOLLOWUPS = 128;
     private static final int MAX_FOLLOWUP_UPDATES = 63;
+    private static final String STOP_FOLLOWUPS = "stop_followups";
     private static final Gson JSON = new Gson();
 
     record Settings(URI url, String token) {
@@ -70,8 +71,7 @@ final class SudoChannel implements AutoCloseable {
             this(id, command, deadlineMs, false);
         }
 
-        static Request parse(String raw) {
-            JsonObject json = JsonParser.parseString(raw).getAsJsonObject();
+        static Request parse(JsonObject json) {
             var id = json.getAsJsonPrimitive("id");
             var command = json.getAsJsonPrimitive("command");
             var deadline = json.getAsJsonPrimitive("deadline_ms");
@@ -85,6 +85,25 @@ final class SudoChannel implements AutoCloseable {
             }
             return new Request(id.getAsString(), command.getAsString(), deadline.getAsLong(),
                     stream != null && stream.getAsBoolean());
+        }
+    }
+
+    private record StopRequest(String id, Set<String> requestIds) {
+        static StopRequest parse(JsonObject json) {
+            var id = json.getAsJsonPrimitive("id");
+            var ids = json.getAsJsonArray("request_ids");
+            if (!id.isString() || !id.getAsString().matches("[0-9a-f]{32}")
+                    || ids.isEmpty() || ids.size() > MAX_FOLLOWUPS) {
+                throw new IllegalArgumentException("Invalid sudo stop request");
+            }
+            var requestIds = new HashSet<String>();
+            for (var entry : ids) {
+                if (!entry.isJsonPrimitive() || !entry.getAsJsonPrimitive().isString()
+                        || !entry.getAsString().matches("[0-9a-f]{32}") || !requestIds.add(entry.getAsString())) {
+                    throw new IllegalArgumentException("Invalid sudo stop request ID");
+                }
+            }
+            return new StopRequest(id.getAsString(), requestIds);
         }
     }
 
@@ -191,6 +210,7 @@ final class SudoChannel implements AutoCloseable {
         try {
             http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(5))
                     .header("Authorization", "Bearer " + settings.token())
+                    .header("X-MCQQSudo-Capabilities", STOP_FOLLOWUPS)
                     .buildAsync(settings.url(), attempt)
                     .whenComplete((socket, failure) -> {
                         if (failure != null) {
@@ -378,7 +398,7 @@ final class SudoChannel implements AutoCloseable {
                 followup.update = timer.schedule(() -> sendUpdate(followup), 1, SECONDS);
             }
         }
-        result.whenCompleteAsync((later, failure) -> finishFollowup(followup, later, failure));
+        result.whenCompleteAsync((later, failure) -> finishFollowup(followup, later, failure), timer);
     }
 
     private synchronized void sendUpdate(Followup followup) {
@@ -403,6 +423,24 @@ final class SudoChannel implements AutoCloseable {
                 reply(followup.source, followup.request, result, 0, followup, true);
             }
         }
+    }
+
+    private synchronized void stopFollowups(Connection source, StopRequest request) {
+        if (active != source) {
+            return;
+        }
+        var iterator = source.followups.iterator();
+        while (iterator.hasNext()) {
+            var followup = iterator.next();
+            if (request.requestIds().contains(followup.request.id())) {
+                iterator.remove();
+                followup.close();
+            }
+        }
+        var ack = new JsonObject();
+        ack.addProperty("type", "stop_followups_ack");
+        ack.addProperty("id", request.id());
+        sendFrame(source, ack);
     }
 
     private synchronized void reply(Connection source, Request request, SudoCommands.Result result) {
@@ -431,6 +469,11 @@ final class SudoChannel implements AutoCloseable {
                 response.addProperty("final", finalResult);
             }
         }
+        sendFrame(source, response);
+    }
+
+    // Called under the channel lock so acknowledgements share the normal write order.
+    private void sendFrame(Connection source, JsonObject response) {
         String frame = JSON.toJson(response);
         source.sending = source.sending.thenCompose(ignored -> source.socket.sendText(frame, true));
         source.sending.whenComplete((socket, failure) -> {
@@ -496,15 +539,28 @@ final class SudoChannel implements AutoCloseable {
             }
             message.append(data);
             if (last) {
-                Request request;
+                Request request = null;
+                StopRequest stop = null;
                 try {
-                    request = Request.parse(message.toString());
+                    var frame = JsonParser.parseString(message.toString()).getAsJsonObject();
+                    var type = frame.getAsJsonPrimitive("type");
+                    if (type == null) {
+                        request = Request.parse(frame);
+                    } else if (type.isString() && STOP_FOLLOWUPS.equals(type.getAsString())) {
+                        stop = StopRequest.parse(frame);
+                    } else {
+                        throw new IllegalArgumentException("Invalid sudo frame type");
+                    }
                 } catch (RuntimeException e) {
                     disconnect(this, "消息格式错误");
                     return null;
                 }
                 message.setLength(0);
-                receive(this, request);
+                if (stop != null) {
+                    stopFollowups(this, stop);
+                } else {
+                    receive(this, request);
+                }
             }
             socket.request(1);
             return null;

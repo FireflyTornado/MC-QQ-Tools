@@ -68,13 +68,37 @@ jobs:
       - name: Verify sudo mod JAR entries
         shell: bash
         run: |
-          entries="$(jar tf minecraft-sudo/target/MCQQSudo-*.jar)"
-          for entry in META-INF/mods.toml mcqqsudo.mixins.json config.yml sudo-allowlist.txt cn/nightbugclub/mcqqauthcapture/SudoMod.class; do
-            if ! grep -Fxq -- "$entry" <<< "$entries"; then
-              printf 'Missing mod JAR entry: %s\n' "$entry" >&2
-              exit 1
-            fi
-          done
+          python3 - <<'PY'
+          from io import BytesIO
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          jars = list(Path("minecraft-sudo/target").glob("MCQQSudo-*.jar"))
+          assert len(jars) == 1, jars
+          with ZipFile(jars[0]) as bundle:
+              services = {
+                  "META-INF/services/cpw.mods.modlauncher.api.ITransformationService",
+                  "META-INF/services/net.minecraftforge.forgespi.locating.IModLocator",
+              }
+              assert services <= set(bundle.namelist())
+              assert "META-INF/mods.toml" not in bundle.namelist()
+              for service in services:
+                  provider = bundle.read(service).decode("utf-8").strip().replace(".", "/")
+                  assert f"{provider}.class" in bundle.namelist()
+              version = jars[0].stem.removeprefix("MCQQSudo-")
+              embedded = [entry for entry in bundle.namelist() if entry.startswith("META-INF/mcqqsudo/")
+                          and entry.endswith(".jar")]
+              assert embedded == [f"META-INF/mcqqsudo/MCQQSudo-{version}-game.jar"]
+              with ZipFile(BytesIO(bundle.read(embedded[0]))) as game:
+                  required = {"META-INF/mods.toml", "mcqqsudo.mixins.json", "config.yml", "sudo-allowlist.txt"}
+                  required.update(f"cn/nightbugclub/mcqqauthcapture/{name}.class"
+                                  for name in ("SudoMod", "ExecutorOutput", "StageOutput"))
+                  assert required <= set(game.namelist())
+                  assert services.isdisjoint(game.namelist())
+                  manifest = game.read("META-INF/MANIFEST.MF").decode("utf-8")
+                  assert f"Implementation-Version: {version}" in manifest.splitlines()
+                  assert "MixinConfigs: mcqqsudo.mixins.json" in manifest.splitlines()
+          PY
 
       - name: Verify plugin JAR entries
         shell: bash

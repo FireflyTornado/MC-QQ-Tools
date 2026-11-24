@@ -28,6 +28,7 @@ import java.util.logging.Logger;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -228,6 +229,8 @@ class SudoChannelTest {
             assertEquals("ok", JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject()
                     .get("status").getAsString());
             ScheduledOutput.cancel(event);
+            assertTrue(frames.isEmpty());
+            fixture.terminalReplies.remove().run();
             var followup = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals(ack.get("id"), followup.get("id"));
             assertEquals("cancelled", followup.get("status").getAsString());
@@ -238,6 +241,51 @@ class SudoChannelTest {
                 assertTrue(followup.get("final").getAsBoolean());
             }
             verify(expiry.future()).cancel(false);
+        }
+    }
+
+    @Test
+    void stopFollowupsClosesOnlyTheListedCapturesAndKeepsTheChannelOpen() throws Exception {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            verify(fixture.builder).header("X-MCQQSudo-Capabilities", "stop_followups");
+            fixture.takeNext(20, SECONDS);
+            var stopped = new Object();
+            var retained = new Object();
+            for (int id : new int[]{1, 2}) {
+                var event = id == 1 ? stopped : retained;
+                when(fixture.commands.execute(eq("test" + id), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
+                    var close = OutputCapture.begin(ignored -> {}, call.getArgument(2));
+                    ScheduledOutput.enqueue(event);
+                    close.get().join();
+                    return CompletableFuture.completedFuture(new SudoCommands.Result("ok"));
+                });
+                peer.send(id, true);
+                fixture.tasks.remove().run();
+                assertEquals("scheduled", peer.status());
+            }
+            var expiry = fixture.takeNext(3600, SECONDS);
+            var update = fixture.takeNext(1, SECONDS);
+            String stopId = "%032x".formatted(5);
+            String stoppedId = "%032x".formatted(1);
+            peer.listener.onText(peer.socket, """
+                    {"type":"stop_followups","id":"%s","request_ids":["%s"]}
+                    """.formatted(stopId, stoppedId), true);
+            var reply = JsonParser.parseString(peer.replies.remove()).getAsJsonObject();
+            assertEquals("stop_followups_ack", reply.get("type").getAsString());
+            assertEquals(stopId, reply.get("id").getAsString());
+            verify(expiry.future()).cancel(false);
+            verify(update.future()).cancel(false);
+            assertFalse(ScheduledOutput.hasPendingEvent(stopped));
+            assertTrue(ScheduledOutput.hasPendingEvent(retained));
+            var ran = new AtomicBoolean();
+            ScheduledOutput.run(stopped, () -> ran.set(true));
+            assertTrue(ran.get());
+
+            peer.send(3);
+            fixture.tasks.remove().run();
+            assertEquals("ok", peer.status());
+            assertTrue(peer.replies.isEmpty());
         }
     }
 
@@ -265,6 +313,7 @@ class SudoChannelTest {
             assertEquals(3600, ack.get("wait_seconds").getAsInt());
 
             ScheduledOutput.run(task, () -> LogManager.getLogger("test.channel").error("Task finished"));
+            fixture.terminalReplies.remove().run();
             var followup = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals(ack.get("id"), followup.get("id"));
             assertEquals("ok", followup.get("status").getAsString());
@@ -314,6 +363,7 @@ class SudoChannelTest {
 
             output.get().appendLine("final batch");
             expiry.action().run();
+            fixture.terminalReplies.remove().run();
             var last = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals("expired", last.get("status").getAsString());
             assertEquals(3, last.get("sequence").getAsInt());
@@ -370,6 +420,7 @@ class SudoChannelTest {
             assertEquals(1, update.get("sequence").getAsInt());
             assertEquals("Late report\n", update.get("output").getAsString());
             expiry.action().run();
+            fixture.terminalReplies.remove().run();
             var terminal = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertTrue(terminal.get("final").getAsBoolean());
 
@@ -391,6 +442,7 @@ class SudoChannelTest {
 
     private static final class ChannelFixture implements AutoCloseable {
         final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
+        final ArrayDeque<Runnable> terminalReplies = new ArrayDeque<>();
         final ArrayDeque<ScheduledTask> scheduled = new ArrayDeque<>();
         final SudoCommands commands = mock(SudoCommands.class);
         final WebSocket.Builder builder = mock(WebSocket.Builder.class, RETURNS_SELF);
@@ -399,6 +451,10 @@ class SudoChannelTest {
         ChannelFixture() {
             var http = mock(HttpClient.class);
             var timer = mock(ScheduledExecutorService.class);
+            doAnswer(call -> {
+                terminalReplies.add(call.getArgument(0));
+                return null;
+            }).when(timer).execute(any(Runnable.class));
             when(timer.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenAnswer(call -> {
                 var future = mock(ScheduledFuture.class);
                 var task = new ScheduledTask(call.getArgument(0), call.getArgument(1), call.getArgument(2), future);

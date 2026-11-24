@@ -7,14 +7,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
 from sudo_api import sudo_router
 from app_config import ConfigError
 from sudo_config import (
-    MAX_RESULT_BYTES, SUDO_FOLLOWUP_PATH, SUDO_SUBMIT_PATH, SUDO_WS_PATH,
+    MAX_RESULT_BYTES, SUDO_FOLLOWUP_PATH, SUDO_STOP_PATH, SUDO_SUBMIT_PATH, SUDO_WS_PATH,
     SudoSettings, is_single_command, read_sudo_output_settings, read_sudo_settings,
 )
 
@@ -96,8 +96,12 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
         }, receive, send)
         return sent[0]["status"], json.loads(sent[-1]["body"])
 
+    async def stop(self, *, token="bot-token", **overrides):
+        payload = {"group_id": "202", "qq_id": "101", **overrides}
+        return await self.http("POST", SUDO_STOP_PATH, token, json.dumps(payload).encode())
+
     @asynccontextmanager
-    async def connect(self, token="plugin-token", *, block_send=None):
+    async def connect(self, token="plugin-token", *, block_send=None, stop_capability=False):
         incoming = asyncio.Queue()
         outgoing = asyncio.Queue()
         incoming.put_nowait({"type": "websocket.connect"})
@@ -115,9 +119,12 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
             if block_send is not None and message["type"] == "websocket.send":
                 await block_send.wait()
 
+        headers = [(b"authorization", f"Bearer {token}".encode())]
+        if stop_capability:
+            headers.append((b"x-mcqqsudo-capabilities", b"stop_followups"))
         task = asyncio.create_task(self.app({
             "type": "websocket", "scheme": "ws", "path": SUDO_WS_PATH,
-            "headers": [(b"authorization", f"Bearer {token}".encode())], "query_string": b"",
+            "headers": headers, "query_string": b"",
         }, receive, send))
         try:
             handshake = await asyncio.wait_for(outgoing.get(), 2)
@@ -149,6 +156,188 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.submit(), (200, {"status": "unavailable"}))
         async with self.connect("bot-token") as (handshake, _, _):
             self.assertEqual(handshake, "websocket.close")
+
+    async def test_stop_requires_bot_token_and_target_group_whitelist(self):
+        self.assertEqual((await self.stop(token="plugin-token"))[0], 401)
+        self.assertEqual((await self.stop(group_id="303"))[0], 403)
+        self.assertEqual((await self.stop(qq_id="102"))[0], 403)
+        self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": []}))
+
+    async def test_followup_state_recovers_initial_reply_without_consuming_frames(self):
+        request_id = "a" * 32
+        path = f"{SUDO_FOLLOWUP_PATH}/{request_id}"
+        async with self.connect() as (_, incoming, outgoing):
+            initial = asyncio.create_task(self.submit())
+            await asyncio.wait_for(outgoing.get(), 2)
+            self.result(incoming, request_id, "initial output", status="partial", wait_seconds=30)
+            reply = await initial
+            self.result(incoming, request_id, "terminal output", followup=True, sequence=1, final=True)
+            self.assertEqual((await self.http("GET", f"{path}/state", "plugin-token"))[0], 401)
+            self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), reply)
+            frame = await self.http("GET", path, "bot-token", query=b"after=0")
+            self.assertEqual(frame[1]["output"], "terminal output")
+            self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), reply)
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
+                             (200, {"status": "closed"}))
+            self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), (200, {"status": "closed"}))
+
+    async def test_stop_releases_capacity_and_wakes_pollers_without_touching_initial_execution(self):
+        first_id, second_id, later_id = ("a" * 32, "b" * 32, "c" * 32)
+        first_path = f"{SUDO_FOLLOWUP_PATH}/{first_id}"
+        second_path = f"{SUDO_FOLLOWUP_PATH}/{second_id}"
+        async with self.connect(stop_capability=True) as (_, incoming, outgoing):
+            with patch("sudo_api.MAX_FOLLOWUPS", 2):
+                first = asyncio.create_task(self.submit(request_id=first_id))
+                await asyncio.wait_for(outgoing.get(), 2)
+                self.result(incoming, first_id, "", status="scheduled", wait_seconds=3600)
+                self.result(incoming, first_id, "already buffered", followup=True, sequence=1, final=False)
+                await first
+                self.assertEqual((await self.http("GET", first_path, "bot-token", query=b"after=0"))[1]["sequence"], 1)
+                second = asyncio.create_task(self.submit(request_id=second_id))
+                await asyncio.wait_for(outgoing.get(), 2)
+                self.result(incoming, second_id, "", wait_seconds=30)
+                await second
+                poll = asyncio.create_task(self.http("GET", first_path, "bot-token", query=b"after=1"))
+                later = asyncio.create_task(self.submit(request_id=later_id))
+                await asyncio.wait_for(outgoing.get(), 2)
+
+                self.assertEqual(await self.stop(),
+                                 (200, {"status": "stopped", "request_ids": [first_id, second_id]}))
+                self.assertEqual(await asyncio.wait_for(poll, 2), (200, {"status": "stopped"}))
+                self.assertEqual(await self.http("GET", second_path, "bot-token"), (200, {"status": "stopped"}))
+                self.assertEqual(await self.http("GET", f"{second_path}/state", "bot-token"),
+                                 (200, {"status": "stopped"}))
+                control = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.assertEqual(control["type"], "stop_followups")
+                self.assertEqual(control["request_ids"], [first_id, second_id])
+                incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
+                    "type": "stop_followups_ack", "id": control["id"],
+                })})
+                self.assertFalse(later.done())
+                self.result(incoming, first_id, "late", followup=True, sequence=2, final=True)
+                self.result(incoming, later_id, "", wait_seconds=30)
+                self.assertEqual((await later)[1]["wait_seconds"], 30)
+                self.result(incoming, later_id, "new output", followup=True, sequence=1, final=True)
+                self.assertEqual((await self.http("GET", f"{SUDO_FOLLOWUP_PATH}/{later_id}", "bot-token",
+                                                  query=b"after=0"))[1]["output"], "new output")
+                self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": []}))
+                self.assertEqual(await self.submit(request_id=first_id), (200, {"status": "rejected"}))
+
+    async def test_stop_keeps_legacy_connection_usable_without_sending_unknown_frames(self):
+        request_id = "a" * 32
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            await asyncio.wait_for(outgoing.get(), 2)
+            self.result(incoming, request_id, "", wait_seconds=3600)
+            await first
+            self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": [request_id]}))
+            second = asyncio.create_task(self.submit(request_id="b" * 32))
+            self.assertEqual(json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])["command"], "list")
+            self.result(incoming, "b" * 32)
+            self.assertEqual((await second)[1]["status"], "ok")
+
+    async def test_stop_retries_failed_game_cleanup_without_counting_the_request_again(self):
+        request_id = "a" * 32
+        attempted = asyncio.Event()
+        failed_frames = []
+        send_json = WebSocket.send_json
+
+        async def fail_first_stop(socket, frame, *args, **kwargs):
+            if frame.get("type") == "stop_followups" and not failed_frames:
+                failed_frames.append(frame)
+                attempted.set()
+                raise OSError("injected stop write failure")
+            await send_json(socket, frame, *args, **kwargs)
+
+        async with self.connect(stop_capability=True) as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            await asyncio.wait_for(outgoing.get(), 2)
+            self.result(incoming, request_id, "", wait_seconds=3600)
+            await first
+            with patch.object(WebSocket, "send_json", new=fail_first_stop):
+                self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": [request_id]}))
+                await asyncio.wait_for(attempted.wait(), 2)
+                self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": []}))
+                retry = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.assertEqual(retry, failed_frames[0])
+            incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
+                "type": "stop_followups_ack", "id": retry["id"],
+            })})
+            processed = asyncio.Event()
+            incoming.put_nowait(processed)
+            await asyncio.wait_for(processed.wait(), 2)
+            self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": []}))
+            await asyncio.sleep(0)
+            self.assertTrue(outgoing.empty())
+
+    async def test_stop_accepts_acknowledgement_after_timeout_and_clears_pending_on_disconnect(self):
+        request_id = "a" * 32
+        timed_out = asyncio.Event()
+        async with self.connect(stop_capability=True) as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            await asyncio.wait_for(outgoing.get(), 2)
+            self.result(incoming, request_id, "", wait_seconds=3600)
+            await first
+            with patch("sudo_api.SEND_TIMEOUT", 0.05), patch("sudo_api.logger.warning",
+                                                            side_effect=lambda *_: timed_out.set()):
+                await self.stop()
+                control = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                await asyncio.wait_for(timed_out.wait(), 2)
+            incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
+                "type": "stop_followups_ack", "id": control["id"],
+            })})
+            processed = asyncio.Event()
+            incoming.put_nowait(processed)
+            await asyncio.wait_for(processed.wait(), 2)
+            await self.stop()
+            await asyncio.sleep(0)
+            self.assertTrue(outgoing.empty())
+
+            second = asyncio.create_task(self.submit(request_id="b" * 32))
+            await asyncio.wait_for(outgoing.get(), 2)
+            self.result(incoming, "b" * 32, "", wait_seconds=3600)
+            await second
+            await self.stop()
+            pending = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.assertEqual(pending["request_ids"], ["b" * 32])
+        async with self.connect(stop_capability=True) as (_, _, outgoing):
+            self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": []}))
+            await asyncio.sleep(0)
+            self.assertTrue(outgoing.empty())
+
+    async def test_late_stop_acknowledgement_resumes_the_next_cleanup_batch(self):
+        first_id, second_id = "a" * 32, "b" * 32
+        timeouts = asyncio.Queue()
+        async with self.connect(stop_capability=True) as (_, incoming, outgoing):
+            with patch("sudo_api.MAX_FOLLOWUPS", 1), patch("sudo_api.SEND_TIMEOUT", 0.1), \
+                 patch("sudo_api.logger.warning", side_effect=lambda *_: timeouts.put_nowait(None)):
+                first = asyncio.create_task(self.submit(request_id=first_id))
+                await asyncio.wait_for(outgoing.get(), 2)
+                self.result(incoming, first_id, "", wait_seconds=3600)
+                await first
+                await self.stop()
+                batch = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.assertEqual(batch["request_ids"], [first_id])
+
+                second = asyncio.create_task(self.submit(request_id=second_id))
+                await asyncio.wait_for(outgoing.get(), 2)
+                self.result(incoming, second_id, "", wait_seconds=3600)
+                await second
+                self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": [second_id]}))
+                retry = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.assertEqual(retry, batch)
+                await asyncio.wait_for(timeouts.get(), 2)
+                await asyncio.wait_for(timeouts.get(), 2)
+
+                incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
+                    "type": "stop_followups_ack", "id": batch["id"],
+                })})
+                next_batch = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+                self.assertNotEqual(next_batch["id"], batch["id"])
+                self.assertEqual(next_batch["request_ids"], [second_id])
+                incoming.put_nowait({"type": "websocket.receive", "text": json.dumps({
+                    "type": "stop_followups_ack", "id": next_batch["id"],
+                })})
 
     async def test_waits_for_matching_result_and_refuses_concurrent_work(self):
         async with self.connect() as (handshake, incoming, outgoing):

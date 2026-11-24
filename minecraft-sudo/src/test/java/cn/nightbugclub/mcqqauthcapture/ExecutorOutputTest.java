@@ -4,6 +4,8 @@ import org.apache.logging.log4j.LogManager;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.ref.Reference;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -17,6 +19,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.PriorityBlockingQueue;
@@ -427,7 +430,8 @@ class ExecutorOutputTest {
     @Test
     void throwingBulkPredicateLeavesCurrentLinkedAndArrayBatchesQueued() throws Exception {
         for (BlockingQueue<Runnable> queue : List.of(
-                new LinkedBlockingQueue<Runnable>(), new ArrayBlockingQueue<Runnable>(2))) {
+                new LinkedBlockingQueue<Runnable>(), new LinkedBlockingDeque<Runnable>(),
+                new ArrayBlockingQueue<Runnable>(2))) {
             var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
             try {
                 var request = new ScheduledOutput();
@@ -452,6 +456,134 @@ class ExecutorOutputTest {
                 ExecutorOutput.shutdownNow(pool);
             }
         }
+    }
+
+    @Test
+    void throwingArrayPredicateKeepsEarlierRemovalWithAnActiveIterator() throws Exception {
+        var queue = new ArrayBlockingQueue<Runnable>(2);
+        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var first = ExecutorOutput.submit(pool, () -> fail("removed task ran"));
+            var second = new FutureTask<>(() -> 2);
+            queue.add(second);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            var active = queue.iterator();
+            assertTrue(active.hasNext());
+            var failure = new IllegalStateException("predicate failed");
+
+            assertSame(failure, assertThrows(IllegalStateException.class, () -> ExecutorOutput.removeIf(queue, task -> {
+                if (task == second) {
+                    throw failure;
+                }
+                return true;
+            })));
+            assertArrayEquals(new Object[]{second}, queue.toArray());
+            assertFalse(first.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+            Reference.reachabilityFence(active);
+        } finally {
+            ExecutorOutput.shutdownNow(pool);
+        }
+    }
+
+    @Test
+    void arrayBulkPredicateHoldsTheNativeLockUntilRemoval() throws Exception {
+        var queue = new ArrayBlockingQueue<Runnable>(2);
+        var pool = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, queue);
+        var releaseWorker = new CompletableFuture<Void>();
+        var worker = new CompletableFuture<Thread>();
+        try {
+            pool.execute(() -> {
+                worker.complete(Thread.currentThread());
+                releaseWorker.join();
+            });
+            Thread workerThread = worker.get(2, TimeUnit.SECONDS);
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var task = ExecutorOutput.submit(pool, () -> fail("removed task ran"));
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+
+            assertTrue(ExecutorOutput.removeIf(queue, candidate -> {
+                assertSame(task, candidate);
+                releaseWorker.complete(null);
+                awaitQueueWait(workerThread, "take");
+                return true;
+            }));
+            assertFalse(task.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            releaseWorker.complete(null);
+            ExecutorOutput.shutdownNow(pool);
+        }
+    }
+
+    @Test
+    void queueMaintenanceReportsWorkQueuedWhileItWaitsForTheNativeLock() throws Exception {
+        for (String operation : List.of("clear", "removeIf", "purge")) {
+            var queue = new ArrayBlockingQueue<Runnable>(2);
+            var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+            try {
+                queue.add(() -> {});
+                var request = new ScheduledOutput();
+                var submitted = new AtomicReference<Future<?>>();
+                var removed = new AtomicReference<Object>();
+                var clean = new FutureTask<Void>(() -> {
+                    switch (operation) {
+                        case "clear" -> ExecutorOutput.clear(queue);
+                        case "removeIf" -> ExecutorOutput.removeIf(queue, task -> task == removed.get());
+                        case "purge" -> ExecutorOutput.purge(pool);
+                    }
+                    return null;
+                });
+                var cleaner = new Thread(clean, "executor-test-" + operation);
+                cleaner.setDaemon(true);
+                queue.forEach(ignored -> {
+                    if (submitted.get() != null) {
+                        return;
+                    }
+                    cleaner.start();
+                    awaitQueueWait(cleaner, "lock");
+                    var close = OutputCapture.begin(line -> fail(line), request);
+                    if (operation.equals("purge")) {
+                        submitted.set(CommandOutputContext.supplyAsync(() -> fail("purged task ran"), pool));
+                        var stageWorker = assertInstanceOf(Future.class, queue.toArray()[1]);
+                        assertTrue(stageWorker.cancel(false));
+                        removed.set(stageWorker);
+                    } else {
+                        submitted.set(ExecutorOutput.submit(pool, () -> fail("removed task ran")));
+                        removed.set(submitted.get());
+                    }
+                    assertTrue(close.get().join());
+                    assertTrue(request.seal());
+                });
+
+                clean.get(2, TimeUnit.SECONDS);
+                assertFalse(queue.contains(removed.get()), operation);
+                assertFalse(submitted.get().isDone(), operation);
+                assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status(), operation);
+            } finally {
+                ExecutorOutput.shutdownNow(pool);
+            }
+        }
+    }
+
+    private static void awaitQueueWait(Thread thread, String method) {
+        assertTimeoutPreemptively(Duration.ofSeconds(4), () -> {
+            while (true) {
+                if (thread.getState() == Thread.State.WAITING) {
+                    for (StackTraceElement frame : thread.getStackTrace()) {
+                        if (frame.getMethodName().equals(method)) {
+                            return;
+                        }
+                    }
+                }
+                Thread.sleep(1);
+            }
+        });
     }
 
     @Test
@@ -560,7 +692,7 @@ class ExecutorOutputTest {
     }
 
     @Test
-    void purgeDelegatesWhenACustomQueueOnlySupportsIteratorRemoval() throws Exception {
+    void purgeSettlesTheStageWhenACustomQueueOnlySupportsIteratorRemoval() throws Exception {
         var queue = new LinkedBlockingQueue<Runnable>() {
             @Override
             public boolean remove(Object task) {
@@ -574,14 +706,37 @@ class ExecutorOutputTest {
             pool.execute(cancelled);
             var request = new ScheduledOutput();
             var close = OutputCapture.begin(line -> fail(line), request);
-            var tracked = ExecutorOutput.submit(pool, () -> 2);
+            var stage = CommandOutputContext.supplyAsync(() -> fail("purged worker ran"), pool);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            var stageWorker = assertInstanceOf(Future.class, queue.toArray()[1]);
+            assertTrue(stageWorker.cancel(false));
+
+            ExecutorOutput.purge(pool);
+            assertTrue(queue.isEmpty());
+            assertFalse(stage.isDone());
+            assertFalse(pool.isShutdown());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            ExecutorOutput.shutdownNow(pool);
+        }
+    }
+
+    @Test
+    void clearingAnInheritedLinkedQueueSettlesTrackedWork() throws Exception {
+        var queue = new LinkedBlockingQueue<Runnable>() {};
+        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var tracked = ExecutorOutput.submit(pool, () -> fail("cleared task ran"));
             assertTrue(close.get().join());
             assertTrue(request.seal());
 
-            ExecutorOutput.purge(pool);
-            assertSame(tracked, queue.element());
-            assertEquals(1, queue.size());
-            assertFalse(request.result().isDone());
+            ExecutorOutput.clear(queue);
+            assertTrue(queue.isEmpty());
+            assertFalse(tracked.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
         } finally {
             ExecutorOutput.shutdownNow(pool);
         }

@@ -1095,7 +1095,7 @@ async def exercise(port):
     ):
         await qq_bot.handle_event(event("/help", 1))
         help_text = initial.call_args.kwargs["message"].extract_plain_text()
-        assert all(command in help_text for command in ("/sudo", "/ping", "/info"))
+        assert all(command in help_text for command in ("/sudo", "/sudostop", "/ping", "/info"))
         assert "/bind " not in help_text and "/reconcile" not in help_text
         initial.reset_mock()
         await qq_bot.handle_event(event("/ping", 2))
@@ -1105,8 +1105,9 @@ async def exercise(port):
         assert initial.call_args.kwargs["message"].type == "image"
         binding_probe.assert_not_called()
         initial.reset_mock()
-        async with connect(f"ws://127.0.0.1:{port}{SUDO_WS_PATH}",
-                           additional_headers={"Authorization": "Bearer mod-token"}, proxy=None) as mod:
+        async with connect(f"ws://127.0.0.1:{port}{SUDO_WS_PATH}", additional_headers={
+            "Authorization": "Bearer mod-token", "X-MCQQSudo-Capabilities": "stop_followups",
+        }, proxy=None) as mod:
             command = asyncio.create_task(qq_bot.handle_event(event("/sudo list", 4)))
             request = json.loads(await asyncio.wait_for(mod.recv(), 2))
             assert request["command"] == "list" and request["stream_followup"] is True
@@ -1115,7 +1116,7 @@ async def exercise(port):
             await asyncio.wait_for(command, 2)
             assert "正在执行..." in str(initial.call_args.kwargs["message"])
             assert request_id in str(initial.call_args.kwargs["message"])
-            tasks = tuple(qq_sudo.followup_tasks)
+            tasks = tuple(delivery.task for delivery in qq_sudo.followup_tasks.values())
             assert len(tasks) == 1
             await mod.send(json.dumps({
                 "id": request_id, "status": "ok", "output": "Delayed command output",
@@ -1124,6 +1125,24 @@ async def exercise(port):
             await asyncio.wait_for(asyncio.gather(*tasks), 3)
             delayed.assert_awaited_once()
             assert f"指令后续回执 {request_id}\\nDelayed command output" == str(delayed.call_args.kwargs["message"])
+
+            waiting = asyncio.create_task(qq_bot.handle_event(event("/sudo list", 5)))
+            pending = json.loads(await asyncio.wait_for(mod.recv(), 2))
+            await mod.send(json.dumps({"id": pending["id"], "status": "scheduled", "output": "", "wait_seconds": 3600}))
+            await asyncio.wait_for(waiting, 2)
+            waiting_task = qq_sudo.followup_tasks[pending["id"]].task
+            initial.reset_mock()
+            await asyncio.wait_for(qq_bot.handle_event(event("/sudostop", 6)), 2)
+            assert str(initial.call_args.kwargs["message"]) == "已停止 1 条指令的回传等待"
+            stop = json.loads(await asyncio.wait_for(mod.recv(), 2))
+            assert stop["type"] == "stop_followups" and stop["request_ids"] == [pending["id"]]
+            await mod.send(json.dumps({"type": "stop_followups_ack", "id": stop["id"]}))
+            await mod.send(json.dumps({
+                "id": pending["id"], "status": "ok", "output": "Stopped output",
+                "followup": True, "sequence": 1, "final": True,
+            }))
+            await asyncio.wait_for(asyncio.gather(waiting_task, return_exceptions=True), 2)
+            delayed.assert_awaited_once()
 
 async def main():
     with socket.socket() as listener:

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import unicodedata
 from base64 import b64encode
@@ -16,10 +17,12 @@ from app_config import API_PORT
 from qq_group import group_rule
 from sudo_config import (
     MAX_FOLLOWUP_FRAMES,
+    MAX_FOLLOWUPS,
     MAX_RESULT_MESSAGE_BYTES,
     SUDO_DIRECT_REPLY_TIMEOUT,
     SUDO_FOLLOWUP_PATH,
     SUDO_FOLLOWUP_TIMEOUT,
+    SUDO_STOP_PATH,
     SUDO_SUBMIT_PATH,
     SUDO_TIMEOUT,
     SudoOutputSettings,
@@ -36,11 +39,11 @@ def configure(sudo_settings: SudoSettings, output: SudoOutputSettings) -> None:
     settings, output_settings = sudo_settings, output
 
 running = asyncio.Lock()
-followup_tasks: set[asyncio.Task] = set()
 recent: OrderedDict[tuple[int, int, int], float] = OrderedDict()
 REPLAY_WINDOW = 300
 MAX_RECENT = 1024
 replay_cache_blocked_until = 0.0
+REPLAY_LIMIT_NOTICE = "指令请求过多，暂无法受理。请等待至少 5 分钟后重新发送。"
 UPLOAD_TIMEOUT = 20
 FOLLOWUP_UPLOAD_ATTEMPTS = 3
 FOLLOWUP_RETRY_DELAY = 1
@@ -77,6 +80,7 @@ class Reply:
     wait_seconds: int | None = None
     sequence: int | None = None
     final: bool = True
+    stopped_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,20 @@ class RenderedReply:
     message: MessageSegment | None
     output_in_file: bool = False
     output_in_message: bool = False
+
+
+@dataclass
+class FollowupDelivery:
+    task: asyncio.Task | None = None
+    stopped: bool = False
+
+    def stop(self) -> None:
+        self.stopped = True
+        if self.task is not None:
+            self.task.cancel()
+
+
+followup_tasks: dict[str, FollowupDelivery] = {}
 
 
 def allowed(event: GroupMessageEvent) -> bool:
@@ -98,6 +116,8 @@ def allowed(event: GroupMessageEvent) -> bool:
 
 sudo = on_command("sudo", rule=group_rule, permission=Permission(allowed), force_whitespace=True,
                   priority=10, block=True)
+sudostop = on_command("sudostop", rule=group_rule, permission=Permission(allowed), force_whitespace=True,
+                      priority=10, block=True)
 
 
 def command_from(event: GroupMessageEvent) -> str | None:
@@ -113,6 +133,19 @@ def command_from(event: GroupMessageEvent) -> str | None:
 
 async def submit(token: str, payload: dict) -> Reply:
     return await request_result(token, "POST", SUDO_SUBMIT_PATH, payload)
+
+
+async def initial_result(token: str, payload: dict) -> Reply:
+    try:
+        async with asyncio.timeout(SUDO_TIMEOUT) as wait:
+            reply = await submit(token, payload)
+            if reply.status == "unknown":
+                # A broken HTTP response cannot tell us whether the plugin executed.
+                await asyncio.sleep(max(0, wait.when() - asyncio.get_running_loop().time()))
+                return Reply("timeout")
+            return reply
+    except TimeoutError:
+        return Reply("timeout")
 
 
 async def request_result(token: str, method: str, path: str, payload: dict | None = None) -> Reply:
@@ -158,12 +191,20 @@ async def request_result(token: str, method: str, path: str, payload: dict | Non
         return Reply("unknown")
     if isinstance(result, dict):
         status, output = result.get("status"), result.get("output", "")
+        if method == "POST" and path == SUDO_STOP_PATH:
+            ids = result.get("request_ids")
+            if (status == "stopped" and isinstance(ids, list) and len(ids) <= MAX_FOLLOWUPS
+                    and all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{32}", item) for item in ids)
+                    and len(set(ids)) == len(ids)):
+                return Reply("stopped", stopped_ids=tuple(ids))
+            return Reply("unknown")
         truncated = result.get("truncated", False)
         wait_seconds = result.get("wait_seconds")
         sequence = result.get("sequence")
         final = result.get("final", True)
         if (
-            isinstance(status, str) and (status in REPLIES or (method == "GET" and status in {"waiting", "closed"}))
+            isinstance(status, str)
+            and (status in REPLIES or (method == "GET" and status in {"waiting", "closed", "stopped"}))
             and isinstance(output, str)
             and type(truncated) is bool
             and (wait_seconds is None or (method == "POST" and type(wait_seconds) is int
@@ -300,7 +341,7 @@ async def confirm_followup(token: str, request_id: str, sequence: int) -> None:
         async with asyncio.timeout(SUDO_TIMEOUT):
             while True:
                 reply = await request_result(token, "GET", path)
-                if reply.status in {"closed", "expired"}:
+                if reply.status in {"closed", "expired", "stopped"}:
                     return
                 await asyncio.sleep(2)
     except TimeoutError:
@@ -325,7 +366,7 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
             if reply.status != "waiting":
                 await asyncio.sleep(max(0, min(2, deadline - loop.time())))
             continue
-        if reply.status == "closed":
+        if reply.status in {"closed", "stopped"}:
             return
         if reply.sequence is not None and (after is None or reply.sequence != after + 1):
             await asyncio.sleep(max(0, min(2, deadline - loop.time())))
@@ -358,28 +399,71 @@ async def deliver_followup(bot: Bot, group_id: int, token: str, request_id: str,
                             pending_initial_notice=pending_initial_notice)
 
 
-@sudo.handle()
-async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
+def admit_message(event: GroupMessageEvent) -> str:
     global replay_cache_blocked_until
 
+    now = time.monotonic()
+    while recent and next(iter(recent.values())) <= now - REPLAY_WINDOW:
+        recent.popitem(last=False)
+    key = (event.self_id, event.group_id, event.message_id)
+    if key in recent:
+        return "duplicate"
+    if len(recent) >= MAX_RECENT or now < replay_cache_blocked_until:
+        # Reject untracked messages until their redelivery window has passed.
+        replay_cache_blocked_until = now + REPLAY_WINDOW
+        return "limited"
+    recent[key] = now
+    return "accepted"
+
+
+@sudostop.handle()
+async def handle_sudostop(event: GroupMessageEvent) -> None:
+    if settings is None:
+        return
+    message = event.original_message
+    if (not message or not all(segment.is_text() for segment in message)
+            or message.extract_plain_text().strip() != "/sudostop"):
+        await sudostop.finish(MessageSegment.text("用法：/sudostop"))
+        return
+    admission = admit_message(event)
+    if admission == "duplicate":
+        return
+    if admission == "limited":
+        await sudostop.finish(MessageSegment.text(REPLAY_LIMIT_NOTICE))
+        return
+    try:
+        async with asyncio.timeout(SUDO_TIMEOUT):
+            reply = await request_result(settings.bot_token, "POST", SUDO_STOP_PATH, {
+                "group_id": str(event.group_id),
+                "qq_id": str(event.user_id),
+            })
+    except TimeoutError:
+        reply = Reply("unknown")
+    if reply.status != "stopped":
+        await sudostop.finish(MessageSegment.text("暂时无法确认是否已停止回传等待"))
+        return
+    for request_id in reply.stopped_ids:
+        if (delivery := followup_tasks.get(request_id)) is not None:
+            delivery.stop()
+    count = len(reply.stopped_ids)
+    text = f"已停止 {count} 条指令的回传等待" if count else "当前没有等待回传的指令"
+    await sudostop.finish(MessageSegment.text(text))
+
+
+@sudo.handle()
+async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
     if settings is None:
         return
     command = command_from(event)
     if command is None:
         await sudo.finish(MessageSegment.text("用法：/sudo <一条纯文本 Minecraft 指令>"))
         return
-    now = time.monotonic()
-    while recent and next(iter(recent.values())) <= now - REPLAY_WINDOW:
-        recent.popitem(last=False)
-    key = (event.self_id, event.group_id, event.message_id)
-    if key in recent:
+    admission = admit_message(event)
+    if admission == "duplicate":
         return
-    if len(recent) >= MAX_RECENT or now < replay_cache_blocked_until:
-        # Reject untracked messages until their redelivery window has passed.
-        replay_cache_blocked_until = now + REPLAY_WINDOW
-        await sudo.finish(MessageSegment.text("指令请求过多，暂无法受理。请等待至少 5 分钟后重新发送。"))
+    if admission == "limited":
+        await sudo.finish(MessageSegment.text(REPLAY_LIMIT_NOTICE))
         return
-    recent[key] = now
 
     if running.locked():
         await sudo.finish(MessageSegment.text(REPLIES["busy"]))
@@ -393,32 +477,49 @@ async def handle_sudo(bot: Bot, event: GroupMessageEvent) -> None:
             "command": command,
             "deadline_ms": time.time_ns() // 1_000_000 + SUDO_TIMEOUT * 1000,
         }
+        delivery = FollowupDelivery()
+        followup_tasks[request_id] = delivery
         try:
-            async with asyncio.timeout(SUDO_TIMEOUT) as wait:
-                reply = await submit(settings.bot_token, payload)
-                if reply.status == "unknown":
-                    # A broken HTTP response cannot tell us whether the plugin executed.
-                    await asyncio.sleep(max(0, wait.when() - asyncio.get_running_loop().time()))
-                    reply = Reply("timeout")
-        except TimeoutError:
-            reply = Reply("timeout")
-        logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, reply.status)
-        waiting = reply.wait_seconds is not None or reply.status == "scheduled"
-        rendered = await render_result(bot, event.group_id, request_id, reply, waiting=waiting)
-        if waiting:
-            delivered_output = rendered.output_in_file
-            pending_initial_notice = INITIAL_STATUS_NOTICES.get(reply.status)
-            try:
+            delivery.task = asyncio.create_task(initial_result(settings.bot_token, payload))
+            reply = await delivery.task
+            if delivery.stopped:
+                return
+            logger.info("/sudo #{} qq={} result={}", request_id, event.user_id, reply.status)
+            if reply.wait_seconds is not None or reply.status == "scheduled":
+                await start_followup(bot, event.group_id, settings.bot_token, request_id, reply, delivery)
+            else:
+                rendered = await render_result(bot, event.group_id, request_id, reply)
                 if rendered.message is not None:
-                    await sudo.send(rendered.message)
-                    delivered_output |= rendered.output_in_message
-                    pending_initial_notice = None
-            finally:
-                task = asyncio.create_task(deliver_followup(
-                    bot, event.group_id, settings.bot_token, request_id, reply, delivered_output=delivered_output,
-                    pending_initial_notice=pending_initial_notice,
-                ))
-                followup_tasks.add(task)
-                task.add_done_callback(followup_tasks.discard)
-        elif rendered.message is not None:
-            await sudo.finish(rendered.message)
+                    await sudo.finish(rendered.message)
+        except asyncio.CancelledError:
+            if not delivery.stopped:
+                raise
+        finally:
+            if delivery.task is None or delivery.task.done():
+                followup_tasks.pop(request_id, None)
+
+
+async def start_followup(bot: Bot, group_id: int, token: str, request_id: str, reply: Reply,
+                         delivery: FollowupDelivery) -> None:
+    delivered_output = False
+    pending_initial_notice = INITIAL_STATUS_NOTICES.get(reply.status)
+
+    async def send_initial() -> None:
+        nonlocal delivered_output, pending_initial_notice
+        rendered = await render_result(bot, group_id, request_id, reply, waiting=True)
+        delivered_output = rendered.output_in_file
+        if rendered.message is not None:
+            await sudo.send(rendered.message)
+            delivered_output |= rendered.output_in_message
+            pending_initial_notice = None
+
+    delivery.task = asyncio.create_task(send_initial())
+    try:
+        await delivery.task
+    finally:
+        if not delivery.stopped:
+            delivery.task = asyncio.create_task(deliver_followup(
+                bot, group_id, token, request_id, reply, delivered_output=delivered_output,
+                pending_initial_notice=pending_initial_notice,
+            ))
+            delivery.task.add_done_callback(lambda _: followup_tasks.pop(request_id, None))

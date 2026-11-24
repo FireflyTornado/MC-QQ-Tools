@@ -378,7 +378,7 @@ MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 ```
 
-把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令和读取后续回执，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。Bot 启用 Sudo 时也会校验自身环境中已配置的 Mod Token。两个键同时设置时值必须一致。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade 和 Authorization 头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit` 和 `/internal/mc/sudo/followup/` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
+把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令、读取后续回执和结束等待，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。Bot 启用 Sudo 时也会校验自身环境中已配置的 Mod Token。两个键同时设置时值必须一致。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade、Authorization 和 `X-MCQQSudo-Capabilities` 请求头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit`、`/internal/mc/sudo/followup/` 和 `/internal/mc/sudo/stop` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
 用 JDK 17 构建 MCQQSudo，将产物放入 Mohist 1.20.1 服务端的 `mods/`。
 
@@ -386,7 +386,7 @@ MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
 ```
 
-产物是 `minecraft-sudo/target/MCQQSudo-0.3.1.jar`，包含指令通道、输出收集器和 Forge 异步输出转换器。Forge 加载 ID 为 `mcqqsudo`。升级时先停服，移出原 MCQQSudo JAR 和已安装的 `MCQQSudo-Transformer-*.jar`，然后将新 JAR 放入 `mods/`。原有 `config/mcqqsudo/` 可直接沿用。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
+产物是 `minecraft-sudo/target/MCQQSudo-0.3.2.jar`，包含指令通道、输出收集器和 Forge 异步输出转换器。Forge 加载 ID 为 `mcqqsudo`。升级时先停服，移出原 MCQQSudo JAR 和已安装的 `MCQQSudo-Transformer-*.jar`，然后将新 JAR 放入 `mods/`。原有 `config/mcqqsudo/` 可直接沿用。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
 
 ```yaml
 sudo:
@@ -429,7 +429,7 @@ Forge 在启动时从 MCQQSudo JAR 注册转换器，再直接挂载其中的主
 
 线程池的队列维护和拒绝策略沿用 JDK 原生行为。有明确的任务取消、执行结束或提交异常时，采集器据此结清回执。`shutdownNow()` 返回的工作项会在所属线程池终止后核对。第三方静默丢弃或直接移除任务时，如果一直没有可确认的终态，回执会等到最长一小时的后台采集窗口到期。
 
-插件用自有线程、线程池或回调时，将 `MCQQSudo-0.3.1-game.jar` 作为编译期依赖。运行 `mvn -B -ntp -f minecraft-sudo/pom.xml clean install` 后，可声明 Maven 依赖 `cn.nightbugclub:MCQQSudo:0.3.1`，设置 `classifier` 为 `game`、`scope` 为 `provided`。已下载发布包时，也可从外层 JAR 的 `META-INF/mcqqsudo/` 提取该文件并加入编译类路径。游戏服的 `mods/` 只安装外层发布 JAR。
+插件用自有线程、线程池或回调时，将 `MCQQSudo-0.3.2-game.jar` 作为编译期依赖。运行 `mvn -B -ntp -f minecraft-sudo/pom.xml clean install` 后，可声明 Maven 依赖 `cn.nightbugclub:MCQQSudo:0.3.2`，设置 `classifier` 为 `game`、`scope` 为 `provided`。已下载发布包时，也可从外层 JAR 的 `META-INF/mcqqsudo/` 提取该文件并加入编译类路径。游戏服的 `mods/` 只安装外层发布 JAR。
 
 在任务提交点使用 `cn.nightbugclub.mcqqauthcapture.CommandOutputContext.wrap(Runnable)` 或 `wrap(Consumer<T>)`。每次包装绑定一次调用，普通玩家或控制台触发的任务仍按原逻辑执行。若提交失败或任务在开始前取消，请调用包装对象的 `close()` 解除回传等待。此方法只解除关联，实际取消仍由插件的调度器处理。
 
@@ -460,6 +460,8 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 这些接口会在任务完成、失败或取消时结束对应的等待。已有的 `CompletionStage` 也可以在当前请求中用 `track(stage)` 登记，等它结束后再关闭回传。`track` 只延长等待，阶段里的日志和广播需要通过带上下文的任务或回调采集。
 
 已登记的延后任务最多跟踪一小时。任务静默完成或回传超时时，群内仍会收到终态。对于没有登记延后任务的请求，Mod 在发出首轮回执后继续接收原命令发送者的直接回复 30 秒。执行阶段抛出异常时，首轮仍报告失败，并保留这段接收时间。到期且始终未收到输出时，群内显示「等待期间未捕获输出」。首轮采集不完整时，群内会提示采集状态并继续等待迟到输出。Bot 在 OneBot 确认发送后推进补发序号，发送失败时在投递期限内重试。API 在 Bot 投递期间保留回执，收到终帧确认后清理正文。首轮的执行失败或采集不完整提示发送异常时，下一条成功投递的补发会附带该提示。回传状态保存在内存中，指令连接断开会结束本次回传，游戏服继续执行已安排的任务。请更新 Mod、FastAPI 和 Bot 以启用分批补发。
+
+`/sudostop` 由目标群内配置在 `MC_SUDO_QQ_IDS` 中的账号使用。指令会结束受理时已进入后续回传、且还没有终态的全部请求，包含 30 秒直接回复窗口和最长一小时的后台等待。群内会显示「已停止 x 条指令的回传等待」或「当前没有等待回传的指令」。游戏服已开始的命令和后台任务可以继续运行。旧模组仍可使用普通 `/sudo`，升级模组后 `/sudostop` 也会释放游戏服侧的采集名额。
 
 可在 `bot/.env` 的远程指令段调整输出发送方式。阈值只按输出正文判断，请求编号和状态提示不计入。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
 

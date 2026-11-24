@@ -102,7 +102,8 @@ DEFAULTS = MappingProxyType({
         "/帮助 或 /help · 显示本帮助\n"
         "/信息 或 /info · 查看状态图片（超级用户专用）"
     ),
-    "commands.help.sudo": "/sudo <Minecraft 指令> · 执行并回显（指定 QQ 号专用）",
+    "commands.help.sudo": "/sudo <Minecraft 指令> · 执行并回显（指定 QQ 号专用）\n"
+                          "/sudostop · 停止所有等待中的回传",
     "commands.info.busy": "状态图正在生成，请稍后重试。",
     "commands.info.error": "状态图暂不可用，请稍后重试。",
     "info.title": "MC-QQ-Tools",

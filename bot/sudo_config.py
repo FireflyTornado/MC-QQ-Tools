@@ -8,10 +8,12 @@ from app_config import ConfigError, read_switch, require_token
 SUDO_TIMEOUT = 30
 SUDO_SUBMIT_PATH = "/internal/mc/sudo/submit"
 SUDO_FOLLOWUP_PATH = "/internal/mc/sudo/followup"
+SUDO_STOP_PATH = "/internal/mc/sudo/stop"
 SUDO_WS_PATH = "/internal/mc/sudo/ws"
 SUDO_FOLLOWUP_TIMEOUT = 3600
 SUDO_DIRECT_REPLY_TIMEOUT = 30
 MAX_FOLLOWUP_FRAMES = 64
+MAX_FOLLOWUPS = 128
 MAX_COMMAND_LENGTH = 256
 MAX_RESULT_BYTES = 64 * 1024
 MAX_RESULT_MESSAGE_BYTES = 512 * 1024

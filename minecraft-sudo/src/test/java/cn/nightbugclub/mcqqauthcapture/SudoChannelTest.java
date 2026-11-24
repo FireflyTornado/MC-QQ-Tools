@@ -28,6 +28,7 @@ import java.util.logging.Logger;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -238,6 +239,51 @@ class SudoChannelTest {
                 assertTrue(followup.get("final").getAsBoolean());
             }
             verify(expiry.future()).cancel(false);
+        }
+    }
+
+    @Test
+    void stopFollowupsClosesOnlyTheListedCapturesAndKeepsTheChannelOpen() throws Exception {
+        try (var fixture = new ChannelFixture()) {
+            var peer = fixture.connect();
+            verify(fixture.builder).header("X-MCQQSudo-Capabilities", "stop_followups");
+            fixture.takeNext(20, SECONDS);
+            var stopped = new Object();
+            var retained = new Object();
+            for (int id : new int[]{1, 2}) {
+                var event = id == 1 ? stopped : retained;
+                when(fixture.commands.execute(eq("test" + id), anyLong(), any(ScheduledOutput.class))).thenAnswer(call -> {
+                    var close = OutputCapture.begin(ignored -> {}, call.getArgument(2));
+                    ScheduledOutput.enqueue(event);
+                    close.get().join();
+                    return CompletableFuture.completedFuture(new SudoCommands.Result("ok"));
+                });
+                peer.send(id, true);
+                fixture.tasks.remove().run();
+                assertEquals("scheduled", peer.status());
+            }
+            var expiry = fixture.takeNext(3600, SECONDS);
+            var update = fixture.takeNext(1, SECONDS);
+            String stopId = "%032x".formatted(5);
+            String stoppedId = "%032x".formatted(1);
+            peer.listener.onText(peer.socket, """
+                    {"type":"stop_followups","id":"%s","request_ids":["%s"]}
+                    """.formatted(stopId, stoppedId), true);
+            var reply = JsonParser.parseString(peer.replies.remove()).getAsJsonObject();
+            assertEquals("stop_followups_ack", reply.get("type").getAsString());
+            assertEquals(stopId, reply.get("id").getAsString());
+            verify(expiry.future()).cancel(false);
+            verify(update.future()).cancel(false);
+            assertFalse(ScheduledOutput.hasPendingEvent(stopped));
+            assertTrue(ScheduledOutput.hasPendingEvent(retained));
+            var ran = new AtomicBoolean();
+            ScheduledOutput.run(stopped, () -> ran.set(true));
+            assertTrue(ran.get());
+
+            peer.send(3);
+            fixture.tasks.remove().run();
+            assertEquals("ok", peer.status());
+            assertTrue(peer.replies.isEmpty());
         }
     }
 

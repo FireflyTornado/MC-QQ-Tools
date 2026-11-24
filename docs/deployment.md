@@ -386,7 +386,7 @@ MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
 ```
 
-产物是 `minecraft-sudo/target/MCQQSudo-0.3.0.jar`，包含指令通道和输出收集器。Forge 加载 ID 为 `mcqqsudo`。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
+产物是 `minecraft-sudo/target/MCQQSudo-0.3.1.jar`，包含指令通道、输出收集器和 Forge 异步输出转换器。Forge 加载 ID 为 `mcqqsudo`。升级时先停服，移出原 MCQQSudo JAR 和已安装的 `MCQQSudo-Transformer-*.jar`，然后将新 JAR 放入 `mods/`。原有 `config/mcqqsudo/` 可直接沿用。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
 
 ```yaml
 sudo:
@@ -419,16 +419,9 @@ Mod 在当前请求的等待窗口内收集已关联的原版回调。回调超�
 
 通过 Mohist 的 Bukkit 调度器提交的一次性同步、异步或延迟任务也会关联到正在执行的 `/sudo` 请求，包括 `callSyncMethod` 提交的任务。任务执行或取消后复用后续回执。可用测试插件安排一项异步任务和一项延迟任务，验证普通请求在等待期间仍能执行，并用任务取消验证回执。周期任务继续按 Bukkit 的原有规则运行。
 
-#### 可选的 Forge 异步输出采集
+#### Forge 异步输出采集
 
-需要采集 Forge 模组的线程池和 Future 回调输出时，将同一源码构建的 MCQQSudo 与下列转换器 JAR 一起放入 `mods/`，然后重启游戏服。
-
-```bash
-mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
-mvn -B -ntp -f minecraft-sudo/transformer/pom.xml clean verify
-```
-
-转换器位于 `minecraft-sudo/transformer/target/MCQQSudo-Transformer-0.3.0.jar`。Forge 启动时会扫描 `mods/` 中独立安装的模组，接入 JDK 定时线程池的 `execute`、`submit` 和单次 `schedule`，以及普通 JDK 线程池的 `submit`。日志中的 `MCQQSudo executor capture targets` 显示找到的类数。只有在 `/sudo` 或其后台任务中提交的新任务才会继承请求归属。可用 Forge spark 的 `/sudo spark gc` 验证结果是否补发。需要撤回时移出转换器 JAR 并重启。
+Forge 在启动时从 MCQQSudo JAR 注册转换器，再直接挂载其中的主模组。部署时只需放入一个 MCQQSudo JAR，内嵌模组无需手动解包。转换器扫描 `mods/` 中独立安装的模组，接入 JDK 定时线程池的 `execute`、`submit` 和单次 `schedule`，以及普通 JDK 线程池的 `submit`。日志中的 `MCQQSudo executor capture targets` 显示找到的类数。只有在 `/sudo` 或其后台任务中提交的新任务才会继承请求归属。可用 Forge spark 的 `/sudo spark gc` 验证结果是否补发。
 
 转换器还会接入 JDK `CompletableFuture` 的 `runAsync`、`supplyAsync`，以及 `CompletableFuture` 和 `CompletionStage` 上的 `thenRun`、`thenApply`、`thenAccept`、`thenCompose`、`whenComplete`、`handle`、`exceptionally`、`exceptionallyCompose` 及其异步重载。回调归属在注册时确定，等待对应阶段结算后再结束回执。
 

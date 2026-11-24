@@ -4,7 +4,7 @@ license="All Rights Reserved"
 
 [[mods]]
 modId="mcqqsudo"
-version="0.3.0"
+version="${file.jarVersion}"
 displayName="MCQQSudo"
 displayTest="IGNORE_ALL_VERSION"
 description="Runs approved QQ commands and captures their output on Mohist 1.20.1."

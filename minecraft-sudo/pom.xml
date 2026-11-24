@@ -4,12 +4,13 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>cn.nightbugclub</groupId>
     <artifactId>MCQQSudo</artifactId>
-    <version>0.3.0</version>
+    <version>0.3.1</version>
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <maven.compiler.proc>none</maven.compiler.proc>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <forge.version>1.20.1-47.4.28</forge.version>
+        <asm.version>9.8</asm.version>
     </properties>
     <repositories>
         <repository>
@@ -53,6 +54,24 @@
         </dependency>
         <dependency>
             <groupId>net.minecraftforge</groupId>
+            <artifactId>forgespi</artifactId>
+            <version>7.0.1</version>
+            <scope>provided</scope>
+            <exclusions>
+                <exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>cpw.mods</groupId>
+            <artifactId>modlauncher</artifactId>
+            <version>10.0.9</version>
+            <scope>provided</scope>
+            <exclusions>
+                <exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>net.minecraftforge</groupId>
             <artifactId>eventbus</artifactId>
             <version>6.0.5</version>
             <scope>provided</scope>
@@ -81,7 +100,13 @@
         <dependency>
             <groupId>org.ow2.asm</groupId>
             <artifactId>asm</artifactId>
-            <version>9.8</version>
+            <version>${asm.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.ow2.asm</groupId>
+            <artifactId>asm-tree</artifactId>
+            <version>${asm.version}</version>
             <scope>provided</scope>
         </dependency>
         <dependency>
@@ -118,17 +143,58 @@
             <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.4</version>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- Unit tests run without the ModLauncher module class loader. -->
+                        <Log4jContextSelector>org.apache.logging.log4j.core.selector.ClassLoaderContextSelector</Log4jContextSelector>
+                    </systemPropertyVariables>
+                </configuration>
             </plugin>
             <plugin>
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>3.4.1</version>
-                <configuration>
-                    <archive>
-                        <manifestEntries>
-                            <MixinConfigs>mcqqsudo.mixins.json</MixinConfigs>
-                        </manifestEntries>
-                    </archive>
-                </configuration>
+                <executions>
+                    <execution>
+                        <id>embedded-game-mod</id>
+                        <phase>prepare-package</phase>
+                        <goals><goal>jar</goal></goals>
+                        <configuration>
+                            <classifier>game</classifier>
+                            <outputDirectory>${project.build.outputDirectory}/META-INF/mcqqsudo</outputDirectory>
+                            <excludes>
+                                <exclude>cn/nightbugclub/mcqqsudotransformer/**</exclude>
+                                <exclude>META-INF/services/**</exclude>
+                                <exclude>META-INF/mcqqsudo/**</exclude>
+                            </excludes>
+                            <archive>
+                                <manifest>
+                                    <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+                                </manifest>
+                                <manifestEntries>
+                                    <MixinConfigs>mcqqsudo.mixins.json</MixinConfigs>
+                                </manifestEntries>
+                            </archive>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>default-jar</id>
+                        <configuration>
+                            <includes>
+                                <include>cn/nightbugclub/mcqqsudotransformer/**</include>
+                                <include>META-INF/services/**</include>
+                                <include>META-INF/mcqqsudo/${project.build.finalName}-game.jar</include>
+                            </includes>
+                            <archive>
+                                <manifest>
+                                    <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+                                </manifest>
+                                <manifestEntries>
+                                    <Automatic-Module-Name>cn.nightbugclub.mcqqsudo.bootstrap</Automatic-Module-Name>
+                                </manifestEntries>
+                            </archive>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

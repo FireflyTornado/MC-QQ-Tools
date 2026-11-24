@@ -21,7 +21,7 @@ import java.util.zip.ZipFile;
 
 final class ExecutorTransformer implements ITransformer<ClassNode> {
     private static final System.Logger LOG = System.getLogger("MCQQSudo-Transformer");
-    private static final String BRIDGE = "cn/nightbugclub/mcqqauthcapture/ExecutorOutput";
+    static final String BRIDGE = "cn/nightbugclub/mcqqauthcapture/ExecutorOutput";
     private static final String CONCURRENT = "java/util/concurrent/";
     private static final String EXECUTOR = CONCURRENT + "Executor";
     private static final String SERVICE = CONCURRENT + "ExecutorService";
@@ -51,15 +51,10 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
             return Set.of();
         }
         var classes = new HashSet<String>();
-        boolean bridgePresent = false;
         try (var files = Files.list(mods)) {
             for (Path file : files.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".jar")).toList()) {
                 try (var jar = new ZipFile(file.toFile())) {
                     if (jar.getEntry("META-INF/mods.toml") == null) {
-                        continue;
-                    }
-                    if (jar.getEntry(BRIDGE + ".class") != null) {
-                        bridgePresent |= jar.getEntry(StageCalls.BRIDGE + ".class") != null;
                         continue;
                     }
                     var entries = jar.entries();
@@ -81,10 +76,6 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
             }
         } catch (IOException failure) {
             LOG.log(Level.WARNING, "Could not scan the mods directory: {0}", failure.getMessage());
-            return Set.of();
-        }
-        if (!bridgePresent) {
-            LOG.log(Level.WARNING, "Matching MCQQSudo capture bridges are unavailable; conversion is disabled.");
             return Set.of();
         }
         return classes;

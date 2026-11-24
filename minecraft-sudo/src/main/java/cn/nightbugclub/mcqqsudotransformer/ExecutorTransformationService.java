@@ -22,6 +22,7 @@ public final class ExecutorTransformationService implements ITransformationServi
 
     @Override
     public void initialize(IEnvironment environment) {
+        BundledMod.root();
         classes = environment.getProperty(IEnvironment.Keys.GAMEDIR.get())
                 .map(directory -> ExecutorTransformer.scan(directory.resolve("mods"))).orElse(Set.of());
         LOG.log(Level.INFO, "MCQQSudo executor capture targets: {0} classes", classes.size());

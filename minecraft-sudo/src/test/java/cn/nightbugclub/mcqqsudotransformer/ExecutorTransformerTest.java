@@ -43,16 +43,14 @@ class ExecutorTransformerTest {
     }
 
     @Test
-    void discoversForgeModClassesOnlyWithTheBridgePresent(@TempDir Path mods) throws IOException {
+    void discoversClassesInForgeModsAndSkipsTheBootstrapJar(@TempDir Path mods) throws IOException {
         String name = Submitter.class.getName().replace('.', '/') + ".class";
-        jar(mods.resolve("fixture.jar"), name, classBytes(Submitter.class), true);
         String stageName = CallbackRegistrar.class.getName().replace('.', '/') + ".class";
+        jar(mods.resolve("mcqqsudo.jar"), name, classBytes(Submitter.class), false);
+        jar(mods.resolve("ordinary-library.jar"), stageName, classBytes(CallbackRegistrar.class), false);
+        assertTrue(ExecutorTransformer.scan(mods).isEmpty());
+        jar(mods.resolve("fixture.jar"), name, classBytes(Submitter.class), true);
         jar(mods.resolve("stage-fixture.jar"), stageName, classBytes(CallbackRegistrar.class), true);
-        assertTrue(ExecutorTransformer.scan(mods).isEmpty());
-        jar(mods.resolve("old-mcqqsudo.jar"), BRIDGE + ".class", new byte[0], true);
-        assertTrue(ExecutorTransformer.scan(mods).isEmpty());
-        jar(mods.resolve("mcqqsudo.jar"), BRIDGE + ".class", new byte[0], true, StageCalls.BRIDGE + ".class");
-        jar(mods.resolve("ordinary-library.jar"), "unreadable.class", new byte[0], false);
         assertEquals(Set.of(Submitter.class.getName(), CallbackRegistrar.class.getName()), ExecutorTransformer.scan(mods));
     }
 
@@ -86,7 +84,7 @@ class ExecutorTransformerTest {
         }
     }
 
-    private static void jar(Path path, String entry, byte[] content, boolean mod, String... otherEntries) throws IOException {
+    private static void jar(Path path, String entry, byte[] content, boolean mod) throws IOException {
         try (var out = new ZipOutputStream(Files.newOutputStream(path))) {
             if (mod) {
                 out.putNextEntry(new ZipEntry("META-INF/mods.toml"));
@@ -95,10 +93,6 @@ class ExecutorTransformerTest {
             out.putNextEntry(new ZipEntry(entry));
             out.write(content);
             out.closeEntry();
-            for (String extra : otherEntries) {
-                out.putNextEntry(new ZipEntry(extra));
-                out.closeEntry();
-            }
         }
     }
 

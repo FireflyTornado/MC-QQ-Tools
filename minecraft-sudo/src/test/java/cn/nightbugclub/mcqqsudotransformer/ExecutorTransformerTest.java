@@ -41,7 +41,7 @@ class ExecutorTransformerTest {
     private static final String BRIDGE = "cn/nightbugclub/mcqqauthcapture/ExecutorOutput";
 
     @Test
-    void rewritesMatchedCallsAndLeavesPeriodicTasksAlone() throws IOException {
+    void rewritesSubmissionButLeavesPeriodicTasksAndShutdownAlone() throws IOException {
         var reader = new ClassReader(classBytes(Submitter.class));
         assertTrue(ExecutorTransformer.hasMatch(reader));
         var node = new ClassNode();
@@ -49,9 +49,10 @@ class ExecutorTransformerTest {
         new ExecutorTransformer(Set.of(Submitter.class.getName())).transform(node, null);
         var calls = node.methods.stream().flatMap(method -> Arrays.stream(method.instructions.toArray()))
                 .filter(MethodInsnNode.class::isInstance).map(MethodInsnNode.class::cast).toList();
-        assertEquals(4, calls.stream().filter(call -> call.owner.equals(BRIDGE)
+        assertEquals(3, calls.stream().filter(call -> call.owner.equals(BRIDGE)
                 && call.getOpcode() == Opcodes.INVOKESTATIC).count());
-        assertTrue(calls.stream().anyMatch(call -> call.owner.equals(BRIDGE) && call.name.equals("shutdownNow")));
+        assertTrue(calls.stream().anyMatch(call -> call.name.equals("shutdownNow")
+                && call.getOpcode() == Opcodes.INVOKEINTERFACE));
         assertTrue(calls.stream().anyMatch(call -> call.name.equals("scheduleAtFixedRate")
                 && call.getOpcode() == Opcodes.INVOKEINTERFACE));
     }
@@ -156,9 +157,13 @@ class ExecutorTransformerTest {
         assertEquals(List.of("setRejectedExecutionHandler", "getRejectedExecutionHandler", "getQueue", "clear", "removeIf",
                         "remove", "remove", "purge"),
                 calls.stream().filter(call -> !call.name.equals("<init>")).map(call -> call.name).toList());
-        assertTrue(instructions.stream().filter(InvokeDynamicInsnNode.class::isInstance)
+        var references = instructions.stream().filter(InvokeDynamicInsnNode.class::isInstance)
                 .map(InvokeDynamicInsnNode.class::cast).map(call -> (Handle) call.bsmArgs[1])
-                .anyMatch(handle -> handle.getOwner().startsWith("java/util/") && handle.getName().equals("clear")));
+                .toList();
+        assertTrue(references.stream().anyMatch(handle -> handle.getOwner().startsWith("java/util/")
+                && handle.getName().equals("clear")));
+        assertTrue(references.stream().anyMatch(handle -> handle.getOwner().equals("java/util/concurrent/ExecutorService")
+                && handle.getName().equals("shutdownNow")));
     }
 
     private static void jar(Path path, String entry, byte[] content, boolean mod) throws IOException {
@@ -208,6 +213,10 @@ class ExecutorTransformerTest {
 
         static Consumer<Queue<Runnable>> clearReference() {
             return Queue::clear;
+        }
+
+        static Function<ExecutorService, List<Runnable>> shutdownReference() {
+            return ExecutorService::shutdownNow;
         }
     }
 

@@ -1,12 +1,11 @@
 package cn.nightbugclub.mcqqauthcapture;
 
-import com.sun.management.ThreadMXBean;
 import org.apache.logging.log4j.LogManager;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -17,7 +16,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
@@ -26,10 +24,9 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class ExecutorOutputTest {
     @Test
@@ -131,127 +128,47 @@ class ExecutorOutputTest {
         }
     }
 
-    @Test
-    void shutdownDrainSettlesTheReturnedTaskWithoutCancellingItsFuture() throws Exception {
-        var pool = occupiedPool(new LinkedBlockingQueue<>(), new ThreadPoolExecutor.AbortPolicy());
-        try {
-            var request = new ScheduledOutput();
-            var close = OutputCapture.begin(line -> fail(line), request);
-            var task = ExecutorOutput.submit(pool, () -> fail("drained task ran"));
-            assertTrue(close.get().join());
-            assertTrue(request.seal());
-
-            assertEquals(List.of(task), ExecutorOutput.shutdownNow(pool));
-            assertTrue(pool.awaitTermination(2, TimeUnit.SECONDS));
-            assertEquals("cancelled", request.result().get(3, TimeUnit.SECONDS).status());
-            assertFalse(task.isDone());
-        } finally {
-            pool.shutdownNow();
-        }
-    }
-
-    @Test
-    void remembersShutdownDrainBeforeSubmitReturnsItsFuture() throws Exception {
-        var afterOffer = new AtomicReference<Consumer<Runnable>>();
-        var queue = new LinkedBlockingQueue<Runnable>() {
-            @Override
-            public boolean offer(Runnable task) {
-                boolean accepted = super.offer(task);
-                var hook = afterOffer.getAndSet(null);
-                if (accepted && hook != null) {
-                    hook.accept(task);
-                }
-                return accepted;
-            }
-        };
-        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
-        try {
-            afterOffer.set(task -> assertEquals(List.of(task), ExecutorOutput.shutdownNow(pool)));
-            var request = new ScheduledOutput();
-            var close = OutputCapture.begin(line -> fail(line), request);
-            var task = ExecutorOutput.submit(pool, () -> fail("drained before submit returned"));
-            assertTrue(close.get().join());
-            assertTrue(request.seal());
-
-            assertTrue(pool.awaitTermination(2, TimeUnit.SECONDS));
-            assertEquals("cancelled", request.result().get(3, TimeUnit.SECONDS).status());
-            assertFalse(task.isDone());
-        } finally {
-            pool.shutdownNow();
-        }
-    }
-
-    @Test
-    void recordsDrainForSubmissionThatReturnsWhileTheIndexIsBuilt() throws Exception {
-        var pool = Executors.newFixedThreadPool(1);
-        var publisher = Executors.newSingleThreadExecutor();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void capturesWorkTransferredAfterTheOriginalExecutorTerminates(boolean stage) throws Exception {
+        var original = occupiedPool(new LinkedBlockingQueue<>(), new ThreadPoolExecutor.AbortPolicy());
+        var backup = Executors.newSingleThreadExecutor();
         var request = new ScheduledOutput();
+        var cancellation = new ScheduledOutput();
         try {
             var close = OutputCapture.begin(line -> fail(line), request);
-            var event = new Object();
-            assertTrue(ScheduledOutput.registerTask(event));
-            ScheduledOutput.beginQueueSubmission(event, pool);
-            assertTrue(close.get().join());
-            assertTrue(request.seal());
-
-            var task = new FutureTask<>(() -> fail("drained task ran"));
-            var drained = new AbstractList<Runnable>() {
-                @Override
-                public Runnable get(int index) {
-                    try {
-                        publisher.submit(() -> ScheduledOutput.observeQueuedWork(event, pool, task, task))
-                                .get(2, TimeUnit.SECONDS);
-                    } catch (InterruptedException | ExecutionException | TimeoutException failure) {
-                        throw new AssertionError("submission could not publish its Future during indexing", failure);
-                    }
-                    return task;
-                }
-
-                @Override
-                public int size() {
-                    return 1;
-                }
+            Supplier<Integer> work = () -> {
+                LogManager.getLogger("test.executor").error("backup executor output");
+                return 42;
             };
-            pool.shutdown();
-            ScheduledOutput.observeShutdownDrain(pool, drained);
-            assertEquals("cancelled", request.result().get(3, TimeUnit.SECONDS).status());
-            assertFalse(task.isDone());
-        } finally {
-            request.abandon();
-            publisher.shutdownNow();
-            pool.shutdownNow();
-        }
-    }
-
-    @Test
-    void largeDrainAllocationDoesNotMultiplyByPendingSubmissions() {
-        var bean = ManagementFactory.getPlatformMXBean(ThreadMXBean.class);
-        assumeTrue(bean != null && bean.isThreadAllocatedMemoryEnabled());
-        var pool = Executors.newFixedThreadPool(1);
-        var request = new ScheduledOutput();
-        try {
-            var tasks = new ArrayList<Runnable>(10_000);
-            for (int index = 0; index < 10_000; index++) {
-                tasks.add(new FutureTask<>(() -> fail("drained task ran")));
-            }
-            var close = OutputCapture.begin(line -> fail(line), request);
-            for (int index = 0; index < 256; index++) {
-                var event = new Object();
-                assertTrue(ScheduledOutput.registerTask(event));
-                ScheduledOutput.beginQueueSubmission(event, pool);
-            }
+            Future<Integer> task = stage ? CommandOutputContext.supplyAsync(work, original)
+                    : ExecutorOutput.submit(original, (Callable<Integer>) work::get);
+            Runnable transferred = original.getQueue().element();
             assertTrue(close.get().join());
             assertTrue(request.seal());
 
-            long thread = Thread.currentThread().getId();
-            long before = bean.getThreadAllocatedBytes(thread);
-            ScheduledOutput.observeShutdownDrain(pool, tasks);
-            long allocated = bean.getThreadAllocatedBytes(thread) - before;
-            // The former per-submission copies allocate over 20 MB even with compressed references.
-            assertTrue(allocated < 8_000_000, () -> "allocated " + allocated + " bytes for one drain");
+            var closeCancellation = OutputCapture.begin(line -> fail(line), cancellation);
+            var cancelled = ExecutorOutput.submit(original, () -> fail("explicitly cancelled task ran"));
+            assertTrue(closeCancellation.get().join());
+            assertTrue(cancellation.seal());
+
+            var drained = original.shutdownNow();
+            assertEquals(List.of(transferred, cancelled), drained);
+            assertTrue(original.awaitTermination(2, TimeUnit.SECONDS));
+            assertTrue(cancelled.cancel(false));
+            // Wait for a real cancellation to be observed before the backup starts.
+            assertEquals("cancelled", cancellation.result().get(3, TimeUnit.SECONDS).status());
+            assertFalse(request.result().isDone());
+
+            backup.execute(drained.get(0));
+            assertEquals(42, task.get(3, TimeUnit.SECONDS));
+            assertEquals(new SudoCommands.Result("ok", "backup executor output\n"),
+                    request.result().get(3, TimeUnit.SECONDS));
         } finally {
             request.abandon();
-            pool.shutdownNow();
+            cancellation.abandon();
+            original.shutdownNow();
+            backup.shutdownNow();
         }
     }
 
@@ -285,7 +202,7 @@ class ExecutorOutputTest {
             releaseFirst.complete(null);
             assertTrue(dequeued.await(3, TimeUnit.SECONDS));
 
-            assertEquals(List.of(worker), ExecutorOutput.shutdownNow(pool));
+            assertEquals(List.of(worker), pool.shutdownNow());
             assertThrows(TimeoutException.class, () -> request.result().get(1200, TimeUnit.MILLISECONDS));
             releaseDequeued.complete(null);
             assertEquals(42, stage.get(3, TimeUnit.SECONDS));
@@ -310,7 +227,7 @@ class ExecutorOutputTest {
             assertTrue(close.get().join());
             assertTrue(request.seal());
 
-            var drained = ExecutorOutput.shutdownNow(other);
+            var drained = other.shutdownNow();
             assertEquals(List.of(future), drained);
             assertTrue(other.isTerminated());
             assertThrows(TimeoutException.class, () -> request.result().get(1200, TimeUnit.MILLISECONDS));
@@ -346,7 +263,7 @@ class ExecutorOutputTest {
 
             queue.clear();
             assertSame(task, transferred.get());
-            assertTrue(ExecutorOutput.shutdownNow(pool).isEmpty());
+            assertTrue(pool.shutdownNow().isEmpty());
             assertTrue(pool.awaitTermination(2, TimeUnit.SECONDS));
             assertThrows(TimeoutException.class, () -> request.result().get(1200, TimeUnit.MILLISECONDS));
             transferred.get().run();

@@ -1,17 +1,12 @@
 package cn.nightbugclub.mcqqauthcapture;
 
 import java.lang.ref.WeakReference;
-import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
@@ -22,65 +17,9 @@ public final class ScheduledOutput {
     static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
-    private static final Map<Object, Submitting> SUBMISSIONS = new IdentityHashMap<>();
-    private static boolean pollingQueuedWork;
+    private static boolean pollingFutures;
 
-    private record QueuedWork(ExecutorService executor, Object task, Future<?> future, boolean drained) {
-        QueuedWork afterDrain() {
-            return new QueuedWork(executor, task, future, true);
-        }
-
-        boolean canPoll() {
-            return future != null || drained;
-        }
-    }
-
-    private record Event(ScheduledOutput owner, String cancellation, QueuedWork queued) {}
-
-    private record Submitting(ExecutorService executor, List<ShutdownDrain> drains) {
-        boolean wasDrained(Object task) {
-            for (var drain : drains) {
-                if (drain.contains(task)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-    }
-
-    private static final class ShutdownDrain {
-        private final Set<TaskReference> tasks = new HashSet<>();
-
-        ShutdownDrain(List<Runnable> drained) {
-            for (Runnable task : drained) {
-                tasks.add(new TaskReference(task));
-            }
-        }
-
-        boolean contains(Object task) {
-            return tasks.contains(new TaskReference(task));
-        }
-    }
-
-    private static final class TaskReference extends WeakReference<Object> {
-        private final int identityHash;
-
-        TaskReference(Object task) {
-            super(task);
-            identityHash = System.identityHashCode(task);
-        }
-
-        @Override
-        public int hashCode() {
-            return identityHash;
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            Object task = get();
-            return this == other || (task != null && other instanceof TaskReference reference && reference.refersTo(task));
-        }
-    }
+    private record Event(ScheduledOutput owner, String cancellation, Future<?> future) {}
 
     private final CommandOutput output = new CommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
@@ -141,106 +80,50 @@ public final class ScheduledOutput {
         }
     }
 
-    static void beginQueueSubmission(Object event, ExecutorService executor) {
+    static void observeFuture(Object eventId, Future<?> future) {
         synchronized (EVENTS) {
-            if (EVENTS.containsKey(event)) {
-                // The JDK can expose its FutureTask before submit or schedule returns it.
-                SUBMISSIONS.put(event, new Submitting(executor, new ArrayList<>()));
-            }
-        }
-    }
-
-    static void endQueueSubmission(Object event) {
-        synchronized (EVENTS) {
-            SUBMISSIONS.remove(event);
-        }
-    }
-
-    static void observeQueuedWork(Object eventId, ExecutorService executor, Object task, Future<?> future) {
-        synchronized (EVENTS) {
-            Submitting submitting = SUBMISSIONS.remove(eventId);
             Event event = EVENTS.get(eventId);
-            if (event == null) {
-                return;
-            }
-            boolean drained = submitting != null && submitting.wasDrained(task);
-            var queued = new QueuedWork(executor, task, future, drained);
-            EVENTS.put(eventId, new Event(event.owner(), event.cancellation(), queued));
-            if (queued.canPoll()) {
-                ensureQueuePoll();
-            }
-        }
-    }
-
-    static void observeShutdownDrain(ExecutorService executor, List<Runnable> drained) {
-        synchronized (EVENTS) {
-            if (SUBMISSIONS.values().stream().noneMatch(work -> work.executor() == executor)
-                    && EVENTS.values().stream().noneMatch(
-                            event -> event.queued() != null && event.queued().executor() == executor)) {
-                return;
-            }
-        }
-        var drain = new ShutdownDrain(drained);
-        synchronized (EVENTS) {
-            // A submission can publish its Future while the index is being built.
-            for (Submitting submission : SUBMISSIONS.values()) {
-                if (submission.executor() == executor) {
-                    submission.drains().add(drain);
-                }
-            }
-            for (var entry : EVENTS.entrySet()) {
-                var event = entry.getValue();
-                var work = entry.getValue().queued();
-                if (work != null && work.executor() == executor && drain.contains(work.task())) {
-                    entry.setValue(new Event(event.owner(), event.cancellation(), work.afterDrain()));
-                    ensureQueuePoll();
+            if (event != null && future != null) {
+                EVENTS.put(eventId, new Event(event.owner(), event.cancellation(), future));
+                if (!pollingFutures) {
+                    pollingFutures = true;
+                    scheduleFuturePoll();
                 }
             }
         }
     }
 
-    private static void ensureQueuePoll() {
-        if (!pollingQueuedWork) {
-            pollingQueuedWork = true;
-            scheduleQueuePoll();
-        }
+    private static void scheduleFuturePoll() {
+        CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS).execute(ScheduledOutput::pollFutures);
     }
 
-    private static void scheduleQueuePoll() {
-        CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS).execute(ScheduledOutput::pollQueuedWork);
-    }
-
-    private static void pollQueuedWork() {
+    private static void pollFutures() {
         synchronized (EVENTS) {
             var settled = EVENTS.entrySet().stream()
                     .filter(entry -> {
-                        var work = entry.getValue().queued();
-                        // Wait for termination so another copy already taken by this executor can still start.
-                        return work != null && (work.future() != null && work.future().isDone()
-                                || work.drained() && work.executor().isTerminated());
+                        var future = entry.getValue().future();
+                        return future != null && future.isDone();
                     })
                     .map(Map.Entry::getKey).toList();
             for (Object task : settled) {
                 Event event = EVENTS.get(task);
                 if (event != null) {
-                    QueuedWork queued = event.queued();
-                    if (queued.future() != null && queued.future().isDone() && !queued.future().isCancelled()) {
-                        completeTask(task, new IllegalStateException("Executor completed without running the task"));
-                    } else {
+                    if (event.future().isCancelled()) {
                         cancel(task);
+                    } else {
+                        completeTask(task, new IllegalStateException("Executor completed without running the task"));
                     }
                 }
             }
-            pollingQueuedWork = EVENTS.values().stream().anyMatch(event -> event.queued() != null && event.queued().canPoll());
-            if (pollingQueuedWork) {
-                scheduleQueuePoll();
+            pollingFutures = EVENTS.values().stream().anyMatch(event -> event.future() != null);
+            if (pollingFutures) {
+                scheduleFuturePoll();
             }
         }
     }
 
     public static void cancel(Object event) {
         synchronized (EVENTS) {
-            SUBMISSIONS.remove(event);
             Event registered = EVENTS.remove(event);
             if (registered != null) {
                 ScheduledOutput owner = registered.owner();
@@ -307,7 +190,6 @@ public final class ScheduledOutput {
         Event registered;
         synchronized (EVENTS) {
             registered = EVENTS.remove(event);
-            SUBMISSIONS.remove(event);
             if (registered != null && cancelled) {
                 registered.owner().output.appendFollowupLine(registered.cancellation());
             }
@@ -348,7 +230,6 @@ public final class ScheduledOutput {
         }
         synchronized (EVENTS) {
             Event registered = EVENTS.remove(event);
-            SUBMISSIONS.remove(event);
             if (registered != null) {
                 ScheduledOutput owner = registered.owner();
                 owner.finishEvent(failure == null, failure == null);
@@ -415,12 +296,6 @@ public final class ScheduledOutput {
     }
 
     private void removeOwnedEvents() {
-        EVENTS.entrySet().removeIf(entry -> {
-            if (entry.getValue().owner() != this) {
-                return false;
-            }
-            SUBMISSIONS.remove(entry.getKey());
-            return true;
-        });
+        EVENTS.values().removeIf(event -> event.owner() == this);
     }
 }

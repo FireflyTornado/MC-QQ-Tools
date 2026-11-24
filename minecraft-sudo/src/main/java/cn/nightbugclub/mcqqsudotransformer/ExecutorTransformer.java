@@ -127,7 +127,6 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
             case "submit" -> SERVICES.contains(owner) && SUBMIT.contains(descriptor) ? SERVICE : null;
             case "schedule" -> (owner.equals(SCHEDULER) || owner.equals(SCHEDULED_POOL))
                     && SCHEDULE.contains(descriptor) ? SCHEDULER : null;
-            case "shutdownNow" -> SERVICES.contains(owner) && descriptor.equals("()Ljava/util/List;") ? SERVICE : null;
             default -> null;
         };
     }

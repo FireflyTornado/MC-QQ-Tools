@@ -6,6 +6,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import islice
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -43,6 +44,31 @@ class PendingCommand:
     request_id: str
     plugin: WebSocket
     result: asyncio.Future
+
+
+@dataclass
+class StopBatch:
+    id: str
+    request_ids: list[str]
+    confirmed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
+class StopCleanup:
+    pending: dict[str, None] = field(default_factory=dict)
+    batch: StopBatch | None = None
+    task: asyncio.Task[None] | None = None
+    retry_requested: bool = False
+
+    def acknowledge(self, stop_id: str) -> bool:
+        batch = self.batch
+        if batch is None or batch.id != stop_id:
+            return False
+        for request_id in batch.request_ids:
+            self.pending.pop(request_id, None)
+        self.batch = None
+        batch.confirmed.set()
+        return True
 
 
 @dataclass
@@ -144,8 +170,7 @@ def sudo_router(
     pending: PendingCommand | None = None
     followups: dict[str, Followup] = {}
     stopped: OrderedDict[str, float] = OrderedDict()
-    stop_tasks: set[asyncio.Task] = set()
-    stop_acks: dict[str, tuple[WebSocket, asyncio.Future[bool]]] = {}
+    stop_cleanup: StopCleanup | None = None
 
     def prune_followups() -> None:
         now = time.monotonic()
@@ -206,25 +231,33 @@ def sudo_router(
             raise HTTPException(403)
         return data
 
-    async def stop_capture(socket: WebSocket, lock: asyncio.Lock, request_ids: list[str]) -> None:
-        stop_id = uuid4().hex
-        ack: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        stop_acks[stop_id] = (socket, ack)
-        confirmed = False
-        try:
-            async with asyncio.timeout(SEND_TIMEOUT):
-                async with lock:
-                    if plugin is socket and router.connected:
-                        await socket.send_json({"type": STOP_CAPABILITY, "id": stop_id, "request_ids": request_ids})
-                    else:
+    async def stop_capture(socket: WebSocket, lock: asyncio.Lock, cleanup: StopCleanup) -> None:
+        while cleanup.pending:
+            cleanup.retry_requested = False
+            if cleanup.batch is None:
+                cleanup.batch = StopBatch(uuid4().hex, list(islice(cleanup.pending, MAX_FOLLOWUPS)))
+            batch = cleanup.batch
+            try:
+                async with asyncio.timeout(SEND_TIMEOUT):
+                    async with lock:
+                        if plugin is not socket or not router.connected:
+                            return
+                        if not batch.confirmed.is_set():
+                            await socket.send_json({"type": STOP_CAPABILITY, "id": batch.id,
+                                                    "request_ids": batch.request_ids})
+                    await batch.confirmed.wait()
+            except (TimeoutError, OSError, RuntimeError, WebSocketDisconnect):
+                if not batch.confirmed.is_set():
+                    logger.warning("/sudostop #%s 游戏服侧清理未确认，requests=%s", batch.id, batch.request_ids)
+                    if not cleanup.retry_requested:
                         return
-                confirmed = await ack
-        except (TimeoutError, OSError, RuntimeError, WebSocketDisconnect):
-            pass
-        finally:
-            stop_acks.pop(stop_id, None)
-            if not confirmed:
-                logger.warning("/sudostop #%s 游戏服侧清理未确认，requests=%s", stop_id, request_ids)
+
+    def schedule_stop_capture(socket: WebSocket, cleanup: StopCleanup, *, retry: bool = False) -> None:
+        if cleanup.pending:
+            if cleanup.task is None or cleanup.task.done():
+                cleanup.task = asyncio.create_task(stop_capture(socket, send_lock, cleanup))
+            elif retry:
+                cleanup.retry_requested = True
 
     @router.post(SUDO_STOP_PATH)
     async def stop(request: Request, authorization: list[str] | None = Header(default=None)):
@@ -234,21 +267,19 @@ def sudo_router(
         request_ids = [request_id for request_id, work in followups.items() if not work.finished]
         expires_at = time.monotonic() + FOLLOWUP_DELIVERY_RETENTION
         for request_id in request_ids:
-            followups.pop(request_id).stop()
+            work = followups.pop(request_id)
+            work.stop()
             stopped[request_id] = expires_at
+            if stop_cleanup is not None and work.plugin is plugin:
+                stop_cleanup.pending[request_id] = None
         while len(stopped) > MAX_STOPPED_REQUESTS:
             stopped.popitem(last=False)
         if request_ids:
             logger.info("/sudostop group=%s qq=%s requests=%s", target_group, data["qq_id"], request_ids)
-            if plugin is not None and router.connected and STOP_CAPABILITY in {
-                capability.strip() for header in plugin.headers.getlist(STOP_CAPABILITY_HEADER)
-                for capability in header.split(",")
-            }:
-                task = asyncio.create_task(stop_capture(plugin, send_lock, request_ids))
-                stop_tasks.add(task)
-                task.add_done_callback(stop_tasks.discard)
-            else:
+            if stop_cleanup is None:
                 logger.warning("/sudostop 游戏服侧清理未确认，requests=%s", request_ids)
+        if plugin is not None and router.connected and stop_cleanup is not None:
+            schedule_stop_capture(plugin, stop_cleanup, retry=True)
         return {"status": "stopped", "request_ids": request_ids}
 
     @router.post(SUDO_SUBMIT_PATH)
@@ -273,7 +304,8 @@ def sudo_router(
         if pending is not None:
             return {"status": "busy"}
         prune_followups()
-        if request_id in followups or request_id in stopped:
+        if (request_id in followups or request_id in stopped
+                or (stop_cleanup is not None and request_id in stop_cleanup.pending)):
             return {"status": "rejected"}
         if plugin is None or not router.connected:
             return {"status": "unavailable"}
@@ -302,7 +334,7 @@ def sudo_router(
 
     @router.websocket(SUDO_WS_PATH)
     async def results(websocket: WebSocket):
-        nonlocal plugin, send_lock
+        nonlocal plugin, send_lock, stop_cleanup
         if (
             mod_token is None or plugin is not None
             or not verify_bearer(websocket.headers.getlist("authorization"), mod_token)
@@ -312,6 +344,11 @@ def sudo_router(
 
         plugin = websocket
         send_lock = asyncio.Lock()
+        cleanup = StopCleanup() if STOP_CAPABILITY in {
+            capability.strip() for header in websocket.headers.getlist(STOP_CAPABILITY_HEADER)
+            for capability in header.split(",")
+        } else None
+        stop_cleanup = cleanup
         try:
             await websocket.accept()
             router.connected = True
@@ -336,9 +373,8 @@ def sudo_router(
                     if not isinstance(stop_id, str) or re.fullmatch(r"[0-9a-f]{32}", stop_id) is None:
                         await websocket.close(code=1007)
                         break
-                    outstanding = stop_acks.get(stop_id)
-                    if outstanding is not None and outstanding[0] is websocket and not outstanding[1].done():
-                        outstanding[1].set_result(True)
+                    if cleanup is not None and cleanup.acknowledge(stop_id):
+                        schedule_stop_capture(websocket, cleanup)
                     continue
                 status, output = result.get("status"), result.get("output")
                 truncated = result.get("truncated", False)
@@ -398,13 +434,14 @@ def sudo_router(
         finally:
             router.connected = False
             plugin = None
+            stop_cleanup = None
             if pending is not None and pending.plugin is websocket and not pending.result.done():
                 pending.result.set_result({"status": "disconnected"})
-            for source, ack in stop_acks.values():
-                if source is websocket and not ack.done():
-                    ack.set_result(False)
             for work in followups.values():
                 if work.plugin is websocket:
                     work.complete({"status": "disconnected"})
+            if cleanup is not None and cleanup.task is not None:
+                cleanup.task.cancel()
+                await asyncio.gather(cleanup.task, return_exceptions=True)
 
     return router

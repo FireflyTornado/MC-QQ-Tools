@@ -2,7 +2,7 @@ package cn.nightbugclub.mcqqauthcapture;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,14 +37,48 @@ public final class ScheduledOutput {
 
     private record Event(ScheduledOutput owner, String cancellation, QueuedWork queued) {}
 
-    private record Submitting(ExecutorService executor, List<WeakReference<Object>> drained) {
-        void remember(List<WeakReference<Object>> tasks) {
-            drained.removeIf(reference -> reference.get() == null);
-            drained.addAll(tasks);
+    private record Submitting(ExecutorService executor, List<ShutdownDrain> drains) {
+        boolean wasDrained(Object task) {
+            for (var drain : drains) {
+                if (drain.contains(task)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private static final class ShutdownDrain {
+        private final Set<TaskReference> tasks = new HashSet<>();
+
+        ShutdownDrain(List<Runnable> drained) {
+            for (Runnable task : drained) {
+                tasks.add(new TaskReference(task));
+            }
         }
 
-        boolean wasDrained(Object task) {
-            return drained.stream().anyMatch(reference -> reference.get() == task);
+        boolean contains(Object task) {
+            return tasks.contains(new TaskReference(task));
+        }
+    }
+
+    private static final class TaskReference extends WeakReference<Object> {
+        private final int identityHash;
+
+        TaskReference(Object task) {
+            super(task);
+            identityHash = System.identityHashCode(task);
+        }
+
+        @Override
+        public int hashCode() {
+            return identityHash;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            Object task = get();
+            return this == other || (task != null && other instanceof TaskReference reference && reference.refersTo(task));
         }
     }
 
@@ -140,28 +174,26 @@ public final class ScheduledOutput {
 
     static void observeShutdownDrain(ExecutorService executor, List<Runnable> drained) {
         synchronized (EVENTS) {
-            if (EVENTS.isEmpty()) {
+            if (SUBMISSIONS.values().stream().noneMatch(work -> work.executor() == executor)
+                    && EVENTS.values().stream().noneMatch(
+                            event -> event.queued() != null && event.queued().executor() == executor)) {
                 return;
             }
-            var submissions = SUBMISSIONS.values().stream().filter(work -> work.executor() == executor).toList();
-            var queued = EVENTS.entrySet().stream().filter(entry -> {
-                var work = entry.getValue().queued();
-                return work != null && work.executor() == executor;
-            }).toList();
-            if (!submissions.isEmpty()) {
-                List<WeakReference<Object>> entries = drained.stream().map(WeakReference<Object>::new).toList();
-                submissions.forEach(submission -> submission.remember(entries));
+        }
+        var drain = new ShutdownDrain(drained);
+        synchronized (EVENTS) {
+            // A submission can publish its Future while the index is being built.
+            for (Submitting submission : SUBMISSIONS.values()) {
+                if (submission.executor() == executor) {
+                    submission.drains().add(drain);
+                }
             }
-            if (!queued.isEmpty()) {
-                Set<Object> identities = Collections.newSetFromMap(new IdentityHashMap<>());
-                identities.addAll(drained);
-                for (var entry : queued) {
-                    var event = entry.getValue();
-                    var work = event.queued();
-                    if (identities.contains(work.task())) {
-                        EVENTS.put(entry.getKey(), new Event(event.owner(), event.cancellation(), work.afterDrain()));
-                        ensureQueuePoll();
-                    }
+            for (var entry : EVENTS.entrySet()) {
+                var event = entry.getValue();
+                var work = entry.getValue().queued();
+                if (work != null && work.executor() == executor && drain.contains(work.task())) {
+                    entry.setValue(new Event(event.owner(), event.cancellation(), work.afterDrain()));
+                    ensureQueuePoll();
                 }
             }
         }

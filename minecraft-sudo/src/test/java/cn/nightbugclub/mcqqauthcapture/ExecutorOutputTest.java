@@ -1,9 +1,12 @@
 package cn.nightbugclub.mcqqauthcapture;
 
+import com.sun.management.ThreadMXBean;
 import org.apache.logging.log4j.LogManager;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -14,6 +17,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
@@ -25,6 +29,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class ExecutorOutputTest {
     @Test
@@ -172,6 +177,80 @@ class ExecutorOutputTest {
             assertEquals("cancelled", request.result().get(3, TimeUnit.SECONDS).status());
             assertFalse(task.isDone());
         } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void recordsDrainForSubmissionThatReturnsWhileTheIndexIsBuilt() throws Exception {
+        var pool = Executors.newFixedThreadPool(1);
+        var publisher = Executors.newSingleThreadExecutor();
+        var request = new ScheduledOutput();
+        try {
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var event = new Object();
+            assertTrue(ScheduledOutput.registerTask(event));
+            ScheduledOutput.beginQueueSubmission(event, pool);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+
+            var task = new FutureTask<>(() -> fail("drained task ran"));
+            var drained = new AbstractList<Runnable>() {
+                @Override
+                public Runnable get(int index) {
+                    try {
+                        publisher.submit(() -> ScheduledOutput.observeQueuedWork(event, pool, task, task))
+                                .get(2, TimeUnit.SECONDS);
+                    } catch (InterruptedException | ExecutionException | TimeoutException failure) {
+                        throw new AssertionError("submission could not publish its Future during indexing", failure);
+                    }
+                    return task;
+                }
+
+                @Override
+                public int size() {
+                    return 1;
+                }
+            };
+            pool.shutdown();
+            ScheduledOutput.observeShutdownDrain(pool, drained);
+            assertEquals("cancelled", request.result().get(3, TimeUnit.SECONDS).status());
+            assertFalse(task.isDone());
+        } finally {
+            request.abandon();
+            publisher.shutdownNow();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void largeDrainAllocationDoesNotMultiplyByPendingSubmissions() {
+        var bean = ManagementFactory.getPlatformMXBean(ThreadMXBean.class);
+        assumeTrue(bean != null && bean.isThreadAllocatedMemoryEnabled());
+        var pool = Executors.newFixedThreadPool(1);
+        var request = new ScheduledOutput();
+        try {
+            var tasks = new ArrayList<Runnable>(10_000);
+            for (int index = 0; index < 10_000; index++) {
+                tasks.add(new FutureTask<>(() -> fail("drained task ran")));
+            }
+            var close = OutputCapture.begin(line -> fail(line), request);
+            for (int index = 0; index < 256; index++) {
+                var event = new Object();
+                assertTrue(ScheduledOutput.registerTask(event));
+                ScheduledOutput.beginQueueSubmission(event, pool);
+            }
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+
+            long thread = Thread.currentThread().getId();
+            long before = bean.getThreadAllocatedBytes(thread);
+            ScheduledOutput.observeShutdownDrain(pool, tasks);
+            long allocated = bean.getThreadAllocatedBytes(thread) - before;
+            // The former per-submission copies allocate over 20 MB even with compressed references.
+            assertTrue(allocated < 8_000_000, () -> "allocated " + allocated + " bytes for one drain");
+        } finally {
+            request.abandon();
             pool.shutdownNow();
         }
     }

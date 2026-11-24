@@ -28,6 +28,7 @@ import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -347,6 +348,109 @@ class ExecutorOutputTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void linkedRemoveIfKeepsThePositionOfUnselectedDuplicates() {
+        for (var queue : linkedQueues()) {
+            var duplicate = new EqualRunnable();
+            var middle = new EqualRunnable();
+            queue.addAll(List.of(duplicate, middle, duplicate));
+            var visits = new AtomicInteger();
+
+            assertTrue(ExecutorOutput.removeIf(queue, task -> task == duplicate && visits.incrementAndGet() == 2));
+            assertSame(duplicate, queue.remove());
+            assertSame(middle, queue.remove());
+            assertTrue(queue.isEmpty());
+        }
+    }
+
+    @Test
+    void linkedRemoveIfCanSeeAnEntryAppendedDuringAnEarlierPredicate() {
+        for (var queue : linkedQueues()) {
+            var first = new EqualRunnable();
+            var appended = new EqualRunnable();
+            queue.add(first);
+            for (int i = 0; i < 64; i++) {
+                queue.add(new EqualRunnable());
+            }
+
+            assertTrue(ExecutorOutput.removeIf(queue, task -> {
+                if (task == first) {
+                    queue.add(appended);
+                }
+                return task == appended;
+            }));
+            assertEquals(65, queue.size());
+            assertTrue(queue.stream().noneMatch(task -> task == appended));
+        }
+    }
+
+    @Test
+    void removingOneOccurrenceOfAStageWorkerKeepsCapturingTheOther() throws Exception {
+        for (var queue : linkedQueues()) {
+            var pool = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, queue);
+            var release = new CompletableFuture<Void>();
+            try {
+                pool.execute(release::join);
+                var request = new ScheduledOutput();
+                var close = OutputCapture.begin(line -> fail(line), request);
+                var stage = CommandOutputContext.supplyAsync(() -> {
+                    LogManager.getLogger("test.executor.duplicate").error("remaining stage output");
+                    return 42;
+                }, pool);
+                var worker = queue.element();
+                queue.add(new EqualRunnable());
+                queue.add(worker);
+                assertTrue(close.get().join());
+                assertTrue(request.seal());
+                var visits = new AtomicInteger();
+
+                assertTrue(ExecutorOutput.removeIf(queue, task -> task == worker && visits.incrementAndGet() == 2));
+                assertSame(worker, queue.element());
+                assertFalse(request.result().isDone());
+                release.complete(null);
+                assertEquals(42, stage.get(2, TimeUnit.SECONDS));
+                assertEquals(new SudoCommands.Result("ok", "remaining stage output\n"),
+                        request.result().get(2, TimeUnit.SECONDS));
+            } finally {
+                release.complete(null);
+                ExecutorOutput.shutdownNow(pool);
+            }
+        }
+    }
+
+    @Test
+    void removeReportsTheActualStageWorkerWhenTheLookupKeyIsEqual() throws Exception {
+        for (boolean poolRemoval : List.of(false, true)) {
+            for (var queue : linkedQueues()) {
+                var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+                try {
+                    var request = new ScheduledOutput();
+                    var close = OutputCapture.begin(line -> fail(line), request);
+                    var stage = CommandOutputContext.supplyAsync(() -> fail("removed stage ran"), pool);
+                    var worker = queue.element();
+                    assertTrue(close.get().join());
+                    assertTrue(request.seal());
+                    var key = new Runnable() {
+                        @Override public void run() {}
+                        @Override public boolean equals(Object other) { return other == this || other == worker; }
+                        @Override public int hashCode() { return worker.hashCode(); }
+                    };
+
+                    assertTrue(poolRemoval ? ExecutorOutput.remove(pool, key) : ExecutorOutput.remove(queue, key));
+                    assertTrue(queue.isEmpty());
+                    assertFalse(stage.isDone());
+                    assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+                } finally {
+                    ExecutorOutput.shutdownNow(pool);
+                }
+            }
+        }
+    }
+
+    private static List<BlockingQueue<Runnable>> linkedQueues() {
+        return List.of(new LinkedBlockingQueue<>(), new LinkedBlockingDeque<>(), new LinkedTransferQueue<>());
     }
 
     @Test
@@ -723,8 +827,53 @@ class ExecutorOutputTest {
     }
 
     @Test
-    void clearingAnInheritedLinkedQueueSettlesTrackedWork() throws Exception {
-        var queue = new LinkedBlockingQueue<Runnable>() {};
+    void purgeSettlesStageWorkersWithDelegatingQueueOverrides() throws Exception {
+        var toArrayOverride = new LinkedBlockingQueue<Runnable>() {
+            @Override
+            public Object[] toArray() {
+                return super.toArray();
+            }
+        };
+        var iteratorOverride = new LinkedBlockingQueue<Runnable>() {
+            @Override
+            public Iterator<Runnable> iterator() {
+                var delegate = super.iterator();
+                return new Iterator<>() {
+                    @Override public boolean hasNext() { return delegate.hasNext(); }
+                    @Override public Runnable next() { return delegate.next(); }
+                    @Override public void remove() { delegate.remove(); }
+                };
+            }
+        };
+        for (var queue : List.of(toArrayOverride, iteratorOverride)) {
+            var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+            try {
+                var request = new ScheduledOutput();
+                var close = OutputCapture.begin(line -> fail(line), request);
+                var stage = CommandOutputContext.supplyAsync(() -> fail("purged worker ran"), pool);
+                var worker = assertInstanceOf(Future.class, queue.element());
+                assertTrue(close.get().join());
+                assertTrue(request.seal());
+                assertTrue(worker.cancel(false));
+
+                ExecutorOutput.purge(pool);
+                assertTrue(queue.isEmpty());
+                assertFalse(stage.isDone());
+                assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+            } finally {
+                ExecutorOutput.shutdownNow(pool);
+            }
+        }
+    }
+
+    @Test
+    void clearingADelegatingLinkedQueueSettlesTrackedWork() throws Exception {
+        var queue = new LinkedBlockingQueue<Runnable>() {
+            @Override
+            public void clear() {
+                super.clear();
+            }
+        };
         var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
         try {
             var request = new ScheduledOutput();

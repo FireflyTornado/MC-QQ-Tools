@@ -96,6 +96,23 @@ public final class ScheduledOutput {
         }
     }
 
+    static void retainTrackedQueueWork(BlockingQueue<?> queue, Set<Object> candidates) {
+        synchronized (EVENTS) {
+            if (SUBMISSIONS.values().stream().anyMatch(submitting -> submitting.queue() == queue)) {
+                // The submitting executor may not have returned the Future's identity yet.
+                return;
+            }
+            Set<Object> tracked = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (Event event : EVENTS.values()) {
+                var work = event.queued();
+                if (work != null && work.queue() == queue) {
+                    tracked.add(work.task());
+                }
+            }
+            candidates.retainAll(tracked);
+        }
+    }
+
     private static boolean enqueue(Object event, String cancellation) {
         ScheduledOutput owner = OutputCapture.scheduledOutput();
         if (owner == null) {

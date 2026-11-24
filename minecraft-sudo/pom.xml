@@ -66,6 +66,11 @@
             <artifactId>unsafe</artifactId>
             <version>0.2.0</version>
             <scope>provided</scope>
+            <exclusions>
+                <!-- Unsafe publishes Gradle-style Log4j versions. Use the project's Log4j instead. -->
+                <exclusion><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-api</artifactId></exclusion>
+                <exclusion><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId></exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>cpw.mods</groupId>

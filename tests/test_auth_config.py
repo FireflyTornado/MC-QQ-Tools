@@ -984,9 +984,9 @@ import message_config
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter
 assert Path.cwd() == before
-assert message_config.MESSAGES.text("commands.help.message") == "configured"
+assert message_config.MESSAGES.text("commands.help.message.main") == "configured"
 message_config.MESSAGE_FILE.unlink()
-assert message_config.MESSAGES.text("commands.help.message") == "configured"
+assert message_config.MESSAGES.text("commands.help.message.main") == "configured"
 assert nonebot.get_driver().config.target_group_id == 98765
 assert mc_api.app.state.auth.target_group == "98765"
 adapter = nonebot.get_adapter(Adapter)
@@ -1096,6 +1096,7 @@ async def exercise(port):
         await qq_bot.handle_event(event("/help", 1))
         help_text = initial.call_args.kwargs["message"].extract_plain_text()
         help_lines = help_text.splitlines()
+        assert "sudo 用户专用" in help_lines
         for command in ("/bind ", "/reconcile "):
             assert any(command in line and line.endswith("（未启用）") for line in help_lines)
         for command in ("/sudo ", "/sudostop ", "/ping ", "/info "):

@@ -44,12 +44,17 @@ info = on_command("信息", aliases={"info"}, rule=group_rule, permission=SUPERU
 
 @help_command.handle()
 async def handle_help(bot: Bot) -> None:
-    await help_command.finish(message_config.MESSAGES.render(
-        "commands.help.message",
-        **message_variables(bot),
+    variables = message_variables(bot)
+    variables.update(
         auth_enabled="" if auth_enabled else "（未启用）",
         sudo_enabled="" if sudo_enabled else "（未启用）",
-    ))
+    )
+    messages = message_config.MESSAGES
+    reply = messages.render("commands.help.message.main", **variables)
+    if sudo_enabled:
+        reply += MessageSegment.text("\n")
+        reply += messages.render("commands.help.message.sudo", **variables)
+    await help_command.finish(reply)
 
 
 @ping.handle()

@@ -1825,34 +1825,41 @@ commands:
                 reply = await self.command_reply("/reconcile", user=MEMBER)
                 self.assertEqual(reply.extract_plain_text(), "自定义对账忙")
 
-    async def test_default_help_keeps_command_order_and_marks_disabled_components(self):
-        expected_order = [
+    async def test_default_help_keeps_main_order_and_appends_sudo_when_enabled(self):
+        main_order = [
             "[MC-QQ-Tools]", "/绑定", "/我的绑定", "/解绑", "/认证测试", "/帮助",
-            "超级用户专用", "/信息", "/授权对账", "/db", "指定", "/sudo", "/sudostop",
+            "超级用户专用", "/信息", "/授权对账", "/db",
+        ]
+        sudo_lines = [
+            "sudo 用户专用",
+            "/sudo <Minecraft 指令> · 执行并回显",
+            "/sudostop · 停止所有等待中的回传",
         ]
         auth_commands = {"/绑定", "/我的绑定", "/解绑", "/授权对账", "/db"}
-        sudo_commands = {"/sudo", "/sudostop"}
         for auth, sudo in ((True, True), (True, False), (False, True), (False, False)):
             with (self.subTest(auth=auth, sudo=sudo), patch.object(self.status, "auth_enabled", auth),
                   patch.object(self.status, "sudo_enabled", sudo)):
                 reply = (await self.command_reply("/help")).extract_plain_text()
                 self.assertEqual((await self.command_reply("/帮助")).extract_plain_text(), reply)
                 lines = reply.splitlines()
-                commands = [line.split(maxsplit=1)[0] for line in lines]
-                self.assertEqual(commands, expected_order)
-                marked = {command for command, line in zip(commands, lines) if line.endswith("（未启用）")}
-                self.assertEqual(marked, (set() if auth else auth_commands) | (set() if sudo else sudo_commands))
+                main_lines = lines[:len(main_order)]
+                commands = [line.split(maxsplit=1)[0] for line in main_lines]
+                self.assertEqual(commands, main_order)
+                self.assertEqual(lines[len(main_order):], sudo_lines if sudo else [])
+                marked = {command for command, line in zip(commands, main_lines) if line.endswith("（未启用）")}
+                self.assertEqual(marked, set() if auth else auth_commands)
+                self.assertFalse(reply.endswith("\n"))
 
     async def test_help_renders_status_variables_in_the_custom_template(self):
         with self.configure("""
 commands:
   help:
-    message: |-
-      群 {group_id} · /bind{auth_enabled}
-      机器人 {bot_qq} · /sudo{sudo_enabled}
+    message:
+      main: "群 {group_id} · /bind{auth_enabled}"
+      sudo: "机器人 {bot_qq} · /sudo{sudo_enabled}"
 """):
             for auth, sudo, expected in (
-                (True, False, f"群 {GROUP} · /bind\n机器人 {BOT} · /sudo（未启用）"),
+                (True, False, f"群 {GROUP} · /bind"),
                 (False, True, f"群 {GROUP} · /bind（未启用）\n机器人 {BOT} · /sudo"),
             ):
                 with (self.subTest(auth=auth, sudo=sudo), patch.object(self.status, "auth_enabled", auth),

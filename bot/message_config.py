@@ -84,7 +84,7 @@ DEFAULTS = MappingProxyType({
     "commands.db.ambiguous": "按 QQ 号和游戏名查到了两条不同绑定，请用 qq: 或 mc: 指定类型。",
     "commands.db.not_bound": "未找到绑定。",
     "commands.db.error": "绑定数据库操作失败，请稍后重试。",
-    "commands.help.message": (
+    "commands.help.message.main": (
         "[MC-QQ-Tools] 指令帮助\n"
         "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID{auth_enabled}\n"
         "/我的绑定 或 /binding · 查询自己的绑定{auth_enabled}\n"
@@ -94,8 +94,10 @@ DEFAULTS = MappingProxyType({
         "超级用户专用\n"
         "/信息 或 /info · 查看状态图片\n"
         "/授权对账 或 /reconcile · 核对群成员与授权{auth_enabled}\n"
-        "/db · 手动添加、删除或查询绑定{auth_enabled}\n"
-        "指定 QQ 号专用\n"
+        "/db · 手动添加、删除或查询绑定{auth_enabled}"
+    ),
+    "commands.help.message.sudo": (
+        "sudo 用户专用\n"
         "/sudo <Minecraft 指令> · 执行并回显{sudo_enabled}\n"
         "/sudostop · 停止所有等待中的回传{sudo_enabled}"
     ),
@@ -150,7 +152,8 @@ BUSINESS_FIELDS = {
     "commands.ping.timeout": {"latency_ms"},
     "commands.ping.connection_error": {"latency_ms"},
     "commands.ping.error": {"latency_ms"},
-    "commands.help.message": {"auth_enabled", "sudo_enabled"},
+    "commands.help.message.main": {"auth_enabled", "sudo_enabled"},
+    "commands.help.message.sudo": {"auth_enabled", "sudo_enabled"},
     "commands.reconcile.success": {"count"},
     "commands.db.not_member": MEMBER_FIELDS,
     "commands.db.members_unverified": MEMBER_FIELDS,
@@ -239,6 +242,8 @@ def _apply_overrides(raw: object, values: dict[str, str | bool], prefix: str = "
             key = ""
         else:
             key = f"{prefix}.{name}" if prefix else name
+        if key == "commands.help.message" and isinstance(value, str):
+            key = "commands.help.message.main"
         if key in SECTIONS:
             _apply_overrides(value, values, key)
         elif key not in DEFAULTS:

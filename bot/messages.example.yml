@@ -132,21 +132,24 @@ commands:
     not_bound: "未找到绑定。"
     error: "绑定数据库操作失败，请稍后重试。"
   help:
-    # {auth_enabled} 和 {sudo_enabled} 在对应模块启用时为空，未启用时显示「（未启用）」。
-    message: |-
-      [MC-QQ-Tools] 指令帮助
-      /绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID{auth_enabled}
-      /我的绑定 或 /binding · 查询自己的绑定{auth_enabled}
-      /解绑 或 /unbind · 撤销自己的绑定{auth_enabled}
-      /认证测试 或 /ping · 检查 API
-      /帮助 或 /help · 显示本帮助
-      超级用户专用
-      /信息 或 /info · 查看状态图片
-      /授权对账 或 /reconcile · 核对群成员与授权{auth_enabled}
-      /db · 手动添加、删除或查询绑定{auth_enabled}
-      指定 QQ 号专用
-      /sudo <Minecraft 指令> · 执行并回显{sudo_enabled}
-      /sudostop · 停止所有等待中的回传{sudo_enabled}
+    message:
+      # 正文始终显示。授权关闭时，{auth_enabled} 显示「（未启用）」，启用时为空。
+      main: |-
+        [MC-QQ-Tools] 指令帮助
+        /绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID{auth_enabled}
+        /我的绑定 或 /binding · 查询自己的绑定{auth_enabled}
+        /解绑 或 /unbind · 撤销自己的绑定{auth_enabled}
+        /认证测试 或 /ping · 检查 API
+        /帮助 或 /help · 显示本帮助
+        超级用户专用
+        /信息 或 /info · 查看状态图片
+        /授权对账 或 /reconcile · 核对群成员与授权{auth_enabled}
+        /db · 手动添加、删除或查询绑定{auth_enabled}
+      # Sudo 启用时追加此段，此时 {sudo_enabled} 为空。
+      sudo: |-
+        sudo 用户专用
+        /sudo <Minecraft 指令> · 执行并回显{sudo_enabled}
+        /sudostop · 停止所有等待中的回传{sudo_enabled}
   info:
     busy: "状态图正在生成，请稍后重试。"
     error: "状态图暂不可用，请稍后重试。"

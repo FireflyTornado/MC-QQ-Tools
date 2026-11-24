@@ -29,6 +29,8 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
     private static final String SCHEDULER = CONCURRENT + "ScheduledExecutorService";
     private static final String THREAD_POOL = CONCURRENT + "ThreadPoolExecutor";
     private static final String SCHEDULED_POOL = CONCURRENT + "ScheduledThreadPoolExecutor";
+    private static final String BLOCKING_QUEUE = CONCURRENT + "BlockingQueue";
+    private static final String BLOCKING_DEQUE = CONCURRENT + "BlockingDeque";
     private static final String RUNNABLE = "Ljava/lang/Runnable;";
     private static final String CALLABLE = "L" + CONCURRENT + "Callable;";
     private static final String FUTURE = "L" + CONCURRENT + "Future;";
@@ -111,8 +113,18 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
             case "submit" -> SERVICES.contains(owner) && SUBMIT.contains(descriptor) ? SERVICE : null;
             case "schedule" -> (owner.equals(SCHEDULER) || owner.equals(SCHEDULED_POOL))
                     && SCHEDULE.contains(descriptor) ? SCHEDULER : null;
+            case "shutdownNow" -> SERVICES.contains(owner) && descriptor.equals("()Ljava/util/List;") ? SERVICE : null;
+            case "remove" -> removeReceiver(owner, descriptor);
             default -> null;
         };
+    }
+
+    private static String removeReceiver(String owner, String descriptor) {
+        if ((owner.equals(THREAD_POOL) || owner.equals(SCHEDULED_POOL)) && descriptor.equals("(" + RUNNABLE + ")Z")) {
+            return THREAD_POOL;
+        }
+        return (owner.equals(BLOCKING_QUEUE) || owner.equals(BLOCKING_DEQUE)) && descriptor.equals("(Ljava/lang/Object;)Z")
+                ? BLOCKING_QUEUE : null;
     }
 
     @Override

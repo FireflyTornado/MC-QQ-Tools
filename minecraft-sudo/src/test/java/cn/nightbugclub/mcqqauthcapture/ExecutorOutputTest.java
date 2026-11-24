@@ -115,4 +115,45 @@ class ExecutorOutputTest {
             pool.shutdownNow();
         }
     }
+
+    @Test
+    void settlesConfirmedRemovalsWithoutCancellingTheOriginalFutures() throws Exception {
+        var pool = new ScheduledThreadPoolExecutor(1);
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var first = ExecutorOutput.schedule(pool, () -> fail("removed task ran"), 1, TimeUnit.HOURS);
+            var second = ExecutorOutput.schedule(pool, () -> fail("removed task ran"), 1, TimeUnit.HOURS);
+            var third = ExecutorOutput.schedule(pool, () -> fail("drained task ran"), 1, TimeUnit.HOURS);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            assertTrue(ExecutorOutput.remove(pool.getQueue(), first));
+            assertTrue(ExecutorOutput.remove(pool, (Runnable) second));
+            assertFalse(request.result().isDone());
+            assertEquals(java.util.List.of(third), ExecutorOutput.shutdownNow(pool));
+            assertEquals("cancelled", request.result().get(1, TimeUnit.SECONDS).status());
+            assertFalse(first.isDone());
+            assertFalse(second.isDone());
+            assertFalse(third.isDone());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void settlesUnobservedQueueDrainWhenExecutorTerminates() throws Exception {
+        var pool = new ScheduledThreadPoolExecutor(1);
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var future = ExecutorOutput.schedule(pool, () -> fail("drained task ran"), 1, TimeUnit.HOURS);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            assertEquals(java.util.List.of(future), pool.shutdownNow());
+            assertFalse(future.isDone());
+            assertEquals("cancelled", request.result().get(5, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 }

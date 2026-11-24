@@ -24,7 +24,8 @@ public final class CommandOutputContext {
     public static <T> CompletableFuture<T> supplyAsync(Supplier<T> action, Executor executor) {
         Objects.requireNonNull(action);
         Objects.requireNonNull(executor);
-        return registerStage(event -> CompletableFuture.supplyAsync(() -> ScheduledOutput.call(event, action), executor));
+        return registerStage(event -> CompletableFuture.supplyAsync(() -> ScheduledOutput.call(event, action),
+                ExecutorOutput.observeExecutor(event, executor)));
     }
 
     /** Runs the completion callback with the request that registered it. */
@@ -44,7 +45,8 @@ public final class CommandOutputContext {
         Objects.requireNonNull(callback);
         Objects.requireNonNull(executor);
         return registerStage(event -> stage.whenCompleteAsync((value, failure) ->
-                ScheduledOutput.runCompletion(event, () -> callback.accept(value, failure), failure), executor));
+                ScheduledOutput.runCompletion(event, () -> callback.accept(value, failure), failure),
+                ExecutorOutput.observeExecutor(event, executor)));
     }
 
     /** Keeps the current request open until the stage settles. Returns the original stage. */

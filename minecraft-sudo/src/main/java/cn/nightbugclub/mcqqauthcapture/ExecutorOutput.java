@@ -1,5 +1,8 @@
 package cn.nightbugclub.mcqqauthcapture;
 
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -22,7 +25,7 @@ public final class ExecutorOutput {
         if (executor instanceof ScheduledExecutorService scheduler && standardScheduler(scheduler)
                 && OutputCapture.scheduledOutput() != null && task != null
                 && !(task instanceof CommandOutputContext.Task)) {
-            track(task, wrapped -> scheduler.schedule(wrapped, 0, TimeUnit.NANOSECONDS));
+            track(scheduler, task, wrapped -> scheduler.schedule(wrapped, 0, TimeUnit.NANOSECONDS));
         } else {
             executor.execute(task);
         }
@@ -49,18 +52,63 @@ public final class ExecutorOutput {
         return trackCallable(executor, task, wrapped -> executor.schedule(wrapped, delay, unit));
     }
 
+    public static List<Runnable> shutdownNow(ExecutorService executor) {
+        List<Runnable> drained = executor.shutdownNow();
+        if (!drained.isEmpty()) {
+            var tasks = new IdentityHashMap<Runnable, Boolean>();
+            drained.forEach(task -> tasks.put(task, true));
+            ScheduledOutput.discardQueuedWork(work -> work.executor() == executor && tasks.containsKey(work.task()));
+        }
+        return drained;
+    }
+
+    public static boolean remove(ThreadPoolExecutor executor, Runnable task) {
+        boolean removed = executor.remove(task);
+        if (removed) {
+            ScheduledOutput.discardQueuedWork(work -> work.executor() == executor && work.task() == task);
+        }
+        return removed;
+    }
+
+    public static boolean remove(BlockingQueue<?> queue, Object task) {
+        boolean removed = queue.remove(task);
+        if (removed) {
+            ScheduledOutput.discardQueuedWork(work -> work.queue() == queue && work.task() == task);
+        }
+        return removed;
+    }
+
+    static Executor observeExecutor(Object event, Executor executor) {
+        if (!(executor instanceof ExecutorService pool) || !standardPool(pool) || !standardRejection(pool)) {
+            return executor;
+        }
+        return task -> {
+            boolean shutDown = standardRejection(pool) && pool.isShutdown();
+            if (pool instanceof ScheduledExecutorService scheduler) {
+                var future = scheduler.schedule(task, 0, TimeUnit.NANOSECONDS);
+                observeQueuedWork(event, pool, future, future);
+            } else {
+                observeQueuedWork(event, pool, task, null);
+                pool.execute(task);
+            }
+            if (shutDown) {
+                ScheduledOutput.cancel(event);
+            }
+        };
+    }
+
     private static <F extends Future<?>> F trackRunnable(ExecutorService executor, Runnable task,
                                                          Function<Runnable, F> submit) {
         if (OutputCapture.scheduledOutput() == null || task == null
                 || task instanceof CommandOutputContext.Task || !standardPool(executor)) {
             return submit.apply(task);
         }
-        return track(task, submit);
+        return track(executor, task, submit);
     }
 
-    private static <F extends Future<?>> F track(Runnable task, Function<Runnable, F> submit) {
+    private static <F extends Future<?>> F track(ExecutorService executor, Runnable task, Function<Runnable, F> submit) {
         var event = new Object();
-        return observe(event, () -> submit.apply(() -> ScheduledOutput.run(event, task)));
+        return observe(event, executor, () -> submit.apply(() -> ScheduledOutput.run(event, task)));
     }
 
     private static <T, F extends Future<T>> F trackCallable(ExecutorService executor, Callable<T> task,
@@ -69,15 +117,20 @@ public final class ExecutorOutput {
             return submit.apply(task);
         }
         var event = new Object();
-        return observe(event, () -> submit.apply(() -> ScheduledOutput.callFuture(event, task)));
+        return observe(event, executor, () -> submit.apply(() -> ScheduledOutput.callFuture(event, task)));
     }
 
-    private static <F extends Future<?>> F observe(Object event, Supplier<F> submit) {
+    private static <F extends Future<?>> F observe(Object event, ExecutorService executor, Supplier<F> submit) {
         boolean tracked = ScheduledOutput.registerTask(event);
         try {
+            boolean shutDown = tracked && standardRejection(executor) && executor.isShutdown();
             F future = submit.get();
             if (tracked) {
-                ScheduledOutput.observeFuture(event, future);
+                if (shutDown) {
+                    ScheduledOutput.cancel(event);
+                } else {
+                    observeQueuedWork(event, executor, future, future);
+                }
             }
             return future;
         } catch (RuntimeException | Error failure) {
@@ -86,6 +139,20 @@ public final class ExecutorOutput {
             }
             throw failure;
         }
+    }
+
+    private static void observeQueuedWork(Object event, ExecutorService executor, Object task, Future<?> future) {
+        BlockingQueue<?> queue = executor instanceof ThreadPoolExecutor pool ? pool.getQueue() : null;
+        ScheduledOutput.observeQueuedWork(event, new ScheduledOutput.QueuedWork(executor, queue, task, future));
+    }
+
+    static boolean standardRejection(ExecutorService executor) {
+        if (!(executor instanceof ThreadPoolExecutor pool)) {
+            return standardPool(executor);
+        }
+        Class<?> handler = pool.getRejectedExecutionHandler().getClass();
+        return handler == ThreadPoolExecutor.AbortPolicy.class || handler == ThreadPoolExecutor.CallerRunsPolicy.class
+                || handler == ThreadPoolExecutor.DiscardPolicy.class || handler == ThreadPoolExecutor.DiscardOldestPolicy.class;
     }
 
     private static boolean standardPool(ExecutorService executor) {

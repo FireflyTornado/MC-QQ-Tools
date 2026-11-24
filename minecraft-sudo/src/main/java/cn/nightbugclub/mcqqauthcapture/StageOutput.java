@@ -7,6 +7,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -45,6 +46,9 @@ public final class StageOutput {
         var settled = new CompletableFuture<Throwable>();
         return CommandOutputContext.registerStage(event -> {
             arguments[callbackIndex] = wrap(original.type().parameterType(callbackIndex), callback, event, settled);
+            if (arguments.length == callbackIndex + 2) {
+                arguments[callbackIndex + 1] = ExecutorOutput.observeExecutor(event, (Executor) arguments[callbackIndex + 1]);
+            }
             return (CompletionStage<?>) original.invokeWithArguments(arguments);
         }, settled);
     }

@@ -3,13 +3,16 @@ package cn.nightbugclub.mcqqauthcapture;
 import java.lang.ref.WeakReference;
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 public final class ScheduledOutput {
@@ -17,9 +20,19 @@ public final class ScheduledOutput {
     static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
-    private static boolean pollingFutures;
+    private static boolean pollingQueuedWork;
 
-    private record Event(ScheduledOutput owner, String cancellation, Future<?> future) {}
+    record QueuedWork(ExecutorService executor, BlockingQueue<?> queue, Object task, Future<?> future) {
+        boolean futureDone() {
+            return future != null && future.isDone();
+        }
+
+        boolean discarded() {
+            return ExecutorOutput.standardRejection(executor) && executor.isTerminated();
+        }
+    }
+
+    private record Event(ScheduledOutput owner, String cancellation, QueuedWork queued) {}
 
     private final CommandOutput output = new CommandOutput();
     private final CompletableFuture<SudoCommands.Result> result = new CompletableFuture<>();
@@ -74,39 +87,53 @@ public final class ScheduledOutput {
         }
     }
 
-    static void observeFuture(Object task, Future<?> future) {
+    static void observeQueuedWork(Object task, QueuedWork queued) {
         synchronized (EVENTS) {
             Event event = EVENTS.get(task);
             if (event == null) {
                 return;
             }
-            EVENTS.put(task, new Event(event.owner(), event.cancellation(), future));
-            if (!pollingFutures) {
-                pollingFutures = true;
-                scheduleFuturePoll();
+            EVENTS.put(task, new Event(event.owner(), event.cancellation(), queued));
+            if (!pollingQueuedWork) {
+                pollingQueuedWork = true;
+                scheduleQueuePoll();
             }
         }
     }
 
-    private static void scheduleFuturePoll() {
-        CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS).execute(ScheduledOutput::pollFutures);
+    static void discardQueuedWork(Predicate<QueuedWork> discarded) {
+        synchronized (EVENTS) {
+            var tasks = EVENTS.entrySet().stream()
+                    .filter(entry -> entry.getValue().queued() != null && discarded.test(entry.getValue().queued()))
+                    .map(Map.Entry::getKey).toList();
+            tasks.forEach(ScheduledOutput::cancel);
+        }
     }
 
-    private static void pollFutures() {
+    private static void scheduleQueuePoll() {
+        CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS).execute(ScheduledOutput::pollQueuedWork);
+    }
+
+    private static void pollQueuedWork() {
         synchronized (EVENTS) {
             var settled = EVENTS.entrySet().stream()
-                    .filter(entry -> entry.getValue().future() != null && entry.getValue().future().isDone())
+                    .filter(entry -> entry.getValue().queued() != null
+                            && (entry.getValue().queued().futureDone() || entry.getValue().queued().discarded()))
                     .map(Map.Entry::getKey).toList();
             for (Object task : settled) {
                 Event event = EVENTS.get(task);
                 if (event != null) {
-                    completeTask(task, event.future().isCancelled() ? new CancellationException()
-                            : new IllegalStateException("Executor completed without running the task"));
+                    QueuedWork queued = event.queued();
+                    if (queued.futureDone() && !queued.future().isCancelled()) {
+                        completeTask(task, new IllegalStateException("Executor completed without running the task"));
+                    } else {
+                        cancel(task);
+                    }
                 }
             }
-            pollingFutures = EVENTS.values().stream().anyMatch(event -> event.future() != null);
-            if (pollingFutures) {
-                scheduleFuturePoll();
+            pollingQueuedWork = EVENTS.values().stream().anyMatch(event -> event.queued() != null);
+            if (pollingQueuedWork) {
+                scheduleQueuePoll();
             }
         }
     }

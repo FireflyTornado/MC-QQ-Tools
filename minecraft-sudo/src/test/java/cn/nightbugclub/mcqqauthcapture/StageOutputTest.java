@@ -14,6 +14,8 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
@@ -172,6 +174,21 @@ class StageOutputTest {
         assertFalse(request.seal());
         assertTrue(custom.complete(7));
         assertEquals(8, result.join());
+    }
+
+    @Test
+    void settlesSilentRejectionFromAStoppedExecutor() throws Throwable {
+        var async = link("runAsync", null, Runnable.class, Executor.class);
+        var pool = new ScheduledThreadPoolExecutor(1, new ThreadPoolExecutor.DiscardPolicy());
+        pool.shutdown();
+        var request = new ScheduledOutput();
+        var close = OutputCapture.begin(line -> fail(line), request);
+        Runnable task = () -> fail("discarded task ran");
+        var stage = (CompletableFuture<?>) async.invoke(task, pool);
+        assertTrue(close.get().join());
+        assertTrue(request.seal());
+        assertFalse(stage.isDone());
+        assertEquals("cancelled", request.result().get(1, TimeUnit.SECONDS).status());
     }
 
     private static MethodHandle link(String method, Class<?> receiver, Class<?>... parameters)

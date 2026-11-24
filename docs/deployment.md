@@ -379,10 +379,13 @@ banlist-watch:
 默认关闭。启用时，在 Bot 和 FastAPI 共用的 `bot/.env` 的远程指令段设置以下变量。群号取公共配置中的 `TARGET_GROUP_ID`，账号名单与 `SUPERUSERS` 独立。
 
 ```dotenv
+MC_SUDO_ENABLED=true
 MC_SUDO_QQ_IDS=["123456789"]
 MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 ```
+
+如果只在 FastAPI 进程环境中设置 `MC_SUDO_MOD_TOKEN`，请将共享 `bot/.env` 中的同名占位配置注释掉。
 
 把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令、读取后续回执和结束等待，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。Bot 启用 Sudo 时也会校验自身环境中已配置的 Mod Token。两个键同时设置时值必须一致。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade、Authorization 和 `X-MCQQSudo-Capabilities` 请求头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit`、`/internal/mc/sudo/followup/` 和 `/internal/mc/sudo/stop` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 

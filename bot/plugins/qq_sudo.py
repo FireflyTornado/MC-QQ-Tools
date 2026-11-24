@@ -27,6 +27,7 @@ from sudo_config import (
     SUDO_TIMEOUT,
     SudoOutputSettings,
     SudoSettings,
+    is_elapsed_ms,
     is_single_command,
 )
 
@@ -83,6 +84,8 @@ class Reply:
     sequence: int | None = None
     final: bool = True
     stopped_ids: tuple[str, ...] = ()
+    elapsed_ms: int | None = None
+    not_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,7 @@ async def request_result(token: str, method: str, path: str, payload: dict | Non
         wait_seconds = result.get("wait_seconds")
         sequence = result.get("sequence")
         final = result.get("final", True)
+        elapsed_ms = result.get("elapsed_ms")
         if (
             isinstance(status, str)
             and (status in REPLIES or (method == "GET" and status in {"waiting", "closed", "stopped"}))
@@ -221,9 +225,11 @@ async def request_result(token: str, method: str, path: str, payload: dict | Non
                  and wait_seconds in {SUDO_DIRECT_REPLY_TIMEOUT, SUDO_FOLLOWUP_TIMEOUT}))
             and (sequence is None or (method == "GET" and type(sequence) is int and 1 <= sequence <= MAX_FOLLOWUP_FRAMES))
             and type(final) is bool and (final or sequence is not None)
+            and (elapsed_ms is None or is_elapsed_ms(elapsed_ms))
             and not any(0xD800 <= ord(char) <= 0xDFFF for char in output)
         ):
-            return Reply(status, output, truncated, wait_seconds, sequence, final)
+            return Reply(status, output, truncated, wait_seconds, sequence, final, elapsed_ms=elapsed_ms,
+                         not_started="elapsed_ms" in result and elapsed_ms is None)
     return Reply("unknown")
 
 
@@ -247,13 +253,14 @@ async def check_followup_delivery(token: str, request_id: str, deadline: float) 
     raise FollowupDeliveryClosed
 
 
-async def upload_output(bot: Bot, group_id: int, request_id: str, output: str, *, timeout: float) -> bool:
+async def upload_output(bot: Bot, group_id: int, request_id: str, filename_id: str, output: str,
+                        *, timeout: float) -> bool:
     try:
         async with asyncio.timeout(timeout):
             result = await bot.call_api(
                 "upload_group_file",
                 group_id=str(group_id),
-                name=f"sudo-{request_id}.txt",
+                name=f"sudo-{filename_id}.txt",
                 file="base64://" + b64encode(output.encode("utf-8")).decode("ascii"),
             )
     except Exception as exc:
@@ -277,7 +284,7 @@ async def upload_followup(bot: Bot, group_id: int, token: str, request_id: str, 
         remaining = deadline - loop.time()
         if remaining <= 0:
             break
-        if await upload_output(bot, group_id, filename_id, output, timeout=remaining):
+        if await upload_output(bot, group_id, request_id, filename_id, output, timeout=remaining):
             return True
         if attempt + 1 < FOLLOWUP_UPLOAD_ATTEMPTS:
             delay = FOLLOWUP_RETRY_DELAY * 2 ** attempt
@@ -285,28 +292,45 @@ async def upload_followup(bot: Bot, group_id: int, token: str, request_id: str, 
     return False
 
 
+def result_footer(request_id: str, reply: Reply, *, followup: bool) -> str:
+    if reply.elapsed_ms is not None:
+        seconds, hundredths = divmod((reply.elapsed_ms + 5) // 10, 100)
+        elapsed = f"{seconds}.{hundredths:02d} s"
+    elif reply.not_started or (not followup and reply.status in {"busy", "unavailable", "rejected", "expired"}):
+        elapsed = "未执行"
+    else:
+        elapsed = "未知"
+    return f"编号：{request_id[:6]}，时间：{elapsed}"
+
+
+def append_footer(text: str, footer: str) -> str:
+    return text + ("\n" if text and not text.endswith("\n") else "") + footer
+
+
 async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, *, followup_token: str | None = None,
                         waiting: bool = False, terminal_notice: str | None = None,
                         pending_initial_notice: str | None = None, retrying: bool = False) -> RenderedReply:
     followup = followup_token is not None
     status, output = reply.status, reply.output
+    footer = result_footer(request_id, reply, followup=followup)
     text = "".join(
         char for char in output if char in "\r\n\t" or unicodedata.category(char) not in {"Cc", "Cs"}
     )
     output_in_file = False
     output_in_message = bool(text.strip())
-    file_upload_failed = False
     failed_with_followup = status == "error" and waiting
     if reply.truncated or (output and not text.strip()) or output_settings.use_file(output):
         output_in_message = False
-        filename_id = f"{request_id}-followup" if followup else request_id
+        filename_id = request_id[:6] + ("-followup" if followup else "")
         if reply.sequence is not None:
             filename_id += f"-{reply.sequence}"
+        file_output = append_footer(output, footer)
         if followup_token is not None:
-            output_in_file = await upload_followup(bot, group_id, followup_token, request_id, filename_id, output,
+            output_in_file = await upload_followup(bot, group_id, followup_token, request_id, filename_id, file_output,
                                                   retrying=retrying)
         else:
-            output_in_file = await upload_output(bot, group_id, filename_id, output, timeout=UPLOAD_TIMEOUT)
+            output_in_file = await upload_output(bot, group_id, request_id, filename_id, file_output,
+                                                 timeout=UPLOAD_TIMEOUT)
         if output_in_file:
             if followup:
                 text = "输出已上传为文件。"
@@ -315,8 +339,7 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
             else:
                 text = ""
         else:
-            file_upload_failed = True
-            text = f"结果文件上传失败或未确认。请求编号：{request_id}"
+            text = "结果文件上传失败或未确认。"
             if followup and reply.final and not retrying and terminal_notice is None:
                 terminal_notice = {
                     "ok": "已安排的任务执行完毕。",
@@ -338,15 +361,9 @@ async def render_result(bot: Bot, group_id: int, request_id: str, reply: Reply, 
             text += "\n如果收到后续输出，会继续补发。"
         else:
             text += "\n后台任务的结果会继续补发。"
-    if followup:
-        if pending_initial_notice is not None:
-            text = f"{pending_initial_notice}\n{text}"
-        text = f"指令后续回执 {request_id}\n{text}"
-    elif waiting and not file_upload_failed:
-        if not text.endswith("\n"):
-            text += "\n"
-        text += f"请求编号：{request_id}"
-    return RenderedReply(MessageSegment.text(text), output_in_file, output_in_message)
+    if followup and pending_initial_notice is not None:
+        text = f"{pending_initial_notice}\n{text}"
+    return RenderedReply(MessageSegment.text(append_footer(text, footer)), output_in_file, output_in_message)
 
 
 async def send_followup(bot: Bot, group_id: int, token: str, request_id: str, reply: Reply, deadline: float,

@@ -1,6 +1,7 @@
 package cn.nightbugclub.mcqqauthcapture;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.bukkit.configuration.ConfigurationSection;
@@ -34,7 +35,7 @@ final class SudoChannel implements AutoCloseable {
     private static final int MAX_FOLLOWUPS = 128;
     private static final int MAX_FOLLOWUP_UPDATES = 63;
     private static final String STOP_FOLLOWUPS = "stop_followups";
-    private static final Gson JSON = new Gson();
+    private static final Gson JSON = new GsonBuilder().serializeNulls().create();
 
     record Settings(URI url, String token) {
         static Settings read(ConfigurationSection config) {
@@ -350,6 +351,7 @@ final class SudoChannel implements AutoCloseable {
     private synchronized void finish(Connection source, Request request, SudoCommands.Result result,
                                      ScheduledOutput scheduled) {
         if (releaseExecution(request)) {
+            Long elapsedMs = scheduled == null ? null : scheduled.elapsedMs();
             boolean tracked = active == source && scheduled != null && scheduled.seal();
             boolean succeeded = result.status().equals("ok");
             boolean partial = result.status().equals("partial");
@@ -366,17 +368,17 @@ final class SudoChannel implements AutoCloseable {
                     int seconds = tracked ? ScheduledOutput.WAIT_SECONDS : ScheduledOutput.DIRECT_REPLY_WAIT_SECONDS;
                     var followup = new Followup(source, request, scheduled);
                     source.followups.add(followup);
-                    reply(source, request, result, request.streamFollowup ? seconds : 0, null, true);
+                    reply(source, request, result, request.streamFollowup ? seconds : 0, null, true, elapsedMs);
                     source.sending.thenRun(() -> startFollowup(followup, seconds));
                 } else {
                     scheduled.abandon();
                     if (succeeded) {
                         result = new SudoCommands.Result("partial", result.output(), result.truncated());
                     }
-                    reply(source, request, result);
+                    reply(source, request, result, 0, null, true, elapsedMs);
                 }
             } else {
-                reply(source, request, result);
+                reply(source, request, result, 0, null, true, elapsedMs);
                 if (scheduled != null) {
                     scheduled.abandon();
                 }
@@ -408,7 +410,7 @@ final class SudoChannel implements AutoCloseable {
         var output = followup.scheduled.output().takeFollowup();
         if (!output.text().isEmpty() || output.truncated()) {
             reply(followup.source, followup.request, new SudoCommands.Result("ok", output.text(), output.truncated()),
-                    0, followup, false);
+                    0, followup, false, followup.scheduled.elapsedMs());
         }
         if (followup.source.followups.contains(followup) && followup.sequence < MAX_FOLLOWUP_UPDATES
                 && !output.truncated() && !followup.scheduled.result().isDone()) {
@@ -418,9 +420,10 @@ final class SudoChannel implements AutoCloseable {
 
     private synchronized void finishFollowup(Followup followup, SudoCommands.Result result, Throwable failure) {
         if (followup.source.followups.remove(followup)) {
+            Long elapsedMs = followup.scheduled.elapsedMs();
             followup.close();
             if (failure == null) {
-                reply(followup.source, followup.request, result, 0, followup, true);
+                reply(followup.source, followup.request, result, 0, followup, true, elapsedMs);
             }
         }
     }
@@ -444,11 +447,11 @@ final class SudoChannel implements AutoCloseable {
     }
 
     private synchronized void reply(Connection source, Request request, SudoCommands.Result result) {
-        reply(source, request, result, 0, null, true);
+        reply(source, request, result, 0, null, true, null);
     }
 
     private synchronized void reply(Connection source, Request request, SudoCommands.Result result,
-                                    int waitSeconds, Followup followup, boolean finalResult) {
+                                    int waitSeconds, Followup followup, boolean finalResult, Long elapsedMs) {
         if (active != source) {
             return;
         }
@@ -456,6 +459,7 @@ final class SudoChannel implements AutoCloseable {
         response.addProperty("id", request.id);
         response.addProperty("status", result.status());
         response.addProperty("output", result.output());
+        response.addProperty("elapsed_ms", elapsedMs);
         if (result.truncated()) {
             response.addProperty("truncated", true);
         }

@@ -34,10 +34,20 @@ public final class ScheduledOutput {
     private boolean sealed;
     private boolean ran;
     private boolean complete = true;
+    private volatile Long dispatchStartedNanos;
     private volatile boolean failedDuringDispatch;
 
     CommandOutput output() {
         return output;
+    }
+
+    void markDispatchStarted() {
+        dispatchStartedNanos = System.nanoTime();
+    }
+
+    Long elapsedMs() {
+        Long started = dispatchStartedNanos;
+        return started == null ? null : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
     }
 
     void markDispatchFailure() {

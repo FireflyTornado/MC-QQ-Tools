@@ -65,14 +65,14 @@ jobs:
       - name: Build Mohist sudo mod
         run: mvn -B -ntp -f minecraft-sudo/pom.xml verify
 
-      - name: Build optional Forge executor transformer
+      - name: Build optional Forge output transformer
         run: mvn -B -ntp -f minecraft-sudo/transformer/pom.xml verify
 
       - name: Verify sudo mod JAR entries
         shell: bash
         run: |
           entries="$(jar tf minecraft-sudo/target/MCQQSudo-*.jar)"
-          for entry in META-INF/mods.toml mcqqsudo.mixins.json config.yml sudo-allowlist.txt cn/nightbugclub/mcqqauthcapture/SudoMod.class cn/nightbugclub/mcqqauthcapture/ExecutorOutput.class; do
+          for entry in META-INF/mods.toml mcqqsudo.mixins.json config.yml sudo-allowlist.txt cn/nightbugclub/mcqqauthcapture/SudoMod.class cn/nightbugclub/mcqqauthcapture/ExecutorOutput.class cn/nightbugclub/mcqqauthcapture/StageOutput.class; do
             if ! grep -Fxq -- "$entry" <<< "$entries"; then
               printf 'Missing mod JAR entry: %s\n' "$entry" >&2
               exit 1

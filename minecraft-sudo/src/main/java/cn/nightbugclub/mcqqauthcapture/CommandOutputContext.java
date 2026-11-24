@@ -6,7 +6,6 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 /** Opt-in output attribution for work submitted while a command or its tracked task is running. */
@@ -54,20 +53,37 @@ public final class CommandOutputContext {
         return registerStage(ignored -> stage);
     }
 
-    private static <S extends CompletionStage<?>> S registerStage(Function<Object, S> start) {
+    @FunctionalInterface
+    interface StageRegistration<S, E extends Throwable> {
+        S start(Object event) throws E;
+    }
+
+    private static <S extends CompletionStage<?>> S registerStage(StageRegistration<S, RuntimeException> start) {
+        return registerStage(start, null);
+    }
+
+    static <S extends CompletionStage<?>, E extends Throwable> S registerStage(StageRegistration<S, E> start,
+                                                                               CompletableFuture<Throwable> settled) throws E {
         var event = new Object();
         boolean tracked = ScheduledOutput.registerTask(event);
         try {
-            S stage = start.apply(event);
+            S stage = start.start(event);
             if (tracked) {
-                stage.whenComplete((value, failure) -> ScheduledOutput.completeTask(event, failure));
+                stage.whenComplete((value, failure) -> completeStage(event, settled, failure));
             }
             return stage;
-        } catch (RuntimeException | Error failure) {
+        } catch (Throwable failure) {
             if (tracked) {
-                ScheduledOutput.completeTask(event, failure);
+                completeStage(event, settled, failure);
             }
             throw failure;
+        }
+    }
+
+    private static void completeStage(Object event, CompletableFuture<Throwable> settled, Throwable failure) {
+        ScheduledOutput.completeTask(event, failure);
+        if (settled != null) {
+            settled.complete(failure);
         }
     }
 

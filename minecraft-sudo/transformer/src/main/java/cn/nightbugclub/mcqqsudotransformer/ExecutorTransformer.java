@@ -59,7 +59,7 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
                         continue;
                     }
                     if (jar.getEntry(BRIDGE + ".class") != null) {
-                        bridgePresent = true;
+                        bridgePresent |= jar.getEntry(StageCalls.BRIDGE + ".class") != null;
                         continue;
                     }
                     var entries = jar.entries();
@@ -84,7 +84,7 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
             return Set.of();
         }
         if (!bridgePresent) {
-            LOG.log(Level.WARNING, "MCQQSudo executor bridge is unavailable; executor conversion is disabled.");
+            LOG.log(Level.WARNING, "Matching MCQQSudo capture bridges are unavailable; conversion is disabled.");
             return Set.of();
         }
         return classes;
@@ -99,7 +99,8 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
                 return new MethodVisitor(Opcodes.ASM9) {
                     @Override
                     public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean itf) {
-                        matched[0] |= receiver(opcode, owner, name, descriptor) != null;
+                        matched[0] |= receiver(opcode, owner, name, descriptor) != null
+                                || StageCalls.matches(opcode, owner, name, descriptor);
                     }
                 };
             }
@@ -131,6 +132,8 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
                         String descriptor = "(L" + receiver + ";" + call.desc.substring(1);
                         method.instructions.set(call, new MethodInsnNode(Opcodes.INVOKESTATIC,
                                 BRIDGE, call.name, descriptor, false));
+                    } else if (StageCalls.matches(call.getOpcode(), call.owner, call.name, call.desc)) {
+                        method.instructions.set(call, StageCalls.rewrite(call));
                     }
                 }
             }

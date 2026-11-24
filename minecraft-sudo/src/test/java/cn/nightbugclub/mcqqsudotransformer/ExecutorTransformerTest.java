@@ -30,6 +30,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -48,8 +49,9 @@ class ExecutorTransformerTest {
         new ExecutorTransformer(Set.of(Submitter.class.getName())).transform(node, null);
         var calls = node.methods.stream().flatMap(method -> Arrays.stream(method.instructions.toArray()))
                 .filter(MethodInsnNode.class::isInstance).map(MethodInsnNode.class::cast).toList();
-        assertEquals(3, calls.stream().filter(call -> call.owner.equals(BRIDGE)
+        assertEquals(4, calls.stream().filter(call -> call.owner.equals(BRIDGE)
                 && call.getOpcode() == Opcodes.INVOKESTATIC).count());
+        assertTrue(calls.stream().anyMatch(call -> call.owner.equals(BRIDGE) && call.name.equals("shutdownNow")));
         assertTrue(calls.stream().anyMatch(call -> call.name.equals("scheduleAtFixedRate")
                 && call.getOpcode() == Opcodes.INVOKEINTERFACE));
     }
@@ -142,17 +144,21 @@ class ExecutorTransformerTest {
     }
 
     @Test
-    void rewritesQueueMaintenanceAndRejectionPolicyAccess() throws IOException {
+    void leavesNativeQueueMaintenanceAndRejectionPolicyAccessAlone() throws IOException {
         var reader = new ClassReader(classBytes(QueueMaintenance.class));
-        assertTrue(ExecutorTransformer.hasMatch(reader));
+        assertFalse(ExecutorTransformer.hasMatch(reader));
         var node = new ClassNode();
         reader.accept(node, 0);
         new ExecutorTransformer(Set.of(QueueMaintenance.class.getName())).transform(node, null);
-        var calls = node.methods.stream().flatMap(method -> Arrays.stream(method.instructions.toArray()))
-                .filter(MethodInsnNode.class::isInstance).map(MethodInsnNode.class::cast)
-                .filter(call -> call.owner.equals(BRIDGE)).map(call -> call.name).toList();
-        assertEquals(List.of("setRejectedExecutionHandler", "getRejectedExecutionHandler", "clear", "removeIf", "purge"),
-                calls);
+        var instructions = node.methods.stream().flatMap(method -> Arrays.stream(method.instructions.toArray())).toList();
+        var calls = instructions.stream().filter(MethodInsnNode.class::isInstance).map(MethodInsnNode.class::cast).toList();
+        assertTrue(calls.stream().noneMatch(call -> call.owner.equals(BRIDGE)));
+        assertEquals(List.of("setRejectedExecutionHandler", "getRejectedExecutionHandler", "getQueue", "clear", "removeIf",
+                        "remove", "remove", "purge"),
+                calls.stream().filter(call -> !call.name.equals("<init>")).map(call -> call.name).toList());
+        assertTrue(instructions.stream().filter(InvokeDynamicInsnNode.class::isInstance)
+                .map(InvokeDynamicInsnNode.class::cast).map(call -> (Handle) call.bsmArgs[1])
+                .anyMatch(handle -> handle.getOwner().startsWith("java/util/") && handle.getName().equals("clear")));
     }
 
     private static void jar(Path path, String entry, byte[] content, boolean mod) throws IOException {
@@ -173,6 +179,7 @@ class ExecutorTransformerTest {
             executor.submit(action);
             executor.schedule(action, 1, TimeUnit.SECONDS);
             executor.scheduleAtFixedRate(action, 1, 1, TimeUnit.SECONDS);
+            executor.shutdownNow();
         }
     }
 
@@ -186,15 +193,21 @@ class ExecutorTransformerTest {
     }
 
     static class QueueMaintenance {
-        RejectedExecutionHandler reconfigure(ThreadPoolExecutor pool, RejectedExecutionHandler handler) {
+        RejectedExecutionHandler reconfigure(ThreadPoolExecutor pool, RejectedExecutionHandler handler, Runnable task) {
             pool.setRejectedExecutionHandler(handler);
             var configured = pool.getRejectedExecutionHandler();
             Queue<Runnable> queue = pool.getQueue();
             queue.clear();
             Collection<Runnable> collection = queue;
-            collection.removeIf(task -> false);
+            collection.removeIf(candidate -> false);
+            collection.remove(task);
+            pool.remove(task);
             pool.purge();
             return configured;
+        }
+
+        static Consumer<Queue<Runnable>> clearReference() {
+            return Queue::clear;
         }
     }
 

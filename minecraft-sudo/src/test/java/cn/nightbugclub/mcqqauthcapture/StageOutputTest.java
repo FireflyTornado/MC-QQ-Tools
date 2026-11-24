@@ -177,7 +177,7 @@ class StageOutputTest {
     }
 
     @Test
-    void settlesSilentRejectionFromAStoppedExecutor() throws Throwable {
+    void silentRejectionFromAStoppedExecutorUsesTheRequestDeadline() throws Throwable {
         var async = link("runAsync", null, Runnable.class, Executor.class);
         var pool = new ScheduledThreadPoolExecutor(1, new ThreadPoolExecutor.DiscardPolicy());
         pool.shutdown();
@@ -188,7 +188,9 @@ class StageOutputTest {
         assertTrue(close.get().join());
         assertTrue(request.seal());
         assertFalse(stage.isDone());
-        assertEquals("cancelled", request.result().get(1, TimeUnit.SECONDS).status());
+        assertFalse(request.result().isDone());
+        request.expire();
+        assertEquals("expired", request.result().join().status());
     }
 
     private static MethodHandle link(String method, Class<?> receiver, Class<?>... parameters)

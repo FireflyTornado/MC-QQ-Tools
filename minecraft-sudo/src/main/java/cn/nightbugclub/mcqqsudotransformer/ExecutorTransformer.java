@@ -5,9 +5,12 @@ import cpw.mods.modlauncher.api.ITransformerVotingContext;
 import cpw.mods.modlauncher.api.TransformerVoteResult;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.Handle;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 
 import java.io.IOException;
@@ -15,6 +18,7 @@ import java.lang.System.Logger.Level;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -94,13 +98,25 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
                 return new MethodVisitor(Opcodes.ASM9) {
                     @Override
                     public void visitMethodInsn(int opcode, String owner, String name, String descriptor, boolean itf) {
-                        matched[0] |= receiver(opcode, owner, name, descriptor) != null
-                                || StageCalls.matches(opcode, owner, name, descriptor);
+                        matched[0] |= matches(opcode, owner, name, descriptor);
+                    }
+
+                    @Override
+                    public void visitInvokeDynamicInsn(String name, String descriptor, Handle bootstrap,
+                                                       Object... arguments) {
+                        MethodInsnNode target = MethodReferences.target(bootstrap, arguments);
+                        if (target != null) {
+                            matched[0] |= matches(target.getOpcode(), target.owner, target.name, target.desc);
+                        }
                     }
                 };
             }
         }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
         return matched[0];
+    }
+
+    private static boolean matches(int opcode, String owner, String name, String descriptor) {
+        return receiver(opcode, owner, name, descriptor) != null || StageCalls.matches(opcode, owner, name, descriptor);
     }
 
     private static String receiver(int opcode, String owner, String name, String descriptor) {
@@ -129,21 +145,32 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
 
     @Override
     public ClassNode transform(ClassNode node, ITransformerVotingContext context) {
-        for (var method : node.methods) {
+        for (var method : List.copyOf(node.methods)) {
             for (var instruction : method.instructions.toArray()) {
                 if (instruction instanceof MethodInsnNode call) {
-                    String receiver = receiver(call.getOpcode(), call.owner, call.name, call.desc);
-                    if (receiver != null) {
-                        String descriptor = "(L" + receiver + ";" + call.desc.substring(1);
-                        method.instructions.set(call, new MethodInsnNode(Opcodes.INVOKESTATIC,
-                                BRIDGE, call.name, descriptor, false));
-                    } else if (StageCalls.matches(call.getOpcode(), call.owner, call.name, call.desc)) {
-                        method.instructions.set(call, StageCalls.rewrite(call));
+                    var replacement = rewriteCall(call);
+                    if (replacement != null) {
+                        method.instructions.set(call, replacement);
+                    }
+                } else if (instruction instanceof InvokeDynamicInsnNode factory) {
+                    MethodInsnNode target = MethodReferences.target(factory.bsm, factory.bsmArgs);
+                    var replacement = target == null ? null : rewriteCall(target);
+                    if (replacement != null) {
+                        MethodReferences.rewrite(node, factory, target, replacement);
                     }
                 }
             }
         }
         return node;
+    }
+
+    private static AbstractInsnNode rewriteCall(MethodInsnNode call) {
+        String receiver = receiver(call.getOpcode(), call.owner, call.name, call.desc);
+        if (receiver != null) {
+            String descriptor = "(L" + receiver + ";" + call.desc.substring(1);
+            return new MethodInsnNode(Opcodes.INVOKESTATIC, BRIDGE, call.name, descriptor, false);
+        }
+        return StageCalls.matches(call.getOpcode(), call.owner, call.name, call.desc) ? StageCalls.rewrite(call) : null;
     }
 
     @Override

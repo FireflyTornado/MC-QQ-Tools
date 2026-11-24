@@ -3,6 +3,7 @@ package cn.nightbugclub.mcqqsudotransformer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
@@ -10,6 +11,7 @@ import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -17,8 +19,13 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -84,6 +91,51 @@ class ExecutorTransformerTest {
         }
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void discoversAndLinksBoundUnboundAndStaticMethodReferences() throws Exception {
+        var reader = new ClassReader(classBytes(ReferenceTargets.class));
+        assertTrue(ExecutorTransformer.hasMatch(reader));
+        var node = new ClassNode();
+        reader.accept(node, 0);
+        int originalMethods = node.methods.size();
+        new ExecutorTransformer(Set.of(ReferenceTargets.class.getName())).transform(node, null);
+        assertEquals(originalMethods + 3, node.methods.size());
+        var writer = new ClassWriter(0);
+        node.accept(writer);
+        var transformed = new ClassLoader(getClass().getClassLoader()) {
+            Class<?> fromBytes(byte[] code) {
+                return defineClass(null, code, 0, code.length);
+            }
+        }.fromBytes(writer.toByteArray());
+
+        var pool = Executors.newSingleThreadExecutor();
+        try {
+            var bound = transformed.getDeclaredMethod("bound", ExecutorService.class);
+            bound.setAccessible(true);
+            var submit = (Function<Runnable, Future<?>>) bound.invoke(null, pool);
+            assertNull(submit.apply(() -> {}).get(5, TimeUnit.SECONDS));
+
+            var unbound = transformed.getDeclaredMethod("unbound");
+            unbound.setAccessible(true);
+            var apply = (BiFunction<CompletableFuture<Integer>, Function<Integer, String>,
+                    CompletableFuture<String>>) unbound.invoke(null);
+            assertEquals("42", apply.apply(CompletableFuture.completedFuture(42), Object::toString).join());
+
+            var staticMethod = transformed.getDeclaredMethod("staticMethod");
+            staticMethod.setAccessible(true);
+            var run = (Function<Runnable, CompletableFuture<Void>>) staticMethod.invoke(null);
+            assertNull(run.apply(() -> {}).get(5, TimeUnit.SECONDS));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void skipsSerializableMethodReferencesToPreserveTheSerializedLambdaContract() throws IOException {
+        assertFalse(ExecutorTransformer.hasMatch(new ClassReader(classBytes(SerializableReference.class))));
+    }
+
     private static void jar(Path path, String entry, byte[] content, boolean mod) throws IOException {
         try (var out = new ZipOutputStream(Files.newOutputStream(path))) {
             if (mod) {
@@ -111,6 +163,26 @@ class ExecutorTransformerTest {
             work.thenApply(value -> value + 1);
             work.complete(9);
             return input.whenCompleteAsync((value, failure) -> {}, executor);
+        }
+    }
+
+    static class ReferenceTargets {
+        static Function<Runnable, Future<?>> bound(ExecutorService executor) {
+            return executor::submit;
+        }
+
+        static BiFunction<CompletableFuture<Integer>, Function<Integer, String>, CompletableFuture<String>> unbound() {
+            return CompletableFuture::thenApply;
+        }
+
+        static Function<Runnable, CompletableFuture<Void>> staticMethod() {
+            return CompletableFuture::runAsync;
+        }
+    }
+
+    static class SerializableReference {
+        static Function<Runnable, Future<?>> bound(ExecutorService executor) {
+            return (Function<Runnable, Future<?>> & Serializable) executor::submit;
         }
     }
 }

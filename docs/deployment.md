@@ -423,7 +423,7 @@ Mod 在当前请求的等待窗口内收集已关联的原版回调。回调超�
 
 Forge 在启动时从 MCQQSudo JAR 注册转换器，再直接挂载其中的主模组。部署时只需放入一个 MCQQSudo JAR，内嵌模组无需手动解包。转换器扫描 `mods/` 中独立安装的模组，接入 JDK 定时线程池的 `execute`、`submit` 和单次 `schedule`，以及普通 JDK 线程池的 `submit`。日志中的 `MCQQSudo executor capture targets` 显示找到的类数。只有在 `/sudo` 或其后台任务中提交的新任务才会继承请求归属。可用 Forge spark 的 `/sudo spark gc` 验证结果是否补发。
 
-转换器还会接入 JDK `CompletableFuture` 的 `runAsync`、`supplyAsync`，以及 `CompletableFuture` 和 `CompletionStage` 上的 `thenRun`、`thenApply`、`thenAccept`、`thenCompose`、`whenComplete`、`handle`、`exceptionally`、`exceptionallyCompose` 及其异步重载。回调归属在注册时确定，等待对应阶段结算后再结束回执。
+转换器还会接入 JDK `CompletableFuture` 的 `runAsync`、`supplyAsync`，以及 `CompletableFuture` 和 `CompletionStage` 上的 `thenRun`、`thenApply`、`thenAccept`、`thenCompose`、`whenComplete`、`handle`、`exceptionally`、`exceptionallyCompose` 及其异步重载。回调归属在注册时确定，等待对应阶段结算后再结束回执。通过普通 Java 方法引用调用这些入口时，以实际调用时的请求为准。可序列化的方法引用沿用原有调用方式。
 
 普通 `ThreadPoolExecutor.execute` 保留原 Runnable 的队列身份，继续由原线程池处理。自定义线程池、自定义 Future 实现、内嵌依赖、Bukkit 插件 JAR、周期任务和组合多个 Future 的 API 仍可使用原有采集路径或下述显式接口。
 

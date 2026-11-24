@@ -89,6 +89,13 @@ public final class ScheduledOutput {
         }
     }
 
+    static boolean watchesQueue(BlockingQueue<?> queue) {
+        synchronized (EVENTS) {
+            return SUBMISSIONS.values().stream().anyMatch(submitting -> submitting.queue() == queue)
+                    || EVENTS.values().stream().anyMatch(event -> event.queued() != null && event.queued().queue() == queue);
+        }
+    }
+
     private static boolean enqueue(Object event, String cancellation) {
         ScheduledOutput owner = OutputCapture.scheduledOutput();
         if (owner == null) {

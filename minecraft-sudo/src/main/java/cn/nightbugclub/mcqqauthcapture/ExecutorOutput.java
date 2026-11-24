@@ -29,6 +29,8 @@ import java.util.function.Supplier;
 /** Entry points used by the Forge transformer. */
 public final class ExecutorOutput {
     private static final Runnable TERMINATION_CHECK = () -> {};
+    // JDK 17 LinkedBlockingQueue evaluates up to this many predicates before unlinking a batch.
+    private static final int LINKED_REMOVAL_BATCH = 64;
 
     private ExecutorOutput() {}
 
@@ -90,7 +92,8 @@ public final class ExecutorOutput {
     }
 
     public static void clear(Collection<?> collection) {
-        if (!(collection instanceof BlockingQueue<?> queue) || !standardQueue(queue)) {
+        if (!(collection instanceof BlockingQueue<?> queue) || !standardQueue(queue)
+                || !ScheduledOutput.watchesQueue(queue)) {
             collection.clear();
             return;
         }
@@ -107,37 +110,97 @@ public final class ExecutorOutput {
     }
 
     public static <T> boolean removeIf(Collection<T> collection, Predicate<? super T> filter) {
-        if (!(collection instanceof BlockingQueue<?> queue) || !standardQueue(queue)) {
+        if (!(collection instanceof BlockingQueue<?> queue) || !standardQueue(queue)
+                || !ScheduledOutput.watchesQueue(queue)) {
             return collection.removeIf(filter);
         }
         Objects.requireNonNull(filter);
-        var removed = new ArrayList<T>();
         if (queue.getClass() == PriorityBlockingQueue.class) {
-            // PriorityBlockingQueue selects and removes under one lock.
-            boolean changed = collection.removeIf(task -> {
-                if (!filter.test(task)) {
-                    return false;
-                }
-                removed.add(task);
-                return true;
-            });
-            if (changed) {
-                ScheduledOutput.discardQueuedWork(null, queue, removed);
-            }
-            return changed;
+            return removeFromPriorityQueue(collection, queue, filter);
         }
+        var removed = new ArrayList<T>();
         try {
-            // The supported queues use the lookup object's equals method. Select the
-            // exact entry observed by the predicate and report only successful removals.
-            for (T task : new ArrayList<>(collection)) {
-                if (filter.test(task) && queue.remove(removalKey(task))) {
-                    removed.add(task);
+            var snapshot = new ArrayList<>(collection);
+            var selected = new ArrayList<T>();
+            int batchSize = removalBatchSize(queue, snapshot.size());
+            for (int start = 0; start < snapshot.size();) {
+                int end = start + Math.min(batchSize, snapshot.size() - start);
+                selected.clear();
+                for (int index = start; index < end; index++) {
+                    T task = snapshot.get(index);
+                    if (queue.contains(removalKey(task)) && filter.test(task)) {
+                        selected.add(task);
+                    }
                 }
+                // A predicate failure leaves the current batch intact.
+                for (T task : selected) {
+                    if (queue.remove(removalKey(task))) {
+                        removed.add(task);
+                    }
+                }
+                start = end;
             }
         } finally {
             ScheduledOutput.discardQueuedWork(null, queue, removed);
         }
         return !removed.isEmpty();
+    }
+
+    private static int removalBatchSize(BlockingQueue<?> queue, int size) {
+        if (queue.getClass() == ArrayBlockingQueue.class) {
+            return size;
+        }
+        return queue.getClass() == LinkedBlockingQueue.class ? LINKED_REMOVAL_BATCH : 1;
+    }
+
+    private static <T> boolean removeFromPriorityQueue(Collection<T> collection, BlockingQueue<?> queue,
+                                                       Predicate<? super T> filter) {
+        var selection = new PrioritySelection<>(queue, filter);
+        boolean changed;
+        try {
+            changed = collection.removeIf(selection::test);
+        } catch (RuntimeException | Error failure) {
+            // JDK 17 compacts the queue before invoking the comparator to rebuild the heap.
+            if (selection.reachedHeapify()) {
+                ScheduledOutput.discardQueuedWork(null, queue, selection.removed);
+            }
+            throw failure;
+        }
+        if (changed) {
+            ScheduledOutput.discardQueuedWork(null, queue, selection.removed);
+        }
+        return changed;
+    }
+
+    private static final class PrioritySelection<T> {
+        private final BlockingQueue<?> queue;
+        private final Predicate<? super T> filter;
+        private final List<T> removed = new ArrayList<>();
+        private int remaining = -1;
+        private int survivors;
+
+        PrioritySelection(BlockingQueue<?> queue, Predicate<? super T> filter) {
+            this.queue = queue;
+            this.filter = filter;
+        }
+
+        boolean test(T task) {
+            if (remaining == -1) {
+                remaining = queue.size(); // The native predicate is called under the queue lock.
+            }
+            boolean selected = filter.test(task);
+            if (selected) {
+                removed.add(task);
+            } else {
+                survivors++;
+            }
+            remaining--;
+            return selected;
+        }
+
+        boolean reachedHeapify() {
+            return remaining == 0 && survivors > 1;
+        }
     }
 
     public static void purge(ThreadPoolExecutor pool) {
@@ -146,6 +209,10 @@ public final class ExecutorOutput {
             return;
         }
         var queue = pool.getQueue();
+        if (!ScheduledOutput.watchesQueue(queue) || !supportsIdentityRemoval(queue)) {
+            pool.purge();
+            return;
+        }
         try {
             for (Runnable task : queue) {
                 purgeCancelled(pool, queue, task);
@@ -164,15 +231,26 @@ public final class ExecutorOutput {
 
     private static void purgeCancelled(ThreadPoolExecutor pool, BlockingQueue<Runnable> queue, Runnable task) {
         if (task instanceof Future<?> future && future.isCancelled()) {
-            var key = standardQueue(queue) ? removalKey(task) : task;
-            if (pool.remove(key)) {
+            if (pool.remove(removalKey(task))) {
                 ScheduledOutput.discardQueuedWork(pool, queue, List.of(task));
             }
         }
     }
 
+    private static boolean supportsIdentityRemoval(BlockingQueue<?> queue) {
+        try {
+            // Inherited JDK implementations use the lookup key's equals method.
+            return standardQueue(queue.getClass().getMethod("remove", Object.class).getDeclaringClass());
+        } catch (NoSuchMethodException | SecurityException inaccessible) {
+            return false;
+        }
+    }
+
     private static boolean standardQueue(BlockingQueue<?> queue) {
-        Class<?> type = queue.getClass();
+        return standardQueue(queue.getClass());
+    }
+
+    private static boolean standardQueue(Class<?> type) {
         return type == ArrayBlockingQueue.class || type == LinkedBlockingQueue.class || type == LinkedBlockingDeque.class
                 || type == LinkedTransferQueue.class || type == PriorityBlockingQueue.class || delayedWorkQueue(type);
     }

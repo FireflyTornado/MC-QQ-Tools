@@ -16,6 +16,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.PriorityBlockingQueue;
@@ -420,6 +421,185 @@ class ExecutorOutputTest {
             assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
         } finally {
             pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void throwingBulkPredicateLeavesCurrentLinkedAndArrayBatchesQueued() throws Exception {
+        for (BlockingQueue<Runnable> queue : List.of(
+                new LinkedBlockingQueue<Runnable>(), new ArrayBlockingQueue<Runnable>(2))) {
+            var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+            try {
+                var request = new ScheduledOutput();
+                var close = OutputCapture.begin(line -> fail(line), request);
+                var first = ExecutorOutput.submit(pool, () -> 1);
+                var second = ExecutorOutput.submit(pool, () -> 2);
+                assertTrue(close.get().join());
+                assertTrue(request.seal());
+                var failure = new IllegalStateException("predicate failed");
+
+                assertSame(failure, assertThrows(IllegalStateException.class, () ->
+                        ExecutorOutput.removeIf(queue, task -> {
+                            if (task == second) {
+                                throw failure;
+                            }
+                            return task == first;
+                        })));
+                assertArrayEquals(new Object[]{first, second}, queue.toArray());
+                assertFalse(first.isDone());
+                assertFalse(request.result().isDone());
+            } finally {
+                ExecutorOutput.shutdownNow(pool);
+            }
+        }
+    }
+
+    @Test
+    void linkedQueueRetainsTheFailingBatchAndReportsEarlierCompletedBatches() throws Exception {
+        var queue = new LinkedBlockingQueue<Runnable>();
+        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var earlier = ExecutorOutput.submit(pool, () -> 1);
+            for (int index = 1; index < 64; index++) {
+                pool.execute(() -> {});
+            }
+            var last = ExecutorOutput.submit(pool, () -> 2);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            var failure = new IllegalStateException("second batch failed");
+
+            assertSame(failure, assertThrows(IllegalStateException.class, () ->
+                    ExecutorOutput.removeIf(queue, task -> {
+                        if (task == last) {
+                            throw failure;
+                        }
+                        return true;
+                    })));
+            assertArrayEquals(new Object[]{last}, queue.toArray());
+            assertFalse(earlier.isDone());
+            assertFalse(last.isDone());
+            assertFalse(request.result().isDone());
+            assertEquals("已取消一项后台任务。\n", request.output().takeFollowup().text());
+        } finally {
+            ExecutorOutput.shutdownNow(pool);
+        }
+    }
+
+    @Test
+    void priorityQueueReportsRemovedWorkEvenWhenHeapifyThrows() throws Exception {
+        var comparatorFailure = new IllegalArgumentException("heapify failed");
+        var reheap = new AtomicReference<RuntimeException>();
+        var queue = new PriorityBlockingQueue<Runnable>(4, (first, second) -> {
+            if (reheap.get() != null) {
+                throw reheap.get();
+            }
+            return 0;
+        });
+        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var tracked = ExecutorOutput.submit(pool, () -> 1);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            pool.execute(() -> {});
+            pool.execute(() -> {});
+            var predicateFailure = new IllegalStateException("predicate failed");
+
+            assertSame(predicateFailure, assertThrows(IllegalStateException.class, () ->
+                    ExecutorOutput.removeIf(queue, task -> {
+                        if (task != tracked) {
+                            throw predicateFailure;
+                        }
+                        return true;
+                    })));
+            assertTrue(queue.contains(tracked));
+            assertFalse(request.result().isDone());
+
+            reheap.set(comparatorFailure);
+            assertSame(comparatorFailure, assertThrows(IllegalArgumentException.class, () ->
+                    ExecutorOutput.removeIf(queue, task -> task == tracked)));
+            assertFalse(queue.contains(tracked));
+            assertFalse(tracked.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            reheap.set(null);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void purgePreservesAnEqualRunnableAheadOfACancelledTask() throws Exception {
+        for (boolean watched : List.of(false, true)) {
+            var queue = new LinkedBlockingQueue<Runnable>() {};
+            var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+            try {
+                var runnable = new EqualFuture();
+                var cancelled = new EqualFuture();
+                assertTrue(cancelled.cancel(false));
+                pool.execute(runnable);
+                pool.execute(cancelled);
+                Future<?> tracked = null;
+                if (watched) {
+                    var request = new ScheduledOutput();
+                    var close = OutputCapture.begin(line -> fail(line), request);
+                    tracked = ExecutorOutput.submit(pool, () -> 3);
+                    assertTrue(close.get().join());
+                    assertTrue(request.seal());
+                }
+
+                ExecutorOutput.purge(pool);
+                assertArrayEquals(watched ? new Object[]{runnable, tracked} : new Object[]{runnable}, queue.toArray());
+                assertFalse(runnable.isDone());
+            } finally {
+                ExecutorOutput.shutdownNow(pool);
+            }
+        }
+    }
+
+    @Test
+    void purgeDelegatesWhenACustomQueueOnlySupportsIteratorRemoval() throws Exception {
+        var queue = new LinkedBlockingQueue<Runnable>() {
+            @Override
+            public boolean remove(Object task) {
+                throw new UnsupportedOperationException("use the iterator");
+            }
+        };
+        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var cancelled = new FutureTask<>(() -> 1);
+            assertTrue(cancelled.cancel(false));
+            pool.execute(cancelled);
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var tracked = ExecutorOutput.submit(pool, () -> 2);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+
+            ExecutorOutput.purge(pool);
+            assertSame(tracked, queue.element());
+            assertEquals(1, queue.size());
+            assertFalse(request.result().isDone());
+        } finally {
+            ExecutorOutput.shutdownNow(pool);
+        }
+    }
+
+    private static final class EqualFuture extends FutureTask<Integer> {
+        private EqualFuture() {
+            super(() -> 42);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof EqualFuture;
+        }
+
+        @Override
+        public int hashCode() {
+            return 1;
         }
     }
 

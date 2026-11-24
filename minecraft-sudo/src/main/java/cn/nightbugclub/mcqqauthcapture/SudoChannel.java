@@ -398,7 +398,7 @@ final class SudoChannel implements AutoCloseable {
                 followup.update = timer.schedule(() -> sendUpdate(followup), 1, SECONDS);
             }
         }
-        result.whenCompleteAsync((later, failure) -> finishFollowup(followup, later, failure));
+        result.whenCompleteAsync((later, failure) -> finishFollowup(followup, later, failure), timer);
     }
 
     private synchronized void sendUpdate(Followup followup) {

@@ -163,6 +163,24 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.stop(qq_id="102"))[0], 403)
         self.assertEqual(await self.stop(), (200, {"status": "stopped", "request_ids": []}))
 
+    async def test_followup_state_recovers_initial_reply_without_consuming_frames(self):
+        request_id = "a" * 32
+        path = f"{SUDO_FOLLOWUP_PATH}/{request_id}"
+        async with self.connect() as (_, incoming, outgoing):
+            initial = asyncio.create_task(self.submit())
+            await asyncio.wait_for(outgoing.get(), 2)
+            self.result(incoming, request_id, "initial output", status="partial", wait_seconds=30)
+            reply = await initial
+            self.result(incoming, request_id, "terminal output", followup=True, sequence=1, final=True)
+            self.assertEqual((await self.http("GET", f"{path}/state", "plugin-token"))[0], 401)
+            self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), reply)
+            frame = await self.http("GET", path, "bot-token", query=b"after=0")
+            self.assertEqual(frame[1]["output"], "terminal output")
+            self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), reply)
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
+                             (200, {"status": "closed"}))
+            self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), (200, {"status": "closed"}))
+
     async def test_stop_releases_capacity_and_wakes_pollers_without_touching_initial_execution(self):
         first_id, second_id, later_id = ("a" * 32, "b" * 32, "c" * 32)
         first_path = f"{SUDO_FOLLOWUP_PATH}/{first_id}"
@@ -187,6 +205,8 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
                                  (200, {"status": "stopped", "request_ids": [first_id, second_id]}))
                 self.assertEqual(await asyncio.wait_for(poll, 2), (200, {"status": "stopped"}))
                 self.assertEqual(await self.http("GET", second_path, "bot-token"), (200, {"status": "stopped"}))
+                self.assertEqual(await self.http("GET", f"{second_path}/state", "bot-token"),
+                                 (200, {"status": "stopped"}))
                 control = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
                 self.assertEqual(control["type"], "stop_followups")
                 self.assertEqual(control["request_ids"], [first_id, second_id])

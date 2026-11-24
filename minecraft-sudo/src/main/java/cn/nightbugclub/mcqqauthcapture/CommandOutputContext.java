@@ -16,8 +16,6 @@ import java.util.function.Supplier;
 
 /** Opt-in output attribution for work submitted while a command or its tracked task is running. */
 public final class CommandOutputContext {
-    private static final Executor STAGE_POLL = CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS);
-
     private CommandOutputContext() {}
 
     public static Task wrap(Runnable action) {
@@ -129,7 +127,7 @@ public final class CommandOutputContext {
 
     private static void pollStage(Future<?> future, WeakReference<ScheduledOutput> request, Object event,
                                   CompletableFuture<Throwable> settled) {
-        STAGE_POLL.execute(() -> {
+        ScheduledOutput.schedulePoll(() -> {
             var owner = request.get();
             if (owner == null || owner.result().isDone() || settled.isDone()) {
                 return;

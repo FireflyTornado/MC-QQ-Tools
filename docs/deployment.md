@@ -425,7 +425,7 @@ Forge 在启动时从 MCQQSudo JAR 注册转换器，再直接挂载其中的主
 
 转换器还会接入 JDK `CompletableFuture` 的 `runAsync`、`supplyAsync`，以及 `CompletableFuture` 和 `CompletionStage` 上的 `thenRun`、`thenApply`、`thenAccept`、`thenCompose`、`whenComplete`、`handle`、`exceptionally`、`exceptionallyCompose` 及其异步重载。回调归属在注册时确定，等待对应阶段结算后再结束回执。通过普通 Java 方法引用调用这些入口时，以实际调用时的请求为准。可序列化的方法引用沿用原有调用方式。
 
-普通 `ThreadPoolExecutor.execute` 保留原 Runnable 的队列身份，继续由原线程池处理。自定义线程池、自定义 Future 实现、内嵌依赖、Bukkit 插件 JAR、周期任务和组合多个 Future 的 API 仍可使用原有采集路径或下述显式接口。
+普通 `ThreadPoolExecutor.execute` 保留原 Runnable 的队列身份，继续由原线程池处理。调度器包装器（包括 `Executors.newSingleThreadScheduledExecutor()`）和自定义调度器保留原有的提交行为。这些任务与自定义 Future、内嵌依赖、Bukkit 插件 JAR、周期任务和组合多个 Future 的 API 一样，可使用原有采集路径或下述显式接口。
 
 线程池的队列维护、关闭操作和拒绝策略沿用 JDK 原生行为。有明确的任务取消、执行结束或提交异常时，采集器据此结清回执。`shutdownNow()` 返回的工作项如果随后在备用执行器上运行，输出仍归原请求。第三方静默丢弃或直接移除任务时，如果一直没有可确认的终态，回执会等到最长一小时的后台采集窗口到期。
 

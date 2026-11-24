@@ -229,6 +229,8 @@ class SudoChannelTest {
             assertEquals("ok", JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject()
                     .get("status").getAsString());
             ScheduledOutput.cancel(event);
+            assertTrue(frames.isEmpty());
+            fixture.terminalReplies.remove().run();
             var followup = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals(ack.get("id"), followup.get("id"));
             assertEquals("cancelled", followup.get("status").getAsString());
@@ -311,6 +313,7 @@ class SudoChannelTest {
             assertEquals(3600, ack.get("wait_seconds").getAsInt());
 
             ScheduledOutput.run(task, () -> LogManager.getLogger("test.channel").error("Task finished"));
+            fixture.terminalReplies.remove().run();
             var followup = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals(ack.get("id"), followup.get("id"));
             assertEquals("ok", followup.get("status").getAsString());
@@ -360,6 +363,7 @@ class SudoChannelTest {
 
             output.get().appendLine("final batch");
             expiry.action().run();
+            fixture.terminalReplies.remove().run();
             var last = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals("expired", last.get("status").getAsString());
             assertEquals(3, last.get("sequence").getAsInt());
@@ -416,6 +420,7 @@ class SudoChannelTest {
             assertEquals(1, update.get("sequence").getAsInt());
             assertEquals("Late report\n", update.get("output").getAsString());
             expiry.action().run();
+            fixture.terminalReplies.remove().run();
             var terminal = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertTrue(terminal.get("final").getAsBoolean());
 
@@ -437,6 +442,7 @@ class SudoChannelTest {
 
     private static final class ChannelFixture implements AutoCloseable {
         final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
+        final ArrayDeque<Runnable> terminalReplies = new ArrayDeque<>();
         final ArrayDeque<ScheduledTask> scheduled = new ArrayDeque<>();
         final SudoCommands commands = mock(SudoCommands.class);
         final WebSocket.Builder builder = mock(WebSocket.Builder.class, RETURNS_SELF);
@@ -445,6 +451,10 @@ class SudoChannelTest {
         ChannelFixture() {
             var http = mock(HttpClient.class);
             var timer = mock(ScheduledExecutorService.class);
+            doAnswer(call -> {
+                terminalReplies.add(call.getArgument(0));
+                return null;
+            }).when(timer).execute(any(Runnable.class));
             when(timer.schedule(any(Runnable.class), anyLong(), any(TimeUnit.class))).thenAnswer(call -> {
                 var future = mock(ScheduledFuture.class);
                 var task = new ScheduledTask(call.getArgument(0), call.getArgument(1), call.getArgument(2), future);

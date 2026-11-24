@@ -76,6 +76,7 @@ class Followup:
     plugin: WebSocket
     expires_at: float
     streaming: bool
+    initial: dict
     frames: list[dict] = field(default_factory=list)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     finished: bool = False
@@ -104,6 +105,7 @@ class Followup:
 
     def stop(self) -> None:
         self.stopped = self.finished = True
+        self.initial.clear()
         self.frames.clear()
         self.output_bytes = 0
         self.changed.set()
@@ -113,6 +115,7 @@ class Followup:
             return
         if after == len(self.frames):
             self.delivered_sequence = len(self.frames)
+            self.initial.clear()
             self.frames.clear()
             self.output_bytes = 0
             self.expires_at = time.monotonic() + FOLLOWUP_CONFIRMATION_RETENTION
@@ -182,6 +185,19 @@ def sudo_router(
                     del followups[request_id]
                 else:
                     work.complete({"status": "expired"})
+
+    @router.get(SUDO_FOLLOWUP_PATH + "/{request_id}/state")
+    async def followup_state(request_id: str, authorization: list[str] | None = Header(default=None)):
+        if settings is None:
+            raise HTTPException(404)
+        if not verify_bearer(authorization, settings.bot_token.encode("ascii")):
+            raise HTTPException(401)
+        prune_followups()
+        if request_id in stopped:
+            return {"status": "stopped"}
+        if (work := followups.get(request_id)) is not None:
+            return work.initial or {"status": "closed"}
+        return {"status": "expired"}
 
     @router.get(SUDO_FOLLOWUP_PATH + "/{request_id}")
     async def followup(request_id: str, after: int | None = None, authorization: list[str] | None = Header(default=None)):
@@ -422,12 +438,13 @@ def sudo_router(
                             if delivered is not None:
                                 del followups[delivered]
                         if len(followups) < MAX_FOLLOWUPS:
+                            if wait_seconds is not None:
+                                reply["wait_seconds"] = wait_seconds
                             followups[request_id] = Followup(
                                 websocket, time.monotonic() + (wait_seconds or SUDO_FOLLOWUP_TIMEOUT) + SUDO_TIMEOUT,
                                 streaming=wait_seconds is not None,
+                                initial=reply.copy(),
                             )
-                            if wait_seconds is not None:
-                                reply["wait_seconds"] = wait_seconds
                         elif status != "error":
                             reply["status"] = "partial"
                     pending.result.set_result(reply)

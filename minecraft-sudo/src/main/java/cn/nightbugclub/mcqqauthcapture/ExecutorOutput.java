@@ -110,8 +110,8 @@ public final class ExecutorOutput {
     }
 
     private static boolean standardScheduler(ExecutorService executor) {
-        return executor.getClass() == ScheduledThreadPoolExecutor.class
-                || jdkPool(executor, "java.util.concurrent.Executors$DelegatedScheduledExecutorService");
+        // The JDK also uses DelegatedScheduledExecutorService to wrap arbitrary schedulers.
+        return executor.getClass() == ScheduledThreadPoolExecutor.class;
     }
 
     private static boolean jdkPool(ExecutorService executor, String expectedClass) {

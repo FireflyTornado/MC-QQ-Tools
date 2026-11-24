@@ -16,9 +16,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -81,7 +83,7 @@ class ExecutorOutputTest {
 
     @Test
     void cancellationAndRejectionReleaseTrackedWork() throws Exception {
-        var pool = Executors.newSingleThreadScheduledExecutor();
+        var pool = new ScheduledThreadPoolExecutor(1);
         try {
             var cancelled = new ScheduledOutput();
             var finish = OutputCapture.begin(line -> fail(line), cancelled);
@@ -99,6 +101,84 @@ class ExecutorOutputTest {
             assertTrue(rejected.seal());
             assertEquals("partial", rejected.result().get(5, TimeUnit.SECONDS).status());
         } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void preservesSubmissionMethodsAndTaskIdentityThroughCustomSchedulerWrapper() throws Exception {
+        Runnable original = () -> {};
+        var pool = new ScheduledThreadPoolExecutor(1) {
+            @Override
+            public void execute(Runnable task) {
+                // CompletableFuture also uses this entry point for explicit executors.
+                task.run();
+            }
+
+            @Override
+            public Future<?> submit(Runnable task) {
+                assertSame(original, task);
+                return super.schedule(task, 0, TimeUnit.NANOSECONDS);
+            }
+
+            @Override
+            public ScheduledFuture<?> schedule(Runnable task, long delay, TimeUnit unit) {
+                assertSame(original, task);
+                return super.schedule(task, delay, unit);
+            }
+        };
+        try {
+            var executor = Executors.unconfigurableScheduledExecutorService(pool);
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            try {
+                ExecutorOutput.execute(executor, original);
+                ExecutorOutput.submit(executor, original).get(5, TimeUnit.SECONDS);
+                ExecutorOutput.schedule(executor, original, 0, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+                assertEquals(42, CommandOutputContext.supplyAsync(() -> 42, executor).join());
+            } finally {
+                assertTrue(close.get().join());
+            }
+            assertTrue(request.seal());
+            assertEquals("ok", request.result().get(5, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void oneUnobservableFutureDoesNotStopCancellationPolling() throws Exception {
+        var broken = new ScheduledOutput();
+        var probed = new CountDownLatch(1);
+        var brokenEvent = new Object();
+        var close = OutputCapture.begin(line -> fail(line), broken);
+        assertTrue(ScheduledOutput.registerTask(brokenEvent));
+        ScheduledOutput.observeFuture(brokenEvent, new FutureTask<>(() -> null) {
+            @Override
+            public boolean isDone() {
+                probed.countDown();
+                throw new UnsupportedOperationException("cannot observe this Future");
+            }
+        });
+        assertTrue(close.get().join());
+        assertTrue(broken.seal());
+
+        var pool = new ScheduledThreadPoolExecutor(1);
+        try {
+            assertTrue(probed.await(5, TimeUnit.SECONDS));
+            var healthy = new ScheduledOutput();
+            var finish = OutputCapture.begin(line -> fail(line), healthy);
+            var future = ExecutorOutput.schedule(pool, () -> fail("cancelled task ran"), 1, TimeUnit.HOURS);
+            assertTrue(finish.get().join());
+            assertTrue(healthy.seal());
+            assertTrue(future.cancel(false));
+            assertEquals("cancelled", healthy.result().get(5, TimeUnit.SECONDS).status());
+            assertFalse(broken.result().isDone());
+            ScheduledOutput.run(brokenEvent, () -> {});
+            assertEquals(new SudoCommands.Result("partial", "无法观察后台任务是否完成，输出采集可能不完整。\n"),
+                    broken.result().get(5, TimeUnit.SECONDS));
+        } finally {
+            broken.abandon();
             pool.shutdownNow();
         }
     }

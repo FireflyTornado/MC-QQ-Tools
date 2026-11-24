@@ -89,6 +89,10 @@ class QQRevocationTests(unittest.IsolatedAsyncioTestCase):
         self.reply = self.enterContext(patch.object(self.bot, "send", new_callable=AsyncMock))
         self._confirm_sudo_followup = self.sudo.confirm_followup
         self.confirm_sudo_followup = self.enterContext(patch.object(self.sudo, "confirm_followup", new_callable=AsyncMock))
+        self.sudo_followup_state = self.enterContext(
+            patch.object(self.sudo, "request_followup_state", return_value=self.sudo.Reply("expired")),
+        )
+        self.enterContext(patch.object(self.sudo, "stop_recent", self.sudo.stop_recent.copy()))
         self.driver.bots[self.bot.self_id] = self.bot
         self.addCleanup(self.driver.bots.pop, self.bot.self_id, None)
         self.addCleanup(self.events.recent_departures.clear)
@@ -1187,6 +1191,38 @@ commands:
     def active_followup_tasks(self):
         return {delivery.task for delivery in self.sudo.followup_tasks.values() if delivery.task is not None}
 
+    async def test_sudostop_is_admitted_when_sudo_replay_cache_is_saturated(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "MAX_RECENT", 1))
+        self.enterContext(patch.object(self.sudo, "replay_cache_blocked_until", 0.0))
+        with patch.object(self.sudo, "request_result", return_value=self.sudo.Reply("stopped")) as stop:
+            async with self.sudo.running:
+                self.assertIn("有指令正在处理", str(await self.command_reply("/sudo list", message_id=200)))
+                self.assertIn("请求过多", str(await self.command_reply("/sudo list", message_id=201)))
+            self.assertEqual(str(await self.command_reply("/sudostop", message_id=202)),
+                             "当前没有等待回传的指令")
+            await self.bot.handle_event(self.group_message("/sudostop", message_id=202))
+            stop.assert_awaited_once()
+
+    async def test_sudo_recovers_registered_followup_after_initial_transport_timeout(self):
+        self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
+            frozenset({str(ABSENT)}), "bot-token", "plugin-token",
+        )))
+        self.enterContext(patch.object(self.sudo, "recent", self.sudo.recent.copy()))
+        self.enterContext(patch.object(self.sudo, "followup_tasks", {}))
+        self.sudo_followup_state.return_value = self.sudo.Reply("scheduled", "首轮正文", wait_seconds=30)
+        with patch.object(self.sudo, "submit", side_effect=TimeoutError) as submit, \
+             patch.object(self.sudo, "request_result", return_value=self.sudo.Reply("ok", "后续正文", sequence=1)):
+            self.assertIn("首轮正文", str(await self.command_reply("/sudo list", message_id=203)))
+            request_id = submit.await_args.args[1]["id"]
+            await asyncio.wait_for(asyncio.gather(*self.active_followup_tasks()), 2)
+        submit.assert_awaited_once()
+        self.sudo_followup_state.assert_awaited_once_with("bot-token", request_id, timeout=3)
+        self.assertIn("后续正文", str(self.send_group.await_args.kwargs["message"]))
+
     async def test_sudostop_reports_exact_count_and_cancels_only_the_returned_ids(self):
         self.enterContext(patch.object(self.sudo, "settings", SudoSettings(
             frozenset({str(ABSENT)}), "bot-token", "plugin-token",
@@ -1548,6 +1584,46 @@ commands:
         self.assertEqual(self.send_group.await_count, 2)
         for call in self.send_group.await_args_list:
             self.assertEqual(call.kwargs, {"group_id": GROUP, "message": message})
+
+    async def test_sudo_resends_undelivered_initial_output_before_later_frames(self):
+        initial = self.sudo.Reply("error", "首轮错误详情", wait_seconds=30)
+        request_id = "e" * 32
+        with patch.object(self.sudo.sudo, "send", side_effect=RuntimeError("OneBot unavailable")), \
+             patch.object(self.sudo, "request_result", return_value=self.sudo.Reply("ok", "后续正文", sequence=1)):
+            delivery = self.sudo.FollowupDelivery()
+            with self.assertRaises(RuntimeError):
+                await self.sudo.start_followup(self.bot, GROUP, "bot-token", request_id, initial, delivery)
+            await asyncio.wait_for(delivery.task, 2)
+        first, second = (str(call.kwargs["message"]) for call in self.send_group.await_args_list)
+        self.assertIn("首轮命令执行失败或无法确认结果。", first)
+        self.assertIn("首轮错误详情", first)
+        self.assertIn("后续正文", second)
+        self.confirm_sudo_followup.assert_awaited_once_with("bot-token", request_id, 1)
+
+    async def test_sudo_checks_stop_before_retrying_qq_text_or_file(self):
+        request_id = "f" * 32
+        initial = self.sudo.Reply("scheduled", wait_seconds=30)
+        self.sudo_followup_state.return_value = self.sudo.Reply("stopped")
+        for output in ("普通消息", "报告\n" * 11):
+            with self.subTest(output=output):
+                self.send_group.reset_mock(side_effect=True)
+                self.send_group.side_effect = RuntimeError("OneBot unavailable")
+                self.sudo_followup_state.reset_mock()
+                frame = self.sudo.Reply("ok", output, sequence=1, final=False)
+                with patch.object(self.sudo, "request_result", return_value=frame) as poll, \
+                     patch.object(self.sudo, "FOLLOWUP_RETRY_DELAY", 0), \
+                     patch.object(self.bot, "call_api", AsyncMock(side_effect=RuntimeError("upload failed"))) as upload:
+                    await asyncio.wait_for(self.sudo.deliver_followup(self.bot, GROUP, "bot-token", request_id,
+                                                                     initial, delivered_output=False), 2)
+                poll.assert_awaited_once()
+                self.sudo_followup_state.assert_awaited_once()
+                if "\n" in output:
+                    upload.assert_awaited_once()
+                    self.send_group.assert_not_awaited()
+                else:
+                    self.send_group.assert_awaited_once()
+                    upload.assert_not_awaited()
+                self.confirm_sudo_followup.assert_not_awaited()
 
     async def test_sudo_followup_retries_upload_and_reuses_a_confirmed_file(self):
         request_id = "b" * 32

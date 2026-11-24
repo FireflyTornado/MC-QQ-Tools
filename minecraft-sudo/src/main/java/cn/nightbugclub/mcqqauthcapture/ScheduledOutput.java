@@ -8,6 +8,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
@@ -17,6 +18,11 @@ public final class ScheduledOutput {
     static final int DIRECT_REPLY_WAIT_SECONDS = 30;
     private static final int MAX_EVENTS = 512;
     private static final Map<Object, Event> EVENTS = new IdentityHashMap<>();
+    private static final ScheduledThreadPoolExecutor POLLER = new ScheduledThreadPoolExecutor(2, task -> {
+        var thread = new Thread(task, "MCQQSudo output poll");
+        thread.setDaemon(true);
+        return thread;
+    });
     private static boolean pollingFutures;
 
     private record Event(ScheduledOutput owner, String cancellation, Future<?> future) {}
@@ -87,37 +93,59 @@ public final class ScheduledOutput {
                 EVENTS.put(eventId, new Event(event.owner(), event.cancellation(), future));
                 if (!pollingFutures) {
                     pollingFutures = true;
-                    scheduleFuturePoll();
+                    schedulePoll(ScheduledOutput::pollFutures);
                 }
             }
         }
     }
 
-    private static void scheduleFuturePoll() {
-        CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS).execute(ScheduledOutput::pollFutures);
+    static void schedulePoll(Runnable poll) {
+        POLLER.schedule(poll, 1, TimeUnit.SECONDS);
     }
 
     private static void pollFutures() {
+        Map<Object, Event> observed = new IdentityHashMap<>();
         synchronized (EVENTS) {
-            var settled = EVENTS.entrySet().stream()
-                    .filter(entry -> {
-                        var future = entry.getValue().future();
-                        return future != null && future.isDone();
-                    })
-                    .map(Map.Entry::getKey).toList();
-            for (Object task : settled) {
-                Event event = EVENTS.get(task);
-                if (event != null) {
-                    if (event.future().isCancelled()) {
-                        cancel(task);
-                    } else {
-                        completeTask(task, new IllegalStateException("Executor completed without running the task"));
-                    }
+            EVENTS.forEach((id, event) -> {
+                if (event.future() != null) {
+                    observed.put(id, event);
+                }
+            });
+        }
+        try {
+            observed.forEach(ScheduledOutput::pollFuture);
+        } finally {
+            synchronized (EVENTS) {
+                pollingFutures = EVENTS.values().stream().anyMatch(event -> event.future() != null);
+                if (pollingFutures) {
+                    schedulePoll(ScheduledOutput::pollFutures);
                 }
             }
-            pollingFutures = EVENTS.values().stream().anyMatch(event -> event.future() != null);
-            if (pollingFutures) {
-                scheduleFuturePoll();
+        }
+    }
+
+    private static void pollFuture(Object id, Event event) {
+        boolean cancelled;
+        try {
+            if (!event.future().isDone()) {
+                return;
+            }
+            cancelled = event.future().isCancelled();
+        } catch (RuntimeException | LinkageError | AssertionError unsupported) {
+            synchronized (EVENTS) {
+                if (EVENTS.get(id) == event) {
+                    var owner = event.owner();
+                    owner.complete = false;
+                    owner.output.appendFollowupLine("无法观察后台任务是否完成，输出采集可能不完整。");
+                    EVENTS.put(id, new Event(owner, event.cancellation(), null));
+                }
+            }
+            return;
+        }
+        synchronized (EVENTS) {
+            if (EVENTS.get(id) == event) {
+                completeTask(id, cancelled ? new CancellationException()
+                        : new IllegalStateException("Executor completed without running the task"));
             }
         }
     }

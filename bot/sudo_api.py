@@ -24,6 +24,7 @@ from sudo_config import (
     SUDO_TIMEOUT,
     SUDO_WS_PATH,
     SudoSettings,
+    is_elapsed_ms,
     is_single_command,
 )
 
@@ -399,6 +400,7 @@ def sudo_router(
                 sequence = result.get("sequence")
                 final = result.get("final", True)
                 request_id = result.get("id")
+                elapsed_ms = result.get("elapsed_ms")
                 if (
                     type(is_followup) is not bool or not isinstance(request_id, str)
                     or not isinstance(status, str)
@@ -410,6 +412,7 @@ def sudo_router(
                         or not 1 <= sequence <= MAX_FOLLOWUP_FRAMES))
                     or (("final" in result) != ("sequence" in result))
                     or type(final) is not bool
+                    or (elapsed_ms is not None and not is_elapsed_ms(elapsed_ms))
                     or not isinstance(output, str) or len(output) > MAX_RESULT_BYTES
                     or any(0xD800 <= ord(char) <= 0xDFFF for char in output)
                     or len(output.encode("utf-8")) > MAX_RESULT_BYTES or type(truncated) is not bool
@@ -417,6 +420,9 @@ def sudo_router(
                     await websocket.close(code=1007)
                     break
                 reply = {"status": status, "output": output}
+                # An explicit null means execution never started. Legacy frames omit elapsed_ms.
+                if "elapsed_ms" in result:
+                    reply["elapsed_ms"] = elapsed_ms
                 if truncated:
                     reply["truncated"] = True
                 if is_followup:

@@ -147,6 +147,13 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
             self.result(incoming, request["id"], output, truncated=True)
             self.assertEqual(await first, (200, {"status": "ok", "output": output, "truncated": True}))
 
+    async def test_forwards_explicitly_unstarted_result(self):
+        async with self.connect() as (_, incoming, outgoing):
+            first = asyncio.create_task(self.submit())
+            request = json.loads((await asyncio.wait_for(outgoing.get(), 2))["text"])
+            self.result(incoming, request["id"], "", status="rejected", elapsed_ms=None)
+            self.assertEqual(await first, (200, {"status": "rejected", "output": "", "elapsed_ms": None}))
+
     async def test_permission_and_single_command_validation(self):
         self.assertEqual((await self.submit(qq_id="102"))[0], 403)
         self.assertEqual((await self.submit(group_id="303"))[0], 403)
@@ -169,13 +176,16 @@ class SudoApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.connect() as (_, incoming, outgoing):
             initial = asyncio.create_task(self.submit())
             await asyncio.wait_for(outgoing.get(), 2)
-            self.result(incoming, request_id, "initial output", status="partial", wait_seconds=30)
+            self.result(incoming, request_id, "initial output", status="partial", wait_seconds=30, elapsed_ms=40)
             reply = await initial
-            self.result(incoming, request_id, "terminal output", followup=True, sequence=1, final=True)
+            self.assertEqual(reply[1]["elapsed_ms"], 40)
+            self.result(incoming, request_id, "terminal output", followup=True, sequence=1, final=True, elapsed_ms=1250)
             self.assertEqual((await self.http("GET", f"{path}/state", "plugin-token"))[0], 401)
             self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), reply)
             frame = await self.http("GET", path, "bot-token", query=b"after=0")
             self.assertEqual(frame[1]["output"], "terminal output")
+            self.assertEqual(frame[1]["elapsed_ms"], 1250)
+            self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=0"), frame)
             self.assertEqual(await self.http("GET", f"{path}/state", "bot-token"), reply)
             self.assertEqual(await self.http("GET", path, "bot-token", query=b"after=1"),
                              (200, {"status": "closed"}))

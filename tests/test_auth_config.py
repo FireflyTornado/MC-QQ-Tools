@@ -984,9 +984,9 @@ import message_config
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter
 assert Path.cwd() == before
-assert message_config.MESSAGES.text("commands.help.message") == "configured"
+assert message_config.MESSAGES.text("commands.help.message.main") == "configured"
 message_config.MESSAGE_FILE.unlink()
-assert message_config.MESSAGES.text("commands.help.message") == "configured"
+assert message_config.MESSAGES.text("commands.help.message.main") == "configured"
 assert nonebot.get_driver().config.target_group_id == 98765
 assert mc_api.app.state.auth.target_group == "98765"
 adapter = nonebot.get_adapter(Adapter)
@@ -1095,8 +1095,12 @@ async def exercise(port):
     ):
         await qq_bot.handle_event(event("/help", 1))
         help_text = initial.call_args.kwargs["message"].extract_plain_text()
-        assert all(command in help_text for command in ("/sudo", "/sudostop", "/ping", "/info"))
-        assert "/bind " not in help_text and "/reconcile" not in help_text
+        help_lines = help_text.splitlines()
+        assert "sudo 用户专用" in help_lines
+        for command in ("/bind ", "/reconcile "):
+            assert any(command in line and line.endswith("（未启用）") for line in help_lines)
+        for command in ("/sudo ", "/sudostop ", "/ping ", "/info "):
+            assert any(command in line and not line.endswith("（未启用）") for line in help_lines)
         initial.reset_mock()
         await qq_bot.handle_event(event("/ping", 2))
         assert "HTTP 200" in initial.call_args.kwargs["message"].extract_plain_text()
@@ -1112,19 +1116,23 @@ async def exercise(port):
             request = json.loads(await asyncio.wait_for(mod.recv(), 2))
             assert request["command"] == "list" and request["stream_followup"] is True
             request_id = request["id"]
-            await mod.send(json.dumps({"id": request_id, "status": "ok", "output": "", "wait_seconds": 30}))
+            await mod.send(json.dumps({"id": request_id, "status": "ok", "output": "", "wait_seconds": 30,
+                                       "elapsed_ms": 42}))
             await asyncio.wait_for(command, 2)
-            assert "正在执行..." in str(initial.call_args.kwargs["message"])
-            assert request_id in str(initial.call_args.kwargs["message"])
+            assert str(initial.call_args.kwargs["message"]) == (
+                f"正在执行...\\n编号：{request_id[:6]}，时间：0.04 s"
+            )
             tasks = tuple(delivery.task for delivery in qq_sudo.followup_tasks.values())
             assert len(tasks) == 1
             await mod.send(json.dumps({
                 "id": request_id, "status": "ok", "output": "Delayed command output",
-                "followup": True, "sequence": 1, "final": True,
+                "followup": True, "sequence": 1, "final": True, "elapsed_ms": 12380,
             }))
             await asyncio.wait_for(asyncio.gather(*tasks), 3)
             delayed.assert_awaited_once()
-            assert f"指令后续回执 {request_id}\\nDelayed command output" == str(delayed.call_args.kwargs["message"])
+            assert str(delayed.call_args.kwargs["message"]) == (
+                f"Delayed command output\\n编号：{request_id[:6]}，时间：12.38 s"
+            )
 
             waiting = asyncio.create_task(qq_bot.handle_event(event("/sudo list", 5)))
             pending = json.loads(await asyncio.wait_for(mod.recv(), 2))

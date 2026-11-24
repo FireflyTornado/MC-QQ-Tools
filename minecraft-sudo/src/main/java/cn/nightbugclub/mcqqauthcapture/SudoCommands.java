@@ -110,7 +110,11 @@ final class SudoCommands {
         CompletableFuture<Boolean> complete;
         dispatching = true;
         try {
-            dispatched = server.dispatchCommand(feedback.sender(), command);
+            var sender = feedback.sender();
+            if (scheduled != null) {
+                scheduled.markDispatchStarted();
+            }
+            dispatched = server.dispatchCommand(sender, command);
         } catch (RuntimeException | Error failure) {
             if (scheduled != null) {
                 scheduled.markDispatchFailure();

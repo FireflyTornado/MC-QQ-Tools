@@ -21,6 +21,11 @@ MOD_TOKEN_KEY = "MC_SUDO_MOD_TOKEN"
 LEGACY_MOD_TOKEN_KEY = "MC_SUDO_PLUGIN_TOKEN"
 
 
+def is_elapsed_ms(value: object) -> bool:
+    # The Mod converts a signed nanosecond duration to milliseconds.
+    return type(value) is int and 0 <= value <= (2**63 - 1) // 1_000_000
+
+
 @dataclass(frozen=True)
 class SudoOutputSettings:
     line_threshold: int = 10

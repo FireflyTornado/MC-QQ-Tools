@@ -44,7 +44,7 @@ Bot 和 FastAPI 使用同一组组件开关，修改后重启两个进程。未�
 
 启用授权时，群成员对账在 OneBot 连接成功后自动执行。配置在 `SUPERUSERS` JSON 数组中的超级用户可在目标群使用 `/授权对账` 或 `/reconcile` 触发对账。群详情交叉校验依赖当前 Compose 固定的 NapCat 所提供的 `get_group_detail_info`。名单请求失败、为空、两次名单不一致或人数校验失败时，对账跳过撤权。
 
-`/帮助`（`/help`）、`/认证测试`（`/ping`）和 `/信息`（`/info`）是共用指令。帮助按启用的组件显示指令，`/ping` 返回本机 FastAPI 的健康接口状态码与耗时，`/info` 供 `SUPERUSERS` 查看状态图。状态图显示 Bot 账号、采集时间、系统资源和服务链路。授权启用时才读取 SQLite，显示有效绑定数和封禁记录数。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
+`/帮助`（`/help`）、`/认证测试`（`/ping`）和 `/信息`（`/info`）是共用指令。默认帮助始终显示授权和共用指令，授权关闭时在相应行末标注「未启用」。Sudo 启用时在末尾显示 Sudo 指令。`/ping` 返回本机 FastAPI 的健康接口状态码与耗时，`/info` 供 `SUPERUSERS` 查看状态图。状态图显示 Bot 账号、采集时间、系统资源和服务链路。授权启用时才读取 SQLite，显示有效绑定数和封禁记录数。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
 
 封禁记录数包括所有仍有效的游戏服封禁。存在无名 UUID 封禁时，SQLite 节点下方会显示其数量。服务器优先使用具名封禁，使 Bot 能按游戏名同步绑定状态。封禁同步所需的数据库结构在 v1 升至 v2 时一次迁移完成。Minecraft 插件在启动时上报完整封禁快照。
 
@@ -81,7 +81,14 @@ commands:
     success: "已绑定 Minecraft ID：{mc_name}"
     banned_name: "游戏 ID {mc_name} 已被封禁，暂时无法绑定。"
   help:
-    message: "发送 /bind 游戏ID 绑定账号，发送 /binding 查询。"
+    message:
+      main: |-
+        发送 /bind 游戏ID 绑定账号{auth_enabled}
+        发送 /binding 查询{auth_enabled}
+      sudo: |-
+        sudo 用户专用
+        发送 /sudo <Minecraft 指令> 执行指令{sudo_enabled}
+        发送 /sudostop 停止等待回传{sudo_enabled}
 info:
   title: "社区授权状态 · 群 {group_id}"
   labels:
@@ -93,8 +100,7 @@ info:
 
 中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。通用变量 `{group_id}` 和 `{bot_qq}` 分别是目标群号和机器人 QQ 号，可用于所有文字文案，包括状态图的标题和标签。业务变量的含义和可用字段见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。可用变量在本次渲染时缺少实际值会显示为 `—`。指令权限继续由目标群和 `SUPERUSERS` 控制。
 
-授权启用时，帮助正文继续使用原有的 `commands.help.message`。授权关闭时使用 `commands.help.shared` 展示共用命令。启用远程指令时，帮助末尾追加 `commands.help.sudo`。请将自定义的 `/sudo` 说明写在 `commands.help.sudo`，使它随组件开关显示。
-帮助正文与 `/sudo` 说明各自校验文案长度，随后合成一条群消息发送。
+`commands.help.message.main` 始终显示。授权指令行末可放 `{auth_enabled}`，授权关闭时会显示 `（未启用）`。Bot 启用 Sudo 时追加 `commands.help.message.sudo`，此时 `{sudo_enabled}` 为空。旧版字符串形式的 `commands.help.message` 仍作为正文读取。如果旧正文包含 Sudo 指令，将这些行移入 `message.sudo`，其余正文放入 `message.main`。更早版本的 `commands.help.shared` 和 `commands.help.sudo` 中要保留的说明也可移入对应的新字段。希望使用新版默认帮助时，删除整个 `commands.help` 自定义配置即可。
 
 已有绑定时，`/绑定` 统一使用 `commands.bind.already_bound`，默认提示如需更换请先使用 `/解绑`。旧配置里的 `commands.bind.frozen` 和 `commands.bind.pending` 可以删除。`/解绑` 和 `/我的绑定` 仍可显示冻结或待核实状态。
 
@@ -373,10 +379,13 @@ banlist-watch:
 默认关闭。启用时，在 Bot 和 FastAPI 共用的 `bot/.env` 的远程指令段设置以下变量。群号取公共配置中的 `TARGET_GROUP_ID`，账号名单与 `SUPERUSERS` 独立。
 
 ```dotenv
+MC_SUDO_ENABLED=true
 MC_SUDO_QQ_IDS=["123456789"]
 MC_SUDO_BOT_TOKEN=REPLACE_WITH_MC_SUDO_BOT_TOKEN
 MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 ```
+
+如果只在 FastAPI 进程环境中设置 `MC_SUDO_MOD_TOKEN`，请将共享 `bot/.env` 中的同名占位配置注释掉。
 
 把两个 Token 分别替换为独立的随机值，并与授权、通知、封禁名单上报和 OneBot 的凭据区分。Auth 停用时，Sudo 仍会检查已配置的封禁名单 Token。Bot 用 `MC_SUDO_BOT_TOKEN` 向 FastAPI 提交指令、读取后续回执和结束等待，固定使用回环地址 `127.0.0.1:18765`。模组的 `sudo.token` 对应 `MC_SUDO_MOD_TOKEN`，按进程配置时可只在 FastAPI 服务环境中设置后者。旧部署可沿用 `MC_SUDO_PLUGIN_TOKEN` 的同一值，也可以只改键名。Bot 启用 Sudo 时也会校验自身环境中已配置的 Mod Token。两个键同时设置时值必须一致。反代只为游戏主机增加 `/internal/mc/sudo/ws` 的 WSS 路由，转发 Upgrade、Authorization 和 `X-MCQQSudo-Capabilities` 请求头，尽可能限制到游戏主机的来源地址。将 `/internal/mc/sudo/submit`、`/internal/mc/sudo/followup/` 和 `/internal/mc/sudo/stop` 留在回环地址。FastAPI 继续使用单 worker，两个主机应同步时钟，时差控制在一秒内。
 
@@ -386,7 +395,7 @@ MC_SUDO_MOD_TOKEN=REPLACE_WITH_MC_SUDO_MOD_TOKEN
 mvn -B -ntp -f minecraft-sudo/pom.xml clean verify
 ```
 
-产物是 `minecraft-sudo/target/MCQQSudo-0.3.2.jar`，包含指令通道、输出收集器和 Forge 异步输出转换器。Forge 加载 ID 为 `mcqqsudo`。升级时先停服，移出原 MCQQSudo JAR 和已安装的 `MCQQSudo-Transformer-*.jar`，然后将新 JAR 放入 `mods/`。原有 `config/mcqqsudo/` 可直接沿用。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
+产物是 `minecraft-sudo/target/MCQQSudo-0.3.3.jar`，包含指令通道、输出收集器和 Forge 异步输出转换器。Forge 加载 ID 为 `mcqqsudo`。升级时先停服，移出原 MCQQSudo JAR 和已安装的 `MCQQSudo-Transformer-*.jar`，然后将新 JAR 放入 `mods/`。原有 `config/mcqqsudo/` 可直接沿用。MCQQAuth 授权插件可按需安装。新安装时会创建 `config/mcqqsudo/config.yml` 和同目录的 `sudo-allowlist.txt`。配置默认关闭。将 `MC_SUDO_MOD_TOKEN` 的值填入 `sudo.token` 并设置 WSS 地址，修改后重启游戏服生效。
 
 ```yaml
 sudo:
@@ -429,7 +438,7 @@ Forge 在启动时从 MCQQSudo JAR 注册转换器，再直接挂载其中的主
 
 线程池的队列维护、关闭操作和拒绝策略沿用 JDK 原生行为。有明确的任务取消、执行结束或提交异常时，采集器据此结清回执。`shutdownNow()` 返回的工作项如果随后在备用执行器上运行，输出仍归原请求。第三方静默丢弃或直接移除任务时，如果一直没有可确认的终态，回执会等到最长一小时的后台采集窗口到期。
 
-插件用自有线程、线程池或回调时，将 `MCQQSudo-0.3.2-game.jar` 作为编译期依赖。运行 `mvn -B -ntp -f minecraft-sudo/pom.xml clean install` 后，可声明 Maven 依赖 `cn.nightbugclub:MCQQSudo:0.3.2`，设置 `classifier` 为 `game`、`scope` 为 `provided`。已下载发布包时，也可从外层 JAR 的 `META-INF/mcqqsudo/` 提取该文件并加入编译类路径。游戏服的 `mods/` 只安装外层发布 JAR。
+插件用自有线程、线程池或回调时，将 `MCQQSudo-0.3.3-game.jar` 作为编译期依赖。运行 `mvn -B -ntp -f minecraft-sudo/pom.xml clean install` 后，可声明 Maven 依赖 `cn.nightbugclub:MCQQSudo:0.3.3`，设置 `classifier` 为 `game`、`scope` 为 `provided`。已下载发布包时，也可从外层 JAR 的 `META-INF/mcqqsudo/` 提取该文件并加入编译类路径。游戏服的 `mods/` 只安装外层发布 JAR。
 
 在任务提交点使用 `cn.nightbugclub.mcqqauthcapture.CommandOutputContext.wrap(Runnable)` 或 `wrap(Consumer<T>)`。每次包装绑定一次调用，普通玩家或控制台触发的任务仍按原逻辑执行。若提交失败或任务在开始前取消，请调用包装对象的 `close()` 解除回传等待。此方法只解除关联，实际取消仍由插件的调度器处理。
 
@@ -465,7 +474,9 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 
 游戏服未确认清理时，再次发送 `/sudostop` 可重试同一连接上的待清理请求。群回执按本次新停止的请求数计算。
 
-可在 `bot/.env` 的远程指令段调整输出发送方式。阈值只按输出正文判断，请求编号和状态提示不计入。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
+群内的 `/sudo` 回执和 TXT 末尾会显示 `编号：a1b2c3，时间：12.38 s`。编号取原请求编号的前六位，文件名也使用这个短编号。时间从游戏服开始执行指令时起算，每批回执记录各自的时间，重试沿用原值。确认指令未开始时显示「未执行」，未收到计时数据时显示「未知」。显示耗时需要 Bot、FastAPI 和游戏服 Mod 都支持计时。
+
+可在 `bot/.env` 的远程指令段调整输出发送方式。阈值只按输出正文判断，请求编号、耗时和状态提示不计入。超过任一阈值就转为 TXT，恰好等于阈值时仍可直接发文本。
 
 | 配置 | 默认 | 判断方式 |
 | --- | --- | --- |
@@ -473,7 +484,7 @@ CommandOutputContext.whenComplete(report, (data, failure) -> {
 | `MC_SUDO_FILE_LINE_CHAR_THRESHOLD` | `0` | 任意一行的字符数，0 表示关闭该判断。 |
 | `MC_SUDO_TEXT_MAX_CHARS` | `1500` | 单条输出正文的总字符数，包含换行。最小值为 1。 |
 
-TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带请求编号的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在文件末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod。Bot 和 FastAPI 共用 Sudo 启用判定，修改这三个阈值后重启两项服务。
+TXT 通过 NapCat 的 `upload_group_file` 发送到群内。首轮文件上传最多等待 20 秒，期间 Bot 占用指令处理名额。补发文件在 20 秒内最多尝试三次，失败或未获确认时改发带编号和时间的文本，并保留完成或超时状态。Mod 在接收命令反馈时限制累积大小。超过 64 KiB 时，保留由完整字符组成的原文前缀，并在正文末尾标注截断，标注也计入 64 KiB。编码后的回执另有 512 KiB 上限。首次部署此功能需要更新 Bot、FastAPI 和游戏服 Mod。Bot 和 FastAPI 共用 Sudo 启用判定，修改这三个阈值后重启两项服务。
 
 每次提交一条纯文本命令。在机器人发出结果前，新的请求会收到忙碌提示。Bot 在同一进程内保留消息 ID 5 分钟，忙碌时拒绝的指令也会登记，以忽略 OneBot 重投。去重缓存满时，Bot 暂停接收新指令，最后一次因容量拒绝的消息再过 5 分钟才恢复接收。等待满 30 秒会回复「执行超时，结果未知」。若 API 先检测到游戏端指令连接断开且仍在等回执，Bot 会立即回复「指令通道已断开，执行结果未知」，回复后释放名额。两种情况下，已经开始的指令仍可能完成，机器人不会自动重发。Bot 和 FastAPI 日志可按请求编号关联群号、QQ 号、命令和回执。可在 Bot 和 FastAPI 的配置中设 `MC_SUDO_ENABLED=false` 后重启两者。将 Mod 的 `sudo.enabled` 改为 `false` 后重启游戏服也可关闭游戏端指令通道。
 

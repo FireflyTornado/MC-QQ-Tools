@@ -412,17 +412,22 @@ class SudoChannelTest {
             var ack = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals("error", ack.get("status").getAsString());
             assertEquals(30, ack.get("wait_seconds").getAsInt());
+            long initialElapsed = ack.get("elapsed_ms").getAsLong();
+            assertTrue(initialElapsed >= 0);
             var expiry = fixture.takeNext(30, SECONDS);
+            MILLISECONDS.sleep(20);
             CompletableFuture.runAsync(lateReply.get()).get(2, SECONDS);
             fixture.runNext(1, SECONDS);
             var update = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals(ack.get("id"), update.get("id"));
             assertEquals(1, update.get("sequence").getAsInt());
             assertEquals("Late report\n", update.get("output").getAsString());
+            assertTrue(update.get("elapsed_ms").getAsLong() >= initialElapsed + 10);
             expiry.action().run();
             fixture.terminalReplies.remove().run();
             var terminal = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertTrue(terminal.get("final").getAsBoolean());
+            assertTrue(terminal.get("elapsed_ms").getAsLong() >= update.get("elapsed_ms").getAsLong());
 
             peer.send(2, true);
             fixture.tasks.remove().run();
@@ -436,6 +441,7 @@ class SudoChannelTest {
             var unavailable = JsonParser.parseString(frames.poll(2, SECONDS)).getAsJsonObject();
             assertEquals("error", unavailable.get("status").getAsString());
             assertNull(unavailable.get("wait_seconds"));
+            assertTrue(unavailable.get("elapsed_ms").isJsonNull());
             verify(server, never()).dispatchCommand(any(), eq("test3"));
         }
     }

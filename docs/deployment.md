@@ -44,7 +44,7 @@ Bot 和 FastAPI 使用同一组组件开关，修改后重启两个进程。未�
 
 启用授权时，群成员对账在 OneBot 连接成功后自动执行。配置在 `SUPERUSERS` JSON 数组中的超级用户可在目标群使用 `/授权对账` 或 `/reconcile` 触发对账。群详情交叉校验依赖当前 Compose 固定的 NapCat 所提供的 `get_group_detail_info`。名单请求失败、为空、两次名单不一致或人数校验失败时，对账跳过撤权。
 
-`/帮助`（`/help`）、`/认证测试`（`/ping`）和 `/信息`（`/info`）是共用指令。帮助按启用的组件显示指令，`/ping` 返回本机 FastAPI 的健康接口状态码与耗时，`/info` 供 `SUPERUSERS` 查看状态图。状态图显示 Bot 账号、采集时间、系统资源和服务链路。授权启用时才读取 SQLite，显示有效绑定数和封禁记录数。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
+`/帮助`（`/help`）、`/认证测试`（`/ping`）和 `/信息`（`/info`）是共用指令。默认帮助始终列出全部指令，并在未启用模块的指令行末标注「未启用」。`/ping` 返回本机 FastAPI 的健康接口状态码与耗时，`/info` 供 `SUPERUSERS` 查看状态图。状态图显示 Bot 账号、采集时间、系统资源和服务链路。授权启用时才读取 SQLite，显示有效绑定数和封禁记录数。采集时间使用 Bot 服务器的当地时间并标注 UTC 偏移。磁盘优先统计 `/opt`，缺失时统计根目录。
 
 封禁记录数包括所有仍有效的游戏服封禁。存在无名 UUID 封禁时，SQLite 节点下方会显示其数量。服务器优先使用具名封禁，使 Bot 能按游戏名同步绑定状态。封禁同步所需的数据库结构在 v1 升至 v2 时一次迁移完成。Minecraft 插件在启动时上报完整封禁快照。
 
@@ -81,7 +81,9 @@ commands:
     success: "已绑定 Minecraft ID：{mc_name}"
     banned_name: "游戏 ID {mc_name} 已被封禁，暂时无法绑定。"
   help:
-    message: "发送 /bind 游戏ID 绑定账号，发送 /binding 查询。"
+    message: |-
+      发送 /bind 游戏ID 绑定账号{auth_enabled}
+      发送 /binding 查询{auth_enabled}
 info:
   title: "社区授权状态 · 群 {group_id}"
   labels:
@@ -93,8 +95,7 @@ info:
 
 中文和英文别名共用 `commands` 下的字段。使用 `|-` 编写多行回复，使用 `{{` 和 `}}` 显示字面花括号。通用变量 `{group_id}` 和 `{bot_qq}` 分别是目标群号和机器人 QQ 号，可用于所有文字文案，包括状态图的标题和标签。业务变量的含义和可用字段见模板注释。`{member}` 在欢迎语中生成对新成员的 QQ @。其他动态值和配置文案均作为纯文本发送。可用变量在本次渲染时缺少实际值会显示为 `—`。指令权限继续由目标群和 `SUPERUSERS` 控制。
 
-授权启用时，帮助正文继续使用原有的 `commands.help.message`。授权关闭时使用 `commands.help.shared` 展示共用命令。启用远程指令时，帮助末尾追加 `commands.help.sudo`。请将自定义的 `/sudo` 说明写在 `commands.help.sudo`，使它随组件开关显示。
-帮助正文与 `/sudo` 说明各自校验文案长度，随后合成一条群消息发送。
+帮助正文统一使用 `commands.help.message`。授权指令行末可放 `{auth_enabled}`，远程指令行末可放 `{sudo_enabled}`。对应模块启用时占位符为空，未启用时显示 `（未启用）`。已有 `messages.yml` 时，可将旧 `commands.help.shared` 和 `commands.help.sudo` 中要保留的说明移入 `commands.help.message`，再删除旧字段。希望使用新版默认帮助时，删除整个 `commands.help` 自定义配置即可。
 
 已有绑定时，`/绑定` 统一使用 `commands.bind.already_bound`，默认提示如需更换请先使用 `/解绑`。旧配置里的 `commands.bind.frozen` 和 `commands.bind.pending` 可以删除。`/解绑` 和 `/我的绑定` 仍可显示冻结或待核实状态。
 

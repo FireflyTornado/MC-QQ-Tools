@@ -86,24 +86,19 @@ DEFAULTS = MappingProxyType({
     "commands.db.error": "绑定数据库操作失败，请稍后重试。",
     "commands.help.message": (
         "[MC-QQ-Tools] 指令帮助\n"
-        "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID\n"
-        "/我的绑定 或 /binding · 查询自己的绑定\n"
-        "/解绑 或 /unbind · 撤销自己的绑定\n"
+        "/绑定 游戏ID 或 /bind 游戏ID · 绑定 Minecraft 游戏 ID{auth_enabled}\n"
+        "/我的绑定 或 /binding · 查询自己的绑定{auth_enabled}\n"
+        "/解绑 或 /unbind · 撤销自己的绑定{auth_enabled}\n"
         "/认证测试 或 /ping · 检查 API\n"
         "/帮助 或 /help · 显示本帮助\n"
         "超级用户专用\n"
         "/信息 或 /info · 查看状态图片\n"
-        "/授权对账 或 /reconcile · 核对群成员与授权\n"
-        "/db · 手动添加、删除或查询绑定"
+        "/授权对账 或 /reconcile · 核对群成员与授权{auth_enabled}\n"
+        "/db · 手动添加、删除或查询绑定{auth_enabled}\n"
+        "指定 QQ 号专用\n"
+        "/sudo <Minecraft 指令> · 执行并回显{sudo_enabled}\n"
+        "/sudostop · 停止所有等待中的回传{sudo_enabled}"
     ),
-    "commands.help.shared": (
-        "指令帮助\n"
-        "/认证测试 或 /ping · 检查 API\n"
-        "/帮助 或 /help · 显示本帮助\n"
-        "/信息 或 /info · 查看状态图片（超级用户专用）"
-    ),
-    "commands.help.sudo": "/sudo <Minecraft 指令> · 执行并回显（指定 QQ 号专用）\n"
-                          "/sudostop · 停止所有等待中的回传",
     "commands.info.busy": "状态图正在生成，请稍后重试。",
     "commands.info.error": "状态图暂不可用，请稍后重试。",
     "info.title": "MC-QQ-Tools",
@@ -155,6 +150,7 @@ BUSINESS_FIELDS = {
     "commands.ping.timeout": {"latency_ms"},
     "commands.ping.connection_error": {"latency_ms"},
     "commands.ping.error": {"latency_ms"},
+    "commands.help.message": {"auth_enabled", "sudo_enabled"},
     "commands.reconcile.success": {"count"},
     "commands.db.not_member": MEMBER_FIELDS,
     "commands.db.members_unverified": MEMBER_FIELDS,

@@ -24,7 +24,8 @@ public final class CommandOutputContext {
     public static <T> CompletableFuture<T> supplyAsync(Supplier<T> action, Executor executor) {
         Objects.requireNonNull(action);
         Objects.requireNonNull(executor);
-        return registerStage(event -> CompletableFuture.supplyAsync(() -> ScheduledOutput.call(event, action),
+        return registerStage((event, settled) -> CompletableFuture.supplyAsync(
+                () -> ScheduledOutput.callStage(event, action, settled),
                 ExecutorOutput.observeExecutor(event, executor)));
     }
 
@@ -33,8 +34,8 @@ public final class CommandOutputContext {
                                                       BiConsumer<? super T, ? super Throwable> callback) {
         Objects.requireNonNull(stage);
         Objects.requireNonNull(callback);
-        return registerStage(event -> stage.whenComplete((value, failure) ->
-                ScheduledOutput.runCompletion(event, () -> callback.accept(value, failure), failure)));
+        return registerStage((event, settled) -> stage.whenComplete((value, failure) ->
+                ScheduledOutput.runStageCompletion(event, () -> callback.accept(value, failure), settled, failure)));
     }
 
     /** Runs the completion callback on the supplied executor with the request that registered it. */
@@ -44,49 +45,64 @@ public final class CommandOutputContext {
         Objects.requireNonNull(stage);
         Objects.requireNonNull(callback);
         Objects.requireNonNull(executor);
-        return registerStage(event -> stage.whenCompleteAsync((value, failure) ->
-                ScheduledOutput.runCompletion(event, () -> callback.accept(value, failure), failure),
+        return registerStage((event, settled) -> stage.whenCompleteAsync((value, failure) ->
+                ScheduledOutput.runStageCompletion(event, () -> callback.accept(value, failure), settled, failure),
                 ExecutorOutput.observeExecutor(event, executor)));
     }
 
     /** Keeps the current request open until the stage settles. Returns the original stage. */
     public static <S extends CompletionStage<?>> S track(S stage) {
         Objects.requireNonNull(stage);
-        return registerStage(ignored -> stage);
+        return registerStage((event, settled) -> stage);
     }
 
     @FunctionalInterface
     interface StageRegistration<S, E extends Throwable> {
-        S start(Object event) throws E;
+        S start(Object event, CompletableFuture<Throwable> settled) throws E;
     }
 
-    private static <S extends CompletionStage<?>> S registerStage(StageRegistration<S, RuntimeException> start) {
-        return registerStage(start, null);
-    }
-
-    static <S extends CompletionStage<?>, E extends Throwable> S registerStage(StageRegistration<S, E> start,
-                                                                               CompletableFuture<Throwable> settled) throws E {
+    static <S extends CompletionStage<?>, E extends Throwable> S registerStage(StageRegistration<S, E> start) throws E {
+        var owner = OutputCapture.scheduledOutput();
         var event = new Object();
+        var settled = new CompletableFuture<Throwable>();
         boolean tracked = ScheduledOutput.registerTask(event);
+        S stage;
         try {
-            S stage = start.start(event);
-            if (tracked) {
-                stage.whenComplete((value, failure) -> completeStage(event, settled, failure));
-            }
-            return stage;
+            stage = start.start(event, settled);
         } catch (Throwable failure) {
             if (tracked) {
                 completeStage(event, settled, failure);
             }
             throw failure;
         }
+        if (tracked) {
+            observeStage(stage, owner, event, settled);
+        }
+        return stage;
+    }
+
+    private static void observeStage(CompletionStage<?> stage, ScheduledOutput owner, Object event,
+                                     CompletableFuture<Throwable> settled) {
+        BiConsumer<Object, Throwable> observer = (value, failure) -> completeStage(event, settled, failure);
+        try {
+            stage.whenComplete(observer);
+        } catch (RuntimeException | LinkageError failure) {
+            try {
+                CompletableFuture<?> future = stage.toCompletableFuture();
+                // If the stage rejects whenComplete itself, try a standard view of its result.
+                (future == stage ? future.copy() : future).whenComplete(observer);
+            } catch (RuntimeException | LinkageError unsupported) {
+                if (!settled.isDone()) {
+                    owner.output().appendFollowupLine("无法观察后台阶段是否完成，输出采集可能不完整。");
+                    completeStage(event, settled, failure);
+                }
+            }
+        }
     }
 
     private static void completeStage(Object event, CompletableFuture<Throwable> settled, Throwable failure) {
         ScheduledOutput.completeTask(event, failure);
-        if (settled != null) {
-            settled.complete(failure);
-        }
+        settled.complete(failure);
     }
 
     public static final class Task implements Runnable, AutoCloseable {

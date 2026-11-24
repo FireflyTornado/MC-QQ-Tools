@@ -43,14 +43,13 @@ public final class StageOutput {
             return (CompletionStage<?>) original.invokeWithArguments(arguments);
         }
 
-        var settled = new CompletableFuture<Throwable>();
-        return CommandOutputContext.registerStage(event -> {
+        return CommandOutputContext.registerStage((event, settled) -> {
             arguments[callbackIndex] = wrap(original.type().parameterType(callbackIndex), callback, event, settled);
             if (arguments.length == callbackIndex + 2) {
                 arguments[callbackIndex + 1] = ExecutorOutput.observeExecutor(event, (Executor) arguments[callbackIndex + 1]);
             }
             return (CompletionStage<?>) original.invokeWithArguments(arguments);
-        }, settled);
+        });
     }
 
     private static boolean jdkStage(Object receiver) {

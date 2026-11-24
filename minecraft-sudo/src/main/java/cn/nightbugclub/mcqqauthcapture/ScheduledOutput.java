@@ -151,23 +151,28 @@ public final class ScheduledOutput {
     }
 
     public static void run(Object event, Runnable callback) {
-        runCompletion(event, callback, null);
-    }
-
-    static void runCompletion(Object event, Runnable callback, Throwable upstreamFailure) {
         call(event, () -> {
             callback.run();
             return null;
-        }, upstreamFailure);
-    }
-
-    static <T> T call(Object event, Supplier<T> callback) {
-        return call(event, callback::get, null);
+        }, null);
     }
 
     static <T> T callStage(Object event, Supplier<T> callback, CompletableFuture<Throwable> settled) {
+        return callStage(event, callback, settled, null);
+    }
+
+    static void runStageCompletion(Object event, Runnable callback, CompletableFuture<Throwable> settled,
+                                   Throwable upstreamFailure) {
+        callStage(event, () -> {
+            callback.run();
+            return null;
+        }, settled, upstreamFailure);
+    }
+
+    private static <T> T callStage(Object event, Supplier<T> callback, CompletableFuture<Throwable> settled,
+                                   Throwable upstreamFailure) {
         // In thenCompose the callback can return before its dependent stage finishes.
-        return call(event, callback::get, null, (registered, captured) -> {
+        return call(event, callback::get, upstreamFailure, (registered, captured) -> {
             // A pending mod stage must be able to outlive an expired request without retaining it.
             var request = new WeakReference<>(registered.owner());
             String cancellation = registered.cancellation();
@@ -175,7 +180,7 @@ public final class ScheduledOutput {
                 var owner = request.get();
                 if (owner != null) {
                     boolean cancelled = isCancellation(failure);
-                    if (cancelled) {
+                    if (cancelled && !isCancellation(upstreamFailure)) {
                         owner.output.appendFollowupLine(cancellation);
                     }
                     owner.finishEvent(captured && (failure == null || cancelled), !cancelled);

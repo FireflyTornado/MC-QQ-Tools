@@ -8,14 +8,91 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class CommandOutputContextTest {
+    @Test
+    void observesAFutureViewWhenTheOriginalStageRejectsObservers() throws Exception {
+        var stage = new CompletableFuture<Integer>() {
+            @Override
+            public CompletableFuture<Integer> whenComplete(BiConsumer<? super Integer, ? super Throwable> action) {
+                throw new UnsupportedOperationException("custom observer");
+            }
+        };
+        var request = new ScheduledOutput();
+        var close = OutputCapture.begin(line -> fail(line), request);
+        assertSame(stage, CommandOutputContext.track(stage));
+        assertTrue(close.get().join());
+        assertTrue(request.seal());
+        assertFalse(request.result().isDone());
+        assertTrue(stage.complete(42));
+        assertEquals(new SudoCommands.Result("ok"), request.result().get(2, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void reportsAnUnobservableStageWithoutChangingTheCallerResult() throws Exception {
+        var stage = new CompletableFuture<Integer>() {
+            @Override
+            public CompletableFuture<Integer> whenComplete(BiConsumer<? super Integer, ? super Throwable> action) {
+                throw new UnsupportedOperationException("custom observer");
+            }
+
+            @Override
+            public CompletableFuture<Integer> copy() {
+                throw new UnsupportedOperationException("custom view");
+            }
+        };
+        var request = new ScheduledOutput();
+        var close = OutputCapture.begin(line -> fail(line), request);
+        assertSame(stage, CommandOutputContext.track(stage));
+        assertTrue(close.get().join());
+        assertTrue(request.seal());
+        assertEquals(new SudoCommands.Result("partial", "无法观察后台阶段是否完成，输出采集可能不完整。\n"),
+                request.result().get(2, TimeUnit.SECONDS));
+        assertFalse(stage.isDone());
+        assertTrue(stage.complete(42));
+    }
+
+    @Test
+    void capturesRunningWorkWithoutReplacingItsCancelledOutcome() throws Exception {
+        var pool = Executors.newSingleThreadExecutor();
+        var started = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var log = LogManager.getLogger("test.context.running");
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var stage = CommandOutputContext.supplyAsync(() -> {
+                started.countDown();
+                try {
+                    assertTrue(release.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException failure) {
+                    throw new AssertionError(failure);
+                }
+                log.error("后台输出");
+                return 42;
+            }, pool);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            assertTrue(stage.cancel(false));
+            assertFalse(request.result().isDone());
+            release.countDown();
+            assertEquals(new SudoCommands.Result("cancelled", "后台输出\n已取消一项后台任务。\n"),
+                    request.result().get(5, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
     @Test
     void attributesWrappedWorkerAndCallbackToTheSubmittingRequest() throws Exception {
         var output = new ScheduledOutput();

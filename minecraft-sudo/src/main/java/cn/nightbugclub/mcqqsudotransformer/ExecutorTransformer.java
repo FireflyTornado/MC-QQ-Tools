@@ -35,9 +35,12 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
     private static final String SCHEDULED_POOL = CONCURRENT + "ScheduledThreadPoolExecutor";
     private static final String BLOCKING_QUEUE = CONCURRENT + "BlockingQueue";
     private static final String BLOCKING_DEQUE = CONCURRENT + "BlockingDeque";
+    private static final String COLLECTION = "java/util/Collection";
     private static final String HANDLER = "L" + CONCURRENT + "RejectedExecutionHandler;";
-    private static final Set<String> QUEUES = Set.of(BLOCKING_QUEUE, BLOCKING_DEQUE,
-            CONCURRENT + "ArrayBlockingQueue", CONCURRENT + "LinkedBlockingQueue", CONCURRENT + "LinkedBlockingDeque");
+    private static final Set<String> QUEUES = Set.of(COLLECTION, "java/util/Queue", "java/util/Deque",
+            "java/util/AbstractQueue", BLOCKING_QUEUE, BLOCKING_DEQUE,
+            CONCURRENT + "ArrayBlockingQueue", CONCURRENT + "LinkedBlockingQueue", CONCURRENT + "LinkedBlockingDeque",
+            CONCURRENT + "LinkedTransferQueue", CONCURRENT + "PriorityBlockingQueue");
     private static final String RUNNABLE = "Ljava/lang/Runnable;";
     private static final String CALLABLE = "L" + CONCURRENT + "Callable;";
     private static final String FUTURE = "L" + CONCURRENT + "Future;";
@@ -134,7 +137,9 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
                     && SCHEDULE.contains(descriptor) ? SCHEDULER : null;
             case "shutdownNow" -> SERVICES.contains(owner) && descriptor.equals("()Ljava/util/List;") ? SERVICE : null;
             case "remove" -> removeReceiver(owner, descriptor);
-            case "clear" -> QUEUES.contains(owner) && descriptor.equals("()V") ? BLOCKING_QUEUE : null;
+            case "clear" -> QUEUES.contains(owner) && descriptor.equals("()V") ? COLLECTION : null;
+            case "removeIf" -> QUEUES.contains(owner) && descriptor.equals("(Ljava/util/function/Predicate;)Z")
+                    ? COLLECTION : null;
             case "purge" -> poolOwner(owner) && descriptor.equals("()V") ? THREAD_POOL : null;
             case "getRejectedExecutionHandler" -> poolOwner(owner) && descriptor.equals("()" + HANDLER) ? THREAD_POOL : null;
             case "setRejectedExecutionHandler" -> poolOwner(owner) && descriptor.equals("(" + HANDLER + ")V") ? THREAD_POOL : null;
@@ -147,7 +152,7 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
             return THREAD_POOL;
         }
         return QUEUES.contains(owner) && descriptor.equals("(Ljava/lang/Object;)Z")
-                ? BLOCKING_QUEUE : null;
+                ? COLLECTION : null;
     }
 
     private static boolean poolOwner(String owner) {

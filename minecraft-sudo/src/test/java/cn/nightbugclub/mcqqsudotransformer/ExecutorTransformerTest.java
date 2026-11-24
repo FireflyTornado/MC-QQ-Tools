@@ -15,6 +15,9 @@ import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -148,7 +151,7 @@ class ExecutorTransformerTest {
         var calls = node.methods.stream().flatMap(method -> Arrays.stream(method.instructions.toArray()))
                 .filter(MethodInsnNode.class::isInstance).map(MethodInsnNode.class::cast)
                 .filter(call -> call.owner.equals(BRIDGE)).map(call -> call.name).toList();
-        assertEquals(java.util.List.of("setRejectedExecutionHandler", "getRejectedExecutionHandler", "clear", "purge"),
+        assertEquals(List.of("setRejectedExecutionHandler", "getRejectedExecutionHandler", "clear", "removeIf", "purge"),
                 calls);
     }
 
@@ -186,7 +189,10 @@ class ExecutorTransformerTest {
         RejectedExecutionHandler reconfigure(ThreadPoolExecutor pool, RejectedExecutionHandler handler) {
             pool.setRejectedExecutionHandler(handler);
             var configured = pool.getRejectedExecutionHandler();
-            pool.getQueue().clear();
+            Queue<Runnable> queue = pool.getQueue();
+            queue.clear();
+            Collection<Runnable> collection = queue;
+            collection.removeIf(task -> false);
             pool.purge();
             return configured;
         }

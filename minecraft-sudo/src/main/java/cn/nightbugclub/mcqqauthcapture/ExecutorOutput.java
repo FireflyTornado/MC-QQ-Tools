@@ -1,15 +1,21 @@
 package cn.nightbugclub.mcqqauthcapture;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.ConcurrentModificationException;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.LinkedTransferQueue;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -17,10 +23,13 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /** Entry points used by the Forge transformer. */
 public final class ExecutorOutput {
+    private static final Runnable TERMINATION_CHECK = () -> {};
+
     private ExecutorOutput() {}
 
     public static void execute(Executor executor, Runnable task) {
@@ -72,36 +81,133 @@ public final class ExecutorOutput {
         return removed;
     }
 
-    public static boolean remove(BlockingQueue<?> queue, Object task) {
-        boolean removed = queue.remove(task);
-        if (removed && task != null) {
+    public static boolean remove(Collection<?> collection, Object task) {
+        boolean removed = collection.remove(task);
+        if (removed && task != null && collection instanceof BlockingQueue<?> queue) {
             ScheduledOutput.discardQueuedWork(null, queue, List.of(task));
         }
         return removed;
     }
 
-    public static void clear(BlockingQueue<?> queue) {
-        Class<?> type = queue.getClass();
-        // These queues drain all elements under the same lock used by their normal removal operations.
-        if ((type == ArrayBlockingQueue.class || type == LinkedBlockingQueue.class || type == LinkedBlockingDeque.class)
-                && ScheduledOutput.watchesQueue(queue)) {
-            var removed = new ArrayList<>();
-            queue.drainTo(removed);
-            ScheduledOutput.discardQueuedWork(null, queue, removed);
-        } else {
-            queue.clear();
+    public static void clear(Collection<?> collection) {
+        if (!(collection instanceof BlockingQueue<?> queue) || !standardQueue(queue)) {
+            collection.clear();
+            return;
         }
+        Class<?> type = queue.getClass();
+        if (type == PriorityBlockingQueue.class || delayedWorkQueue(type)) {
+            // drainTo cannot remove unexpired work. Priority queues can clear atomically
+            // through their native bulk removal without reordering the remaining tasks.
+            removeIf(queue, task -> true);
+            return;
+        }
+        var removed = new ArrayList<>();
+        queue.drainTo(removed);
+        ScheduledOutput.discardQueuedWork(null, queue, removed);
+    }
+
+    public static <T> boolean removeIf(Collection<T> collection, Predicate<? super T> filter) {
+        if (!(collection instanceof BlockingQueue<?> queue) || !standardQueue(queue)) {
+            return collection.removeIf(filter);
+        }
+        Objects.requireNonNull(filter);
+        var removed = new ArrayList<T>();
+        if (queue.getClass() == PriorityBlockingQueue.class) {
+            // PriorityBlockingQueue selects and removes under one lock.
+            boolean changed = collection.removeIf(task -> {
+                if (!filter.test(task)) {
+                    return false;
+                }
+                removed.add(task);
+                return true;
+            });
+            if (changed) {
+                ScheduledOutput.discardQueuedWork(null, queue, removed);
+            }
+            return changed;
+        }
+        try {
+            // The supported queues use the lookup object's equals method. Select the
+            // exact entry observed by the predicate and report only successful removals.
+            for (T task : new ArrayList<>(collection)) {
+                if (filter.test(task) && queue.remove(removalKey(task))) {
+                    removed.add(task);
+                }
+            }
+        } finally {
+            ScheduledOutput.discardQueuedWork(null, queue, removed);
+        }
+        return !removed.isEmpty();
     }
 
     public static void purge(ThreadPoolExecutor pool) {
-        if (standardPool(pool)) {
-            for (Future<?> future : ScheduledOutput.queuedFutures(pool)) {
-                if (future instanceof Runnable task && future.isCancelled()) {
-                    remove(pool, task);
-                }
+        if (!standardPool(pool)) {
+            pool.purge();
+            return;
+        }
+        var queue = pool.getQueue();
+        try {
+            for (Runnable task : queue) {
+                purgeCancelled(pool, queue, task);
+            }
+        } catch (ConcurrentModificationException concurrent) {
+            // Match the JDK purge fallback for queues with fail-fast iterators.
+            for (Runnable task : queue.toArray(Runnable[]::new)) {
+                purgeCancelled(pool, queue, task);
             }
         }
-        pool.purge();
+        if (pool.isShutdown() && queue.isEmpty()) {
+            // Let the JDK recheck termination even when there was nothing to remove.
+            pool.remove(TERMINATION_CHECK);
+        }
+    }
+
+    private static void purgeCancelled(ThreadPoolExecutor pool, BlockingQueue<Runnable> queue, Runnable task) {
+        if (task instanceof Future<?> future && future.isCancelled()) {
+            var key = standardQueue(queue) ? removalKey(task) : task;
+            if (pool.remove(key)) {
+                ScheduledOutput.discardQueuedWork(pool, queue, List.of(task));
+            }
+        }
+    }
+
+    private static boolean standardQueue(BlockingQueue<?> queue) {
+        Class<?> type = queue.getClass();
+        return type == ArrayBlockingQueue.class || type == LinkedBlockingQueue.class || type == LinkedBlockingDeque.class
+                || type == LinkedTransferQueue.class || type == PriorityBlockingQueue.class || delayedWorkQueue(type);
+    }
+
+    private static boolean delayedWorkQueue(Class<?> type) {
+        return type.getEnclosingClass() == ScheduledThreadPoolExecutor.class
+                && type.getSimpleName().equals("DelayedWorkQueue");
+    }
+
+    private static Runnable removalKey(Object task) {
+        Class<?> type = task.getClass();
+        // Native future tasks use identity equality, and the delayed queue can find
+        // its own tasks by heap index when given the original instance.
+        if (type == FutureTask.class || type.getEnclosingClass() == ScheduledThreadPoolExecutor.class
+                && type.getSimpleName().equals("ScheduledFutureTask")) {
+            return (Runnable) task;
+        }
+        return new QueueEntry(task);
+    }
+
+    private record QueueEntry(Object task) implements Runnable {
+        @Override
+        public void run() {
+            throw new AssertionError("Queue lookup key must never be executed");
+        }
+
+        @Override
+        public boolean equals(Object entry) {
+            return entry == this || entry == task;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(task);
+        }
     }
 
     public static RejectedExecutionHandler getRejectedExecutionHandler(ThreadPoolExecutor pool) {

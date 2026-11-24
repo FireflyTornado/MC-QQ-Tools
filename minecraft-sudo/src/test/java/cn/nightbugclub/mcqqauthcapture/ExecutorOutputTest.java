@@ -5,7 +5,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
@@ -15,6 +17,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.LinkedTransferQueue;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -263,6 +267,165 @@ class ExecutorOutputTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void clearingDelayedQueueThroughQueueAliasSettlesUnexpiredWork() throws Exception {
+        var pool = new ScheduledThreadPoolExecutor(1);
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var delayed = ExecutorOutput.schedule(pool, () -> fail("cleared delayed task ran"), 1, TimeUnit.HOURS);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            Queue<Runnable> queue = pool.getQueue();
+            assertTrue(queue.contains(delayed));
+            ExecutorOutput.clear(queue);
+
+            assertTrue(queue.isEmpty());
+            assertFalse(pool.isShutdown());
+            assertFalse(delayed.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void clearingPriorityAndTransferQueuesUsesActualRemovals() throws Exception {
+        var compare = new AtomicReference<>(true);
+        var priority = new PriorityBlockingQueue<Runnable>(1, (first, second) -> {
+            assertTrue(compare.get(), "clear must not invoke the priority comparator");
+            return 0;
+        });
+        for (BlockingQueue<Runnable> queue : List.of(priority, new LinkedTransferQueue<Runnable>())) {
+            var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+            try {
+                var request = new ScheduledOutput();
+                var close = OutputCapture.begin(line -> fail(line), request);
+                var first = ExecutorOutput.submit(pool, () -> fail("cleared work ran"));
+                var second = ExecutorOutput.submit(pool, () -> fail("cleared work ran"));
+                var third = ExecutorOutput.submit(pool, () -> fail("cleared work ran"));
+                assertTrue(close.get().join());
+                assertTrue(request.seal());
+                compare.set(false);
+                ExecutorOutput.clear(queue);
+                assertTrue(queue.isEmpty());
+                assertFalse(first.isDone());
+                assertFalse(second.isDone());
+                assertFalse(third.isDone());
+                assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+            } finally {
+                pool.shutdownNow();
+            }
+        }
+    }
+
+    @Test
+    void removeIfSettlesTheSelectedTaskAndKeepsEqualButUnselectedEntries() throws Exception {
+        var pool = occupiedPool(new LinkedBlockingQueue<>(), new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var first = new EqualRunnable();
+            var second = new EqualRunnable();
+            pool.execute(first);
+            pool.execute(second);
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var dropped = ExecutorOutput.submit(pool, () -> fail("filtered work ran"));
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+
+            assertTrue(ExecutorOutput.removeIf(pool.getQueue(), task -> task == second || task == dropped));
+            assertEquals(1, pool.getQueue().size());
+            assertSame(first, pool.getQueue().element());
+            assertFalse(dropped.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void removeIfDoesNotSettleAWorkerTaskTakenDuringPredicateEvaluation() throws Exception {
+        var pool = (ThreadPoolExecutor) Executors.newFixedThreadPool(1);
+        var releaseQueue = new CountDownLatch(1);
+        var started = new CountDownLatch(1);
+        var finishWorker = new CountDownLatch(1);
+        try {
+            pool.execute(() -> {
+                try {
+                    releaseQueue.await();
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var future = ExecutorOutput.submit(pool, () -> {
+                started.countDown();
+                assertTrue(finishWorker.await(5, TimeUnit.SECONDS));
+                LogManager.getLogger("test.executor.remove").error("running output");
+                return 42;
+            });
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+
+            assertFalse(ExecutorOutput.removeIf(pool.getQueue(), task -> {
+                assertSame(future, task);
+                releaseQueue.countDown();
+                try {
+                    assertTrue(started.await(5, TimeUnit.SECONDS));
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                    fail(stopped);
+                }
+                return true;
+            }));
+            assertFalse(request.result().isDone());
+            finishWorker.countDown();
+            assertEquals(42, future.get(2, TimeUnit.SECONDS));
+            assertEquals(new SudoCommands.Result("ok", "running output\n"), request.result().get(2, TimeUnit.SECONDS));
+        } finally {
+            releaseQueue.countDown();
+            finishWorker.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void purgeObservesAStageWorkerCancelledDuringTraversal() throws Exception {
+        var beforeIterator = new AtomicReference<Runnable>();
+        var queue = new LinkedBlockingQueue<Runnable>() {
+            @Override
+            public Iterator<Runnable> iterator() {
+                var hook = beforeIterator.getAndSet(null);
+                if (hook != null) {
+                    hook.run();
+                }
+                return super.iterator();
+            }
+        };
+        var pool = occupiedPool(queue, new ThreadPoolExecutor.AbortPolicy());
+        try {
+            var request = new ScheduledOutput();
+            var close = OutputCapture.begin(line -> fail(line), request);
+            var stage = CommandOutputContext.supplyAsync(() -> fail("purged worker ran"), pool);
+            assertTrue(close.get().join());
+            assertTrue(request.seal());
+            var worker = assertInstanceOf(Future.class, queue.element());
+            beforeIterator.set(() -> assertTrue(worker.cancel(false)));
+            ExecutorOutput.purge(pool);
+            assertTrue(queue.isEmpty());
+            assertFalse(stage.isDone());
+            assertEquals("cancelled", request.result().get(2, TimeUnit.SECONDS).status());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private record EqualRunnable() implements Runnable {
+        @Override
+        public void run() {}
     }
 
     @Test

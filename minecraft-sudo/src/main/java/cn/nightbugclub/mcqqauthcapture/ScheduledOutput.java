@@ -167,22 +167,6 @@ public final class ScheduledOutput {
         }
     }
 
-    static List<Future<?>> queuedFutures(ExecutorService pool) {
-        synchronized (EVENTS) {
-            return EVENTS.values().stream().map(Event::queued)
-                    .filter(work -> work != null && work.executor() == pool)
-                    .map(QueuedWork::task).filter(Future.class::isInstance)
-                    .<Future<?>>map(task -> (Future<?>) task).toList();
-        }
-    }
-
-    static boolean watchesQueue(BlockingQueue<?> queue) {
-        synchronized (EVENTS) {
-            return SUBMISSIONS.values().stream().anyMatch(submission -> submission.queue() == queue)
-                    || EVENTS.values().stream().anyMatch(event -> event.queued() != null && event.queued().queue() == queue);
-        }
-    }
-
     private static boolean sameQueue(ExecutorService executor, BlockingQueue<?> queue,
                                      ExecutorService otherExecutor, BlockingQueue<?> otherQueue) {
         return (executor != null && executor == otherExecutor) || (queue != null && queue == otherQueue);

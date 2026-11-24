@@ -15,6 +15,7 @@ import java.lang.System.Logger.Level;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.zip.ZipFile;
@@ -52,7 +53,8 @@ final class ExecutorTransformer implements ITransformer<ClassNode> {
         }
         var classes = new HashSet<String>();
         try (var files = Files.list(mods)) {
-            for (Path file : files.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".jar")).toList()) {
+            for (Path file : files.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")).toList()) {
                 try (var jar = new ZipFile(file.toFile())) {
                     if (jar.getEntry("META-INF/mods.toml") == null) {
                         continue;

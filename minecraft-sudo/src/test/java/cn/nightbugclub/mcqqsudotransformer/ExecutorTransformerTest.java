@@ -50,7 +50,7 @@ class ExecutorTransformerTest {
         jar(mods.resolve("ordinary-library.jar"), stageName, classBytes(CallbackRegistrar.class), false);
         assertTrue(ExecutorTransformer.scan(mods).isEmpty());
         jar(mods.resolve("fixture.jar"), name, classBytes(Submitter.class), true);
-        jar(mods.resolve("stage-fixture.jar"), stageName, classBytes(CallbackRegistrar.class), true);
+        jar(mods.resolve("stage-fixture.JAR"), stageName, classBytes(CallbackRegistrar.class), true);
         assertEquals(Set.of(Submitter.class.getName(), CallbackRegistrar.class.getName()), ExecutorTransformer.scan(mods));
     }
 
